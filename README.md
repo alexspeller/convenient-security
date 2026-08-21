@@ -1,173 +1,161 @@
-# convenient-security
+# Convenient Security
 
-A resident, hardened macOS agent that lets local tools and long-running agent
-sessions use secrets from either 1Password or csec's native encrypted files
-**without** scattering those secrets across the environment of every process on
-the machine.
+**Keep your secrets in 1Password or an encrypted file, use them in your local
+tools, and give each secret away only when you tap Touch ID — never by scattering
+plaintext into the environment of every process on your Mac.**
 
-The name is the thesis: security people actually keep switched on because it
-isn't in the way. One coarse provider unlock, then per-secret human consent with
-Touch ID and an at-rest cache so you aren't re-prompted all day. Integrated
-clients receive values in their process heap; the environment compatibility
-launcher is explicitly documented as a weaker path.
+Convenient Security (`csec`) is a resident macOS agent that resolves secret
+*references* like `op://Vault/DB/url` or `csec://development/API_TOKEN` into real
+values, one human-approved touch at a time. It exists because the convenient way
+to handle secrets and the safe way are usually opposites — and a security tool
+you turn off because it's annoying protects nothing.
 
-## Status
+> macOS on Apple Silicon, with SIP enabled. Security guarantees apply to the
+> signed, notarized release build; see [Security requirements](#security-requirements).
 
-The implemented system includes mutual live code-identity checks, protocol-v2
-delivery-plan binding, per-reference Touch ID consent, subtree grants, a
-Secure-Enclave-gated keychain cache, a signed Ruby heap-delivery bridge, typed
-value-free failures, a native AES-GCM encrypted store, and a startup security
-audit.
+## The problem
 
-`csec exec` resolves references into a child's initial environment. That is an
-explicitly exposed compatibility path: unrelated same-UID processes can inspect
-the original environment. When output policy is active, `csec` supervises the
-child and masks eligible values in owned stdout/stderr pipes or a PTY, but
-masking does not repair the environment disclosure. `csec tool-exec` provides a
-fail-closed, pre-recipient output scanner for AI Bash commands using the
-daemon's memory-only registry of released values. Claude Code and Codex hook
-adapters generate opt-in configuration for that broker.
-
-The Developer-ID-signed, hardened, provisioned `.app` path has run with real
-1Password values and Touch ID on physical hardware. The native store's
-provisioned access-group exclusion, unauthenticated-read rejection, and
-authenticated `.biometryAny` record read/update have also passed the signed
-hardware spike. The repository contains the `.pkg` build, signing, notarization,
-and root-owned bridge install pipeline; its remaining signed-machine checks are documented in
-[`packaging/README.md`](packaging/README.md). See [`DESIGN.md`](DESIGN.md) for
-the complete current architecture and limitations.
-
-## Why
-
-The ambient alternative — a broker that hands any same-uid process any secret on
-request — means a single piece of user-level malware can read your entire vault
-silently. This project draws the line at **per-secret human consent**, and makes
-the *at-rest* and *in-use* footprint of a secret as small as macOS allows:
-
-- **Protected in-use delivery goes to the heap, not the environment.** The Ruby
-  client uses a signed bridge and private pipe. `csec exec` remains a labeled
-  compatibility exception because its child environment is readable. (See
-  [`docs/threat-model.md`](docs/threat-model.md).)
-- **At-rest secrets live in a Secure-Enclave-gated cache** whose confidentiality
-  rests on unforgeable *code identity* — the same model 1Password itself uses.
-- **Only the agent decrypts or resolves backing stores**, behind provider
-  adapters. `op://` and `csec://` references can be used together in one
-  process or project.
-
-## Layout
-
-| Path | What |
-|------|------|
-| `DESIGN.md` | Current architecture, guarantees, and limitations. |
-| `docs/threat-model.md` | What same-uid malware can/can't read, and why this is safe. |
-| `docs/protocol.md` | The unix-socket wire protocol. |
-| `docs/development.md` | Toolchain baseline, CI entry point, and signed release gates. |
-| `agent/` | Swift package: the `csecd` daemon, the `csec` launcher, and the core. |
-| `agent/Sources/ConvenientSecurity/` | Provider-agnostic core (refs, grants, cache, resolver, protocol). |
-| `agent/Sources/OnePasswordAdapter/` | All 1Password-specific code. |
-| `agent/Sources/ConvenientSecurity/NativeSecretStore.swift` | Native encrypted-file provider, strict JSON, keychain keys, and rollback checks. |
-| `clients/ruby/` | Heap-fetch client gem (for Rails and other Ruby consumers). |
-| `packaging/` | Signing / notarization / `.pkg` pipeline + install. See [`packaging/README.md`](packaging/README.md). |
-
-## Building
+Say you keep a database password in 1Password and want your local Rails app to
+use it. The usual options all leak:
 
 ```sh
-bin/ci                 # Swift build/self-tests/e2e + Ruby unit/cross-stack tests
+export DATABASE_URL="postgres://user:hunter2@…"   # now in your shell's environment
+bin/rails server
 ```
 
-See [`docs/development.md`](docs/development.md) for the pinned CI runner and
-the separate signed physical-machine gate.
+A process's environment and command line are **readable by any other process
+running as you** — via `ps`, `KERN_PROCARGS2`, or a peek at `/proc`-equivalent
+APIs. So does a `.env` file (mode `0600` keeps out *other* users, not *your own*
+processes). That means one malicious `npm install` postinstall script, one
+trojaned CLI tool, one compromised VS Code extension — anything running as your
+login user — can quietly read every secret you've exported and every dotfile you
+own, and send them off. No prompt, no trace.
 
-## Licence
+The popular alternative is an *ambient broker*: a background agent that hands any
+same-user process any secret it asks for. That's convenient, but it's the same
+hole with extra steps — the malware just asks the broker instead of reading your
+environment, and still walks away with the whole vault silently.
 
-Copyright 2026 Stateful Ltd. The source is available under the
-[Functional Source License, Version 1.1, ALv2 Future License](LICENSE.md)
-(`FSL-1.1-ALv2`). The licence permits use, modification, and redistribution for
-non-competing purposes; each released version becomes available under Apache
-License 2.0 two years after that version is made available. This is a Fair
-Source licence, not an OSI-approved open-source licence.
+## What Convenient Security does instead
 
-Security vulnerabilities should be reported privately as described in
-[`SECURITY.md`](SECURITY.md). The project is not currently accepting external
-code contributions; see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+It draws one hard line: **per-secret human consent.** The agent never releases a
+value a human didn't just approve, and it keeps the footprint of each secret — at
+rest and in use — as small as macOS allows.
 
-## Using it
+- **Human in the loop.** The first time a process asks for a reference, the agent
+  prompts for **Touch ID**, showing you exactly which secret, which process, and
+  why. No password fallback, no auto-approve switch in the shipping build.
+- **One touch, sensible scope.** A grant is bound to the approving process and
+  its child processes (its "subtree") for a bounded lifetime, so a `rails server`
+  and the migrations it spawns don't re-prompt you every few seconds — but an
+  unrelated process gets nothing.
+- **Delivery straight to the heap, not the environment.** The integrated Ruby
+  client receives values over a private pipe into its own process memory, which
+  another same-user process can't read on a hardened Mac. Plaintext never touches
+  `ENV` or `argv`.
+- **Two backends, one interface.** References resolve from the official 1Password
+  CLI (`op://…`) or from device-bound, AES-256-GCM encrypted files (`csec://…`).
+  You can mix both in a single launch.
+- **Encrypted at rest, gated by code identity.** The optional cache and the
+  native store keys live in a Secure-Enclave-backed Keychain group that only the
+  signed agent can open — the same code-identity model 1Password itself relies on.
+
+The name is the whole thesis: security that's *convenient* enough to leave
+switched on.
+
+## How it protects you
+
+| Threat | What stops it |
+|--------|---------------|
+| Malware reads secrets from your environment / `argv` | Values are delivered to the consumer's heap over a private pipe, not injected into the environment (for the integrated Ruby client). |
+| Malware asks a broker for your whole vault | The agent releases only references a human just approved with Touch ID, scoped to the approving process subtree. |
+| Malware reads your encrypted files off disk | Files are AES-256-GCM envelopes; the keys live in a Keychain group only the signed, provisioned agent can access, gated by the Secure Enclave. |
+| Malware tampers with or rolls back an encrypted file | Each store's Keychain record pins the current generation, file ID, and ciphertext digest, so modification, cross-store swaps, and replay of an old file fail closed. |
+| A secret leaks into stdout that an AI tool then reads | Optional output redaction masks resolved values from supervised stdout/stderr and from Claude Code / Codex Bash tool calls. |
+| An unsigned or tampered agent impersonates the real one | `csec` and `csecd` mutually verify Team ID, signing identity, hardened-runtime posture, and login UID over the socket before exchanging anything. |
+
+## What it deliberately does *not* protect against
+
+This is a security tool, so its limits matter as much as its features. Convenient
+Security **cannot** protect a secret from:
+
+- **root** or the Apple platform itself;
+- **a consumer you deliberately authorized** — once your Rails app or your shell
+  holds a plaintext value, it can log it, assign it to `ENV`, or send it anywhere;
+- **`csec exec`'s environment channel** — this is an explicit, labeled
+  *compatibility* path for unmodified tools that injects plaintext into the
+  child's environment, where same-user process inspection can read it (output
+  redaction reduces stdout leaks but does not repair this);
+- **the external-editor mode** of the native store, which necessarily writes
+  decrypted JSON to a temp file your editor and its plugins can read;
+- **you approving a request that turns out to be misleading.**
+
+The full attacker model — what a same-user, non-root process can and can't do,
+and why each control holds — is in [`docs/threat-model.md`](docs/threat-model.md).
+
+## Getting started
+
+Build and run the agent, then fetch a secret:
 
 ```sh
-swift run csecd                              # start the agent (Touch ID consent)
-swift run csec get 'op://Vault/Item/Field'   # fetch one secret to stdout
-swift run csec exec -- bin/rails s           # run a tool with provider refs resolved
-swift run csec exec --redact-output=always -- bin/rspec # mask captured stdout/stderr too
-swift run csec tool-exec --destination ai -- /usr/bin/pgrep -fl rubocop
-swift run csec hook-config claude             # JSON fragment for ~/.claude/settings.json
-swift run csec hook-config codex              # JSON fragment for ~/.codex/hooks.json
+bin/ci                                        # build + run the full test suite
+
+swift run csecd                               # start the agent (foreground, dev mode)
+swift run csec get 'op://Vault/Item/Field'    # fetch one secret to stdout — prompts for Touch ID
 ```
 
-`csecd` authenticates peers via `LOCAL_PEERTOKEN`, tracks subtree grants, and
-prompts for **Touch ID** on each newly-requested reference — one touch covers
-the whole process subtree for the grant's duration. The shipping agent has no
-runtime consent bypass; automated tests use the separate `cs-fake-agent`.
-Release `csec` and `csecd` mutually require their exact Team ID and signing
-identifiers before either side exchanges request metadata. SwiftPM debug builds
-use compile-time-only relaxed trust so local development remains possible; that
-branch is absent from release binaries.
-`csec exec` resolves any registered provider reference in the environment in
-place and injects it into the child. The agent listens at
-`…/convenient-security-<uid>/agent.sock` in the per-user temp dir.
+> An unsigned `swift run csecd` runs without the at-rest cache and the native
+> store (it can't open the provisioned Keychain group) and prints
+> `at-rest cache OFF`. For the full feature set, install the signed build — see
+> [Installing the real agent](#installing-the-real-agent).
 
-Output masking defaults to `--redact-output=tty`: terminal streams are relayed
-through a child PTY and guarded automatically, while non-terminal streams remain
-byte-exact with an explicit warning. Use `always` when a human-readable pipe or
-captured log may reach an AI tool, and `never` only when byte-exact output is
-required. Replacements default to `[csec:secret-N]`; the opt-in
-`--redact-output-label=reference` exposes the corresponding provider-reference
-metadata.
-Values shorter than eight bytes are excluded with a warning unless
-`--redact-short-values` explicitly accepts likely false positives.
+### Run an existing tool with secrets resolved
 
-`tool-exec` is the pre-recipient form for AI shell commands. It opens a
-caller-bound scanner in `csecd` before launching the child, relays each output
-chunk through the daemon, and fails closed if scanning cannot start or stops
-working. The daemon matches values actually released during its current
-lifetime; it does not unlock dormant vault/cache entries to build the matcher,
-and the current registry lease ends with the delivery TTL. Run `hook-config`,
-then **merge** its fragment into the corresponding settings file—the command
-does not overwrite or install user configuration. The generated PreToolUse hook
-rewrites Bash tool calls through `tool-exec`; it does not cover file-read, MCP,
-hosted, or other non-Bash tool paths. See the precise guarantees and hook-host
-caveats in [`DESIGN.md`](DESIGN.md#output-redaction-and-ai-hooks) and
-[`docs/threat-model.md`](docs/threat-model.md#output-redaction).
-
-The at-rest cache needs the provisioned keychain entitlement, so an unsigned
-`swift run csecd` prints `at-rest cache OFF` and runs without persistence; the
-signed, installed build (see [`packaging/README.md`](packaging/README.md)) prints
-`at-rest cache on` and persists resolved values in the Secure-Enclave-gated
-keychain. To install the real background agent rather than run it in the
-foreground:
+`csec exec` scans the environment for provider references and resolves them in
+place before launching the child. This is the compatibility path — it works with
+any unmodified tool, at the cost of putting plaintext in the child's environment:
 
 ```sh
-packaging/bin/build-agent.sh                         # build + sign the .app
-/Applications/ConvenientSecurity.app/Contents/MacOS/csec install   # register the LaunchAgent
+DATABASE_URL='op://Engineering/Postgres/url' \
+BUGSNAG_TOKEN='csec://development/BUGSNAG_TOKEN' \
+  swift run csec exec -- bin/rails server
 ```
 
-### Native encrypted files
+One Touch ID prompt covers `rails` and every process it spawns for the grant's
+lifetime.
 
-The native store requires the signed, provisioned installed build; an unsigned
-`swift run csecd` cannot access its restricted Keychain group. It resolves
-references of the form:
+### Deliver secrets to a Ruby app without touching the environment
 
-```text
-csec://<store>/<key>
+For consumers you control — a Rails app at boot, say — the Ruby client is the
+strongest path. It receives values over a private pipe into the process heap,
+never via `ENV` or `argv`:
+
+```ruby
+require 'convenient_security'
+
+secrets = ConvenientSecurity.access(
+  ['op://Vault/DB/url', 'csec://development/LOCAL_API_TOKEN'],
+  reason: 'boot rails',
+  ttl: 8 * 3600
+)
+
+db_url = secrets.fetch('op://Vault/DB/url')             # a plain String, only in the heap
+token  = secrets.fetch('csec://development/LOCAL_API_TOKEN')
 ```
 
-Create or edit a store with:
+See [`clients/ruby/README.md`](clients/ruby/README.md) for the delivery
+guarantees and how the bridge verifies its Ruby parent.
+
+## Native encrypted files
+
+Prefer not to depend on 1Password? Convenient Security ships its own
+device-bound encrypted store. References look like `csec://<store>/<key>`, and
+you create or edit a store with a built-in editor that keeps plaintext in the
+signed launcher's memory — no `$EDITOR`, no temp file:
 
 ```sh
-/Applications/ConvenientSecurity.app/Contents/MacOS/csec edit development
+csec edit development     # Touch ID, then edit a strict-JSON document in place
 ```
-
-After Touch ID, `csec` opens a built-in native editor containing a strict JSON
-object whose keys and values are strings:
 
 ```json
 {
@@ -176,85 +164,103 @@ object whose keys and values are strings:
 }
 ```
 
-JSON is used deliberately: Foundation provides the parser, and csec rejects
-duplicate keys, nested values, implicit types, trailing syntax, invalid key
-names, more than 1024 entries, or a canonical document over 1 MiB. YAML tags,
-anchors and implicit typing—and a third-party TOML parser—are therefore absent
-from the trusted agent.
+Each save writes a fresh AES-256-GCM envelope and atomically flips an agent-only
+Keychain record to the new version. That record pins the store's device-bound
+key, generation, file ID, and ciphertext digest — so tampering with, swapping, or
+rolling back a file on disk fails closed. The strict JSON parser rejects
+duplicate keys, nested or non-string values, more than 1024 entries, and
+documents over 1 MiB, keeping the trusted agent's attack surface small.
 
-The default editor does not invoke `$EDITOR` or create a plaintext temporary
-file. Its text and undo state stay in the signed launcher's heap until Save or
-Cancel. Copying text, screenshots, input methods, and code already running
-inside the authorized launcher/UI session remain outside that protection.
+> The native store needs the signed, provisioned build. There is no key export
+> or recovery path: losing the Mac or deleting the Keychain record makes the
+> ciphertext permanently unrecoverable.
 
-For editing features the built-in UI does not provide, explicitly opt into the
-weaker external-editor mode:
-
-```sh
-EDITOR='code --wait' \
-  /Applications/ConvenientSecurity.app/Contents/MacOS/csec edit --editor development
-```
-
-`csec` parses `$EDITOR` into a bounded argv and launches the resolved executable
-directly; it does not implicitly use a shell or expand variables, globs,
-operators, or command substitutions. It appends the document path as the final
-argument, so GUI editors need an option such as `--wait` that does not return
-until editing is complete.
-
-This mode necessarily writes the decrypted JSON to a named file in a randomized
-`0700` per-user temporary workspace with mode `0600`. Those modes exclude other
-accounts, not same-UID processes. The editor, its plugins, and same-UID malware
-can read the file, and swap, autosave, recovery, backup, snapshots, or deliberate
-copies can outlive the session. Editor display and output are not passed through
-csec's secret masker. `csec` warns before Touch ID and removes its workspace
-after normal success or failure, but cannot securely erase APFS/SSD storage or
-copies made elsewhere; a crash or forced termination can leave the workspace
-behind. The durable native store remains encrypted before and after the edit
-window.
-
-Ciphertext lives under:
-
-```text
-~/Library/Application Support/ConvenientSecurity/Secrets/
-```
-
-Each save creates a fresh AES-256-GCM envelope and atomically switches an
-agent-only Keychain record to that immutable version. The record contains the
-device-bound per-store key, generation, active random file ID, and ciphertext
-digest, which makes arbitrary modification and replay of an older valid file
-fail closed. The directory is `0700`, encrypted files are `0600`, and reads
-reject symlinks; those modes are defense in depth because same-UID processes
-can still read the ciphertext. Ciphertext filenames expose the non-secret store
-name; a same-UID attacker can also delete or replace files and cause denial of
-service, but replacement cannot produce accepted plaintext.
-
-The keychain record uses `WhenUnlockedThisDeviceOnly` plus `.biometryAny` in the
-daemon's provisioned access group. A cold daemon must receive the fresh Touch ID
-context from csec consent before it can load the key. The key is then warm only
-in `csecd` memory, while per-reference grants continue to control releases.
-Changing enrolled fingerprints does not destroy the store, but the key does not
-migrate to another Mac. Losing the Mac or deleting its Keychain record makes
-the ciphertext unrecoverable; there is currently no recovery-key or export
-interface.
-
-Both providers can be referenced in one launch:
+If you need an editor feature the built-in one lacks, you can opt into your own
+`$EDITOR` — but this is a weaker mode that writes decrypted JSON to a temp file:
 
 ```sh
-DATABASE_URL='csec://development/DATABASE_URL' \
-BUGSNAG_TOKEN='op://Engineering/Bugsnag/token' \
-  /Applications/ConvenientSecurity.app/Contents/MacOS/csec exec -- bin/rails s
+EDITOR='code --wait' csec edit --editor development
 ```
 
-These environment entries contain references, not plaintext. `csec exec` still
-places the resolved values in the child's initial environment and retains the
-same disclosure warning described above. The Ruby heap client accepts mixed
-reference arrays without using the environment path.
+## Keeping secrets out of AI tool output
 
-## Security requirements (non-negotiable)
+If you use Claude Code or Codex, a stray `echo $TOKEN` or a verbose log line can
+feed a live secret straight into an AI context. Two opt-in controls guard against
+that:
 
-The agent's protections only hold if it ships hardened-runtime + notarized +
-provisioned (team-prefixed keychain access group), with no `get-task-allow`, no
-Hardened Runtime exception entitlements (including library-validation, DYLD,
-JIT/unsigned executable memory, executable-page protection, or debugger
-exceptions), and only on a machine with SIP enabled. See
-[`DESIGN.md`](DESIGN.md#security-requirements).
+```sh
+# Mask resolved values from a supervised command's stdout/stderr:
+csec exec --redact-output=always -- bin/rspec
+
+# Scan an AI-issued Bash command's output against the daemon's registry of
+# recently-released values, failing closed if scanning can't run:
+csec tool-exec --destination ai -- /usr/bin/pgrep -fl rubocop
+
+# Generate a hook fragment to merge into your AI tool's settings:
+csec hook-config claude     # → merge into ~/.claude/settings.json
+csec hook-config codex      # → merge into ~/.codex/hooks.json
+```
+
+These are egress safeguards, not a cure-all: they cover supervised stdout/stderr
+and Bash tool calls, not file writes, network sends, or non-Bash tool paths. See
+[`DESIGN.md`](DESIGN.md#output-redaction-and-ai-hooks) for the exact guarantees.
+
+## Installing the real agent
+
+The at-rest cache and native store require the signed, notarized, provisioned
+`.app`, which registers as a background LaunchAgent:
+
+```sh
+packaging/bin/build-agent.sh                                        # build + sign the .app
+/Applications/ConvenientSecurity.app/Contents/MacOS/csec install    # register the LaunchAgent
+```
+
+A signed agent prints `at-rest cache on` and persists resolved values in the
+Secure-Enclave-gated Keychain. Signing, notarization, and the root-owned bridge
+install pipeline are documented in [`packaging/README.md`](packaging/README.md).
+
+## Security requirements
+
+The agent's guarantees hold **only** when it ships as a Developer-ID-signed,
+hardened-runtime, notarized build with an embedded provisioning profile for the
+team-prefixed Keychain access group, **no** `get-task-allow`, **no** Hardened
+Runtime exception entitlements (library validation, DYLD variables, JIT/unsigned
+executable memory, executable-page protection, or debugging), and **only** on a
+host with **SIP enabled**. A startup self-audit refuses to run in production if
+this posture is absent. Unsigned development builds deliberately drop the
+persistent cache and compile in test-only trust seams rather than fake the
+entitlements. Details in [`DESIGN.md`](DESIGN.md#security-requirements).
+
+## Learn more
+
+| Document | What's in it |
+|----------|--------------|
+| [`DESIGN.md`](DESIGN.md) | Full architecture, components, guarantees, and limitations. |
+| [`docs/threat-model.md`](docs/threat-model.md) | What same-user malware can and can't do, and why each control holds. |
+| [`docs/protocol.md`](docs/protocol.md) | The authenticated Unix-socket wire protocol (protocol v2). |
+| [`docs/development.md`](docs/development.md) | Toolchain baseline, CI entry point, and signed release gates. |
+| [`clients/ruby/`](clients/ruby/) | The heap-delivery Ruby client gem. |
+| [`packaging/`](packaging/README.md) | Signing, notarization, `.pkg` build, and install pipeline. |
+
+### Repository layout
+
+- `agent/Sources/ConvenientSecurity/` — provider-agnostic core: references,
+  grants, cache, resolver, protocol, and the native encrypted store.
+- `agent/Sources/OnePasswordAdapter/` — all 1Password-specific code.
+- `agent/Sources/csecd/`, `agent/Sources/csec/` — the resident daemon and the
+  signed CLI / launcher / output supervisor.
+- `clients/ruby/` — the Ruby heap-fetch client.
+- `packaging/` — the signing, notarization, and install pipeline.
+
+## Licence
+
+Copyright 2026 Stateful Ltd. The source is available under the
+[Functional Source License, Version 1.1, ALv2 Future License](LICENSE.md)
+(`FSL-1.1-ALv2`). The licence permits use, modification, and redistribution for
+non-competing purposes; each released version becomes Apache License 2.0 two
+years after its release. This is a Fair Source licence, not an OSI-approved
+open-source licence.
+
+Report security vulnerabilities privately as described in
+[`SECURITY.md`](SECURITY.md). The project is not currently accepting external
+code contributions; see [`CONTRIBUTING.md`](CONTRIBUTING.md).
