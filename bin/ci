@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+swift_scratch="${TMPDIR:-/tmp}/convenient-security-swift-cache"
+
+export CLANG_MODULE_CACHE_PATH="$swift_scratch/clang"
+export SWIFTPM_MODULECACHE_OVERRIDE="$swift_scratch/swiftpm"
+
+bash -n \
+  "$repo_root/packaging/bin/build-agent.sh" \
+  "$repo_root/packaging/bin/build-pkg.sh" \
+  "$repo_root/packaging/bin/notarize.sh" \
+  "$repo_root/packaging/bin/provision.sh" \
+  "$repo_root/packaging/pkg-scripts/postinstall"
+plutil -lint \
+  "$repo_root/packaging/agent/Info.plist" \
+  "$repo_root/packaging/agent/csecd.entitlements" \
+  "$repo_root/packaging/agent/LaunchAgents/com.alexspeller.convenient-security.plist"
+ruby -c "$repo_root/packaging/fastlane/Fastfile"
+
+# Every distributed surface must carry the same FSL terms. RubyGems represents
+# licences outside its SPDX allow-list as "Nonstandard"; LICENSE.md is the
+# authoritative identifier and text.
+cmp "$repo_root/LICENSE.md" "$repo_root/clients/ruby/LICENSE.md"
+(
+  cd "$repo_root/clients/ruby"
+  ruby -e '
+    spec = Gem::Specification.load("convenient_security.gemspec")
+    abort "gem licence metadata is not Nonstandard" unless spec.license == "Nonstandard"
+    abort "gem omits LICENSE.md" unless spec.files.include?("LICENSE.md")
+    abort "gem omits README.md" unless spec.files.include?("README.md")
+    abort "RubyGems MFA is not required" unless spec.metadata["rubygems_mfa_required"] == "true"
+  '
+)
+
+# Prove the private-key handoff used by provision/notarize survives exec while
+# remaining outside argv/environment/disk. The marker is synthetic test data.
+fd_marker="csec-synthetic-inherited-fd"
+exec 9< <(printf %s "$fd_marker")
+ruby -e 'abort "inherited fd handoff failed" unless File.binread(ARGV.fetch(0)) == ARGV.fetch(1)' \
+  /dev/fd/9 "$fd_marker"
+exec 9<&-
+
+swift build --package-path "$repo_root/agent"
+"$repo_root/agent/.build/debug/cs-selftest"
+"$repo_root/agent/.build/debug/cs-e2e"
+
+# Compile the shipping branches and prove environment-only test controls are
+# absent there. The release self-test does not contact a real agent or vault.
+swift build --package-path "$repo_root/agent" -c release
+CSEC_SOCKET="/tmp/csec-release-must-ignore.sock" \
+OP_CLI_PATH="/bin/false" \
+  "$repo_root/agent/.build/release/cs-selftest"
+
+ruby -I"$repo_root/clients/ruby/lib" \
+  "$repo_root/clients/ruby/test/convenient_security_test.rb"
+ruby -I"$repo_root/clients/ruby/lib" \
+  "$repo_root/clients/ruby/test/cross_stack_test.rb"

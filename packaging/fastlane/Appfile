@@ -1,0 +1,4 @@
+# Developer-portal team + the agent's App ID. Auth is via an App Store Connect
+# API key (see Fastfile), not an Apple ID, so no apple_id here.
+app_identifier("com.alexspeller.convenient-security")
+team_id("8RS6GD89Y7") # Stateful Ltd

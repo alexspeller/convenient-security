@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.alexspeller.convenient-security</string>
+    <!-- csecd is the bundle's MAIN executable: the embedded provisioning profile
+         authorizes the restricted keychain-access-groups entitlement only for the
+         main executable, so the entitled binary must be it (a secondary binary
+         claiming that entitlement is SIGKILLed by AMFI at launch). csec is an
+         additional binary in Contents/MacOS; running it still gives Bundle.main =
+         this .app, so `csec install` resolves Contents/Library/LaunchAgents/. -->
+    <key>CFBundleExecutable</key>
+    <string>csecd</string>
+    <key>CFBundleName</key>
+    <string>ConvenientSecurity</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <!-- Background agent: no Dock icon or menu bar if the bundle is ever opened. -->
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>

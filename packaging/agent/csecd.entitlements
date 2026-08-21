@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Entitlements for csecd: the data-protection keychain under our own team-
+     prefixed access group. Both keys must be authorized by the embedded Developer
+     ID provisioning profile (a restricted entitlement; Developer ID alone doesn't
+     grant it). No App Sandbox (Developer ID doesn't need it, and the agent shells
+     out to `op` and shares a $TMPDIR socket). Proven by packaging/spike. -->
+<plist version="1.0">
+<dict>
+    <key>com.apple.application-identifier</key>
+    <string>8RS6GD89Y7.com.alexspeller.convenient-security</string>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>8RS6GD89Y7.com.alexspeller.convenient-security</string>
+    </array>
+</dict>
+</plist>

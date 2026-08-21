@@ -1,0 +1,25 @@
+# Swift / SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+DerivedData/
+*.xcodeproj/xcuserdata/
+
+# macOS
+.DS_Store
+
+# Ruby
+clients/ruby/*.gem
+clients/ruby/.bundle/
+clients/ruby/vendor/
+clients/ruby/Gemfile.lock
+
+# Signing / local secrets
+*.provisionprofile
+*.mobileprovision
+*.p12
+*.p8
+*.cer
+*.certSigningRequest
+.env
+.envrc

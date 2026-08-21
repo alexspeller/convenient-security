@@ -1,0 +1,44 @@
+#!/bin/bash
+set -eu
+
+# Installer scripts run as root. Keep the language-client bridge outside the
+# admin-group-writable /Applications directory so same-uid malware cannot swap
+# the path Ruby executes before csecd gets a chance to authenticate it.
+bridge_root="/Library/Application Support/ConvenientSecurity"
+app="/Applications/ConvenientSecurity.app"
+[ ! -L "$bridge_root" ] && [ -d "$bridge_root/bin" ] \
+  && [ ! -L "$bridge_root/bin" ] && [ -f "$bridge_root/bin/csec" ] \
+  && [ ! -L "$bridge_root/bin/csec" ] || {
+    echo "Convenient Security bridge payload has an unsafe path shape" >&2
+    exit 1
+  }
+[ ! -L "$app" ] && [ -d "$app" ] || {
+  echo "Convenient Security app payload has an unsafe path shape" >&2
+  exit 1
+}
+/usr/sbin/chown -R root:wheel "$bridge_root"
+/bin/chmod 0755 "$bridge_root" "$bridge_root/bin" "$bridge_root/bin/csec"
+
+for protected_path in \
+  / \
+  /Library \
+  "/Library/Application Support" \
+  "$bridge_root" \
+  "$bridge_root/bin" \
+  "$bridge_root/bin/csec"; do
+  owner="$(/usr/bin/stat -f %u "$protected_path")"
+  mode="$(/usr/bin/stat -f %Lp "$protected_path")"
+  if [ "$owner" != "0" ] || [ $((8#$mode & 022)) -ne 0 ]; then
+    echo "Convenient Security bridge path is not independently protected: $protected_path" >&2
+    exit 1
+  fi
+done
+
+# The app itself is still live-code authenticated on every connection, but root
+# ownership also prevents in-place modification of its signed contents.
+/usr/sbin/chown -R root:wheel "$app"
+
+/usr/bin/codesign --verify --strict "$bridge_root/bin/csec"
+/usr/bin/codesign --verify --deep --strict "$app"
+
+exit 0

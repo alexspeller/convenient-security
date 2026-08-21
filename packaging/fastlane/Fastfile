@@ -1,0 +1,48 @@
+# frozen_string_literal: true
+
+# Provisioning for the convenient-security agent, driven by an App Store Connect
+# API key (Team key, Admin role) that lives in 1Password. A wrapper reads it with
+# `op` just-in-time and gives Fastlane an inherited `/dev/fd` pipe. Private key
+# bytes therefore stay out of argv, environment snapshots, and disk:
+#   ASC_KEY_ID       - the API key's Key ID
+#   ASC_ISSUER_ID    - the team's Issuer ID
+#   ASC_KEY_FILE     - inherited descriptor path (normally /dev/fd/3)
+#
+# Local signing/notarization (codesign, notarytool, stapler, pkgbuild) live in a
+# shell script; fastlane here only talks to the developer portal.
+
+APP_IDENTIFIER = "com.alexspeller.convenient-security"
+TEAM_ID = "8RS6GD89Y7" # Stateful Ltd
+
+def asc_api_key
+  app_store_connect_api_key(
+    key_id: ENV.fetch("ASC_KEY_ID"),
+    issuer_id: ENV.fetch("ASC_ISSUER_ID"),
+    key_filepath: ENV.fetch("ASC_KEY_FILE")
+  )
+end
+
+# NOTE: the App ID (com.alexspeller.convenient-security) must be pre-registered in
+# the developer portal. `produce` can't do it here — it has no App Store Connect
+# API-key support (Apple-ID auth only). It's a one-time manual step, done in the
+# same portal visit as the Developer ID certificate.
+desc "Fetch/create the Developer ID provisioning profile for the App ID"
+lane :provision do
+  key = asc_api_key
+
+  # Developer ID distribution profile for macOS (sigh's macOS token is "macos").
+  # Auto-includes application-identifier + keychain-access-groups for the App ID,
+  # which is our access group 8RS6GD89Y7.com.alexspeller.convenient-security.
+  # filename must end in .mobileprovision (fastlane validation) even though the
+  # content is a macOS Developer ID profile; build-spike copies it to
+  # embedded.provisionprofile, so the extension on disk is cosmetic.
+  get_provisioning_profile(
+    app_identifier: APP_IDENTIFIER,
+    platform: "macos",
+    developer_id: true,
+    api_key: key,
+    filename: "convenient-security.mobileprovision",
+    output_path: "./build",
+    skip_install: true # we embed the file directly; no Xcode profile store needed
+  )
+end
