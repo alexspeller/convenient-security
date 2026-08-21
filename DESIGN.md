@@ -129,20 +129,39 @@ responsibility.
 
 `csec edit <store>` asks `csecd` to begin a caller-bound, 30-minute edit
 session. After Touch ID, the complete strict-JSON document crosses the mutually
-authenticated socket into the signed launcher. A built-in AppKit `NSTextView`
-edits it without a plaintext filesystem object. Automatic spelling, grammar,
-replacement, data detection, smart punctuation, and window restoration are
-disabled. Save validates and canonicalizes the document in both the launcher
+authenticated socket into the signed launcher. By default a built-in AppKit
+`NSTextView` edits it without a plaintext filesystem object. Automatic spelling,
+grammar, replacement, data detection, smart punctuation, and window restoration
+are disabled. Save validates and canonicalizes the document in both the launcher
 and daemon before the daemon encrypts it; Cancel tells the daemon to discard the
 session. Sessions are bound to the launcher's kernel PID and start time, capped
 at eight, and a stale concurrent editor cannot overwrite a newer generation.
 
-There is no arbitrary `$EDITOR` mode. Ordinary editor contracts require a named
-plaintext file and commonly add swap, backup, or autosave copies, which would
-reopen the same-UID read channel this store is intended to close. The built-in
-editor still authorizes the user and AppKit/input stack to see the plaintext;
-copying, screenshots, accessibility/screen-capture privileges, or a compromised
-authorized process remain outside the boundary.
+`csec edit --editor <store>` is an explicit compatibility boundary for a user's
+`$EDITOR`. Before Touch ID it warns that the mode creates a named plaintext file.
+The command is parsed into a bounded argv and executed directly, without an
+implicit shell or expansion; the randomized document path is appended as the
+last argument. The editor must remain in the foreground (for example,
+`code --wait`) until editing is complete. Invalid JSON is reported without its
+contents and reopens the same editor; a nonzero or signalled exit cancels the
+edit session.
+
+The external mode uses a randomized directory below csec's canonical per-user
+temporary directory. The directory is `0700`; the initial document is created
+with `openat`, `O_EXCL`, `O_NOFOLLOW`, and mode `0600`. After the editor exits,
+csec reopens by directory descriptor, accepts only a bounded, current-user,
+single-link regular file, and restores mode `0600`. It then unlinks the document
+and removes editor artifacts within that exact workspace on normal success or
+failure. A crash, `SIGKILL`, or forced termination can leave the workspace
+behind. These controls reduce accidents and cross-account access; they do not
+restore a same-UID boundary. The editor, plugins, same-UID malware, swap,
+autosave, backup, recovery, and filesystem snapshots can retain plaintext, and
+unlinking is not secure erasure on APFS/SSD storage. Copies outside the
+workspace cannot be removed.
+
+The built-in editor still authorizes the user and AppKit/input stack to see the
+plaintext; copying, screenshots, accessibility/screen-capture privileges, or a
+compromised authorized process remain outside the boundary.
 
 ## Output redaction and AI hooks
 

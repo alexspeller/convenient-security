@@ -158,6 +158,45 @@ checkThrows("native store documents enforce the 1 MiB canonical bound") {
     _ = try NativeStoreDocument(values: ["TOKEN": String(repeating: "x", count: 1024 * 1024)])
 }
 
+print("\n# ExternalEditorCommand")
+
+do {
+    let command = try ExternalEditorCommand(
+        editorValue: #"/bin/cp --force 'path with spaces' escaped\ value "$HOME" '$(touch /tmp/not-run)'"#,
+        environment: ["PATH": "/usr/bin:/bin"]
+    )
+    check(command.executablePath.hasSuffix("/cp"),
+          "$EDITOR resolves its executable without a shell")
+    check(command.arguments == [
+        "--force", "path with spaces", "escaped value", "$HOME", "$(touch /tmp/not-run)",
+    ], "$EDITOR supports quoted argv while preserving expansion syntax literally")
+} catch {
+    check(false, "a bounded quoted $EDITOR command parses (\(error))")
+}
+
+let editorExpansionMarker = NSTemporaryDirectory()
+    + "csec-editor-command-substitution-\(getpid())"
+try? FileManager.default.removeItem(atPath: editorExpansionMarker)
+do {
+    _ = try ExternalEditorCommand(
+        editorValue: "/bin/echo $(/usr/bin/touch \(editorExpansionMarker))",
+        environment: ["PATH": "/usr/bin:/bin"]
+    )
+    check(!FileManager.default.fileExists(atPath: editorExpansionMarker),
+          "$EDITOR parsing never evaluates command substitutions")
+} catch {
+    check(false, "$EDITOR metacharacters remain inert during parsing (\(error))")
+}
+checkThrows("an unset $EDITOR is rejected before editing") {
+    _ = try ExternalEditorCommand(environment: ["PATH": "/usr/bin:/bin"])
+}
+checkThrows("an unterminated $EDITOR quote is rejected") {
+    _ = try ExternalEditorCommand(
+        editorValue: #"/bin/echo 'unterminated"#,
+        environment: ["PATH": "/usr/bin:/bin"]
+    )
+}
+
 let nativeUnlock = CacheUnlock(LAContext()) // in-memory backend only; never prompts
 do {
     let keyBackend = InMemoryNativeStoreKeyBackend()

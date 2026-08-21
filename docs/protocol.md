@@ -278,11 +278,14 @@ can correct it. A save whose baseline is no longer current returns
 `edit_conflict`. `cancel_native_store_edit` removes a caller-owned session and
 returns no document.
 
-The plaintext document crosses only the existing mutually authenticated socket
-and then exists in the daemon and signed launcher's heaps. It is intentionally
-never put in argv, the environment, protocol error text, logs, or a temporary
-file. The protocol does not make the authorized launcher, AppKit editor, or
-user-directed clipboard and screen actions confidential.
+The plaintext document crosses only the existing mutually authenticated socket;
+the protocol never puts it in argv, the environment, error text, or logs. The
+default built-in editor keeps it in the daemon and signed launcher's heaps and
+creates no temporary file. The explicit client-side `csec edit --editor` mode
+instead writes it to a private named temporary file so an arbitrary editor can
+operate on it; that weaker delivery is outside the wire protocol. The protocol
+does not make the authorized launcher, editor, plugins, or user-directed
+clipboard and screen actions confidential.
 
 ## Typed, value-free failures
 

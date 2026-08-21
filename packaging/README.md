@@ -154,6 +154,16 @@ Once the agent is running, create a native encrypted store with:
 /Applications/ConvenientSecurity.app/Contents/MacOS/csec edit development
 ```
 
+That command uses the fileless built-in editor. If its editing features are too
+limited, `csec edit --editor development` invokes the command in `$EDITOR`
+directly and appends a temporary JSON pathname. For example, use
+`EDITOR='code --wait'`; an editor that forks and returns without waiting is not
+compatible. This mode warns because the named plaintext is readable by same-UID
+processes and may be copied by plugins, swap, autosave, backup, or snapshots.
+The private workspace is removed after the editor exits, but cleanup is not
+secure erasure, cannot reach copies elsewhere, and cannot run after a crash or
+forced termination.
+
 Only ciphertext is written beneath
 `~/Library/Application Support/ConvenientSecurity/Secrets/`; the per-store data
 key and authenticated active-version pointer use the provisioned Keychain group.

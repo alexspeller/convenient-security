@@ -106,13 +106,27 @@ permission changes remain denial of service.
 `csec edit` releases the whole decrypted document only to the mutually
 authenticated signed launcher after separate fresh Touch ID consent. The edit
 session is bound to that launcher's kernel PID/start time, expires after 30
-minutes, and rejects stale concurrent saves. The built-in AppKit editor creates
-no named plaintext file and disables automatic spelling, replacement, data
-detection, and window restoration. Plaintext nevertheless exists in launcher
-and AppKit memory. User-initiated copying, screenshots, input methods,
+minutes, and rejects stale concurrent saves. The default built-in AppKit editor
+creates no named plaintext file and disables automatic spelling, replacement,
+data detection, and window restoration. Plaintext nevertheless exists in
+launcher and AppKit memory. User-initiated copying, screenshots, input methods,
 accessibility/screen-capture authority, and compromise of the authorized UI
-process remain outside the boundary. There is no key export or recovery path;
-loss of the Mac or Keychain record is permanent data loss.
+process remain outside the boundary.
+
+`csec edit --editor` deliberately weakens this boundary. It places the whole
+document in a named `0600` file inside a randomized `0700` temporary workspace
+and gives its pathname to the chosen editor. The modes deter other accounts but
+not same-UID malware. The editor and plugins can read or copy every value; swap,
+autosave, backup, recovery, snapshots, and copies outside the workspace may
+survive csec's best-effort cleanup, and a crash or forced termination can leave
+the workspace itself. Interactive editor display and output are not supervised
+by csec's output masker. No implicit shell evaluates `$EDITOR`, but a user can
+explicitly select a shell or an editor argument with its own effects. This mode
+warns before biometric consent and should be used only when its editor
+functionality is worth the edit-window exposure.
+
+There is no key export or recovery path; loss of the Mac or Keychain record is
+permanent data loss.
 
 ### Output redaction
 

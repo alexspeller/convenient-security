@@ -30,7 +30,10 @@ resolution, caller-bound edit sessions, concurrent-edit rejection, AES-GCM
 round trips, ciphertext mutation, valid-version replay, and restart behavior.
 It also exercises the production `openat` filesystem backend in a temporary
 directory, including atomic replacement, modes, and symlink rejection. These
-checks do not substitute for the signed biometric Keychain gate below.
+checks do not substitute for the signed biometric Keychain gate below. External
+editor checks cover bounded shell-free `$EDITOR` parsing, quoted paths, a real
+edit/commit, an editor failure, the pre-edit warning, value-free output, and
+temporary-workspace cleanup.
 
 ## Toolchain baseline
 
@@ -76,8 +79,11 @@ Before treating an artifact as protected, verify on the signed installed app:
 9. `csec edit` creates only ciphertext under the documented directory, a cold
    daemon requires Touch ID, a warm granted read does not reprompt, and
    ciphertext modification plus replay of an older version both fail closed;
-10. editing and cancelling a synthetic store leaves no named plaintext, editor
-    swap, backup, or autosave file;
+10. built-in editing and cancelling a synthetic store leaves no named plaintext,
+    editor swap, backup, or autosave file; external `--editor` mode shows its
+    plaintext warning before Touch ID, uses `0700`/`0600` workspace objects, and
+    removes that exact workspace after success, invalid input, and editor failure
+    (without claiming crash cleanup, secure erasure, or removal of copies);
 11. the signed/notarized package installs the bridge at
    `/Library/Application Support/ConvenientSecurity/bin/csec` with every path
    component root-owned and non-user-writable, and Ruby reaches the installed

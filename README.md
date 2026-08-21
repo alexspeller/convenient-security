@@ -182,10 +182,35 @@ names, more than 1024 entries, or a canonical document over 1 MiB. YAML tags,
 anchors and implicit typing—and a third-party TOML parser—are therefore absent
 from the trusted agent.
 
-The editor does not invoke `$EDITOR` or create a plaintext temporary file. Its
-text and undo state stay in the signed launcher's heap until Save or Cancel.
-Copying text, screenshots, input methods, and code already running inside the
-authorized launcher/UI session remain outside that protection.
+The default editor does not invoke `$EDITOR` or create a plaintext temporary
+file. Its text and undo state stay in the signed launcher's heap until Save or
+Cancel. Copying text, screenshots, input methods, and code already running
+inside the authorized launcher/UI session remain outside that protection.
+
+For editing features the built-in UI does not provide, explicitly opt into the
+weaker external-editor mode:
+
+```sh
+EDITOR='code --wait' \
+  /Applications/ConvenientSecurity.app/Contents/MacOS/csec edit --editor development
+```
+
+`csec` parses `$EDITOR` into a bounded argv and launches the resolved executable
+directly; it does not implicitly use a shell or expand variables, globs,
+operators, or command substitutions. It appends the document path as the final
+argument, so GUI editors need an option such as `--wait` that does not return
+until editing is complete.
+
+This mode necessarily writes the decrypted JSON to a named file in a randomized
+`0700` per-user temporary workspace with mode `0600`. Those modes exclude other
+accounts, not same-UID processes. The editor, its plugins, and same-UID malware
+can read the file, and swap, autosave, recovery, backup, snapshots, or deliberate
+copies can outlive the session. Editor display and output are not passed through
+csec's secret masker. `csec` warns before Touch ID and removes its workspace
+after normal success or failure, but cannot securely erase APFS/SSD storage or
+copies made elsewhere; a crash or forced termination can leave the workspace
+behind. The durable native store remains encrypted before and after the edit
+window.
 
 Ciphertext lives under:
 

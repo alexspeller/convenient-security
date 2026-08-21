@@ -20,8 +20,10 @@ import Darwin
 //       Run a command whose output is scanned against every active value in the
 //       resident agent before any bytes are returned to an AI command runner.
 //
-//   csec edit <store>
-//       Open the native csec:// store as strict JSON in a fileless editor.
+//   csec edit [--editor] <store>
+//       Open the native csec:// store as strict JSON. The built-in fileless
+//       editor is the default; --editor opts into a named plaintext file for
+//       compatibility with the command in $EDITOR.
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
@@ -35,7 +37,7 @@ func usage() -> Never {
       csec tool-exec --destination ai -- <cmd> [args…]
       csec hook claude|codex
       csec hook-config claude|codex
-      csec edit <store>
+      csec edit [--editor] <store>
       csec install | uninstall | status
 
     get        Fetch a secret from the running agent (csecd) and print it to stdout.
@@ -47,7 +49,8 @@ func usage() -> Never {
     tool-exec  Fail-closed AI command broker using csecd's active-value scanner.
     hook       PreToolUse stdin/stdout adapter for Claude Code or Codex.
     hook-config  Print a hook JSON fragment using this exact csec executable.
-    edit       Edit a csec:// store as strict JSON without a plaintext temp file.
+    edit       Edit a csec:// store as strict JSON. The default built-in editor is
+               fileless; --editor uses $EDITOR with a temporary plaintext file.
     install    Register csecd as a login-item LaunchAgent so it runs in the background.
     uninstall  Unregister the csecd LaunchAgent.
     status     Show whether the csecd LaunchAgent is registered/enabled.
@@ -228,10 +231,44 @@ func currentExecutablePath() -> String {
 // MARK: - native encrypted store editor
 
 func runEdit(_ arguments: [String]) -> Never {
-    guard arguments.count == 1 else { usage() }
+    var useExternalEditor = false
+    var storeArgument: String?
+    for argument in arguments {
+        if argument == "--editor" {
+            guard !useExternalEditor else { usage() }
+            useExternalEditor = true
+        } else {
+            guard storeArgument == nil, !argument.hasPrefix("-") else { usage() }
+            storeArgument = argument
+        }
+    }
+    guard let storeArgument else { usage() }
+
+    let externalEditor: ExternalEditorCommand?
+    if useExternalEditor {
+        do {
+            externalEditor = try ExternalEditorCommand()
+        } catch {
+            FileHandle.standardError.write(Data("csec edit: \(error.localizedDescription)\n".utf8))
+            exit(2)
+        }
+        FileHandle.standardError.write(Data("""
+        csec edit: warning: --editor writes decrypted secrets to a named temporary file.
+        Same-UID processes, the selected editor and its plugins can read it; swap,
+        autosave, backup, recovery, or filesystem snapshots may retain copies. csec
+        does not mask the editor's display or output. It removes its private
+        temporary workspace after a normal editor exit, but cannot securely erase
+        storage or remove copies made elsewhere. A crash or forced termination can
+        leave the temporary workspace behind.
+
+        """.utf8))
+    } else {
+        externalEditor = nil
+    }
+
     let store: NativeStoreName
     do {
-        store = try NativeStoreName(arguments[0])
+        store = try NativeStoreName(storeArgument)
     } catch {
         FileHandle.standardError.write(Data("csec edit: \(error.localizedDescription)\n".utf8))
         exit(2)
@@ -261,19 +298,34 @@ func runEdit(_ arguments: [String]) -> Never {
     var currentDocument = edit.document
     while true {
         let edited: Data
-        do {
-            guard let result = try NativeStoreEditor.edit(
-                store: store.value,
-                document: currentDocument
-            ) else {
+        if let externalEditor {
+            do {
+                edited = try ExternalNativeStoreEditor.edit(
+                    command: externalEditor,
+                    document: currentDocument
+                )
+            } catch {
                 client.cancelNativeStoreEdit(sessionID: edit.sessionID)
-                print("csec: native store unchanged")
-                exit(0)
+                FileHandle.standardError.write(Data(
+                    "csec edit: \(error.localizedDescription); store unchanged\n".utf8
+                ))
+                exit(1)
             }
-            edited = result
-        } catch {
-            NativeStoreEditor.showValidationError(error.localizedDescription)
-            continue
+        } else {
+            do {
+                guard let result = try NativeStoreEditor.edit(
+                    store: store.value,
+                    document: currentDocument
+                ) else {
+                    client.cancelNativeStoreEdit(sessionID: edit.sessionID)
+                    print("csec: native store unchanged")
+                    exit(0)
+                }
+                edited = result
+            } catch {
+                NativeStoreEditor.showValidationError(error.localizedDescription)
+                continue
+            }
         }
         currentDocument = edited
 
@@ -281,7 +333,7 @@ func runEdit(_ arguments: [String]) -> Never {
         do {
             canonical = try NativeStoreDocument(data: edited).encoded()
         } catch {
-            NativeStoreEditor.showValidationError(error.localizedDescription)
+            showEditValidationError(error.localizedDescription, external: useExternalEditor)
             continue
         }
         if canonical == edit.document {
@@ -301,12 +353,22 @@ func runEdit(_ arguments: [String]) -> Never {
             )
             exit(0)
         } catch AgentClient.ClientError.protocolFailure(.invalidStoreDocument, let message) {
-            NativeStoreEditor.showValidationError(message)
+            showEditValidationError(message, external: useExternalEditor)
         } catch {
             client.cancelNativeStoreEdit(sessionID: edit.sessionID)
             FileHandle.standardError.write(Data("csec edit: \(error.localizedDescription)\n".utf8))
             exit(1)
         }
+    }
+}
+
+func showEditValidationError(_ message: String, external: Bool) {
+    if external {
+        FileHandle.standardError.write(Data(
+            "csec edit: invalid store: \(message); reopening $EDITOR\n".utf8
+        ))
+    } else {
+        NativeStoreEditor.showValidationError(message)
     }
 }
 

@@ -413,6 +413,13 @@ func runCsec(
     )
 }
 
+func externalEditorWorkspaceNames() -> Set<String> {
+    let entries = (try? FileManager.default.contentsOfDirectory(
+        atPath: AgentSocket.directory()
+    )) ?? []
+    return Set(entries.filter { $0.hasPrefix(".csec-edit-") })
+}
+
 func runProgram(
     executable: String,
     arguments: [String]
@@ -556,6 +563,56 @@ func runCsecWithExternalTermination() -> (status: Int32, out: String, err: Strin
 }
 
 if FileManager.default.isExecutableFile(atPath: csecURL.path) {
+    do {
+        let fixtureDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("csec editor fixture \(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: fixtureDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: fixtureDirectory) }
+        let templateURL = fixtureDirectory.appendingPathComponent("template with spaces.json")
+        try Data(#"{"EDITOR_TOKEN":"external-editor-synthetic-token"}"#.utf8)
+            .write(to: templateURL)
+
+        let workspacesBefore = externalEditorWorkspaceNames()
+        let externallyEdited = runCsec(
+            ["edit", "--editor", "external_editor"],
+            extraEnv: ["EDITOR": "/bin/cp '\(templateURL.path)'"]
+        )
+        let workspacesAfter = externalEditorWorkspaceNames()
+        check(externallyEdited.status == 0
+              && externallyEdited.out.contains("saved encrypted store")
+              && externallyEdited.err.contains("Same-UID processes")
+              && !externallyEdited.out.contains("external-editor-synthetic-token")
+              && !externallyEdited.err.contains("external-editor-synthetic-token"),
+              "--editor warns, invokes a quoted $EDITOR argv, and saves without printing values")
+
+        let externalValues = try client.access(
+            references: ["csec://external_editor/EDITOR_TOKEN"],
+            reason: "external editor e2e",
+            ttlSeconds: 60
+        )
+        check(externalValues["csec://external_editor/EDITOR_TOKEN"]
+              == "external-editor-synthetic-token",
+              "--editor commits the validated document through the native provider")
+        check(workspacesAfter == workspacesBefore,
+              "--editor removes its randomized plaintext workspace after success")
+
+        let failedWorkspacesBefore = externalEditorWorkspaceNames()
+        let failedEdit = runCsec(
+            ["edit", "external_editor_failure", "--editor"],
+            extraEnv: ["EDITOR": "/usr/bin/false"]
+        )
+        check(failedEdit.status == 1
+              && failedEdit.err.contains("did not exit successfully")
+              && externalEditorWorkspaceNames() == failedWorkspacesBefore,
+              "--editor cancels and removes its plaintext workspace when the editor fails")
+    } catch {
+        check(false, "external-editor end-to-end checks run (\(error))")
+    }
+
     let fetched = runCsec(
         ["get", "op://demo/db/url", "--reason", "synthetic pipe test", "--for", "60"],
         extraEnv: [:]
