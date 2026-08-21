@@ -105,6 +105,47 @@ public struct AgentClient {
         return capabilities
     }
 
+    /// Begin an exact-caller native-store edit session. The agent performs a
+    /// fresh Touch ID check before returning the complete decrypted JSON
+    /// document to the authenticated product launcher.
+    public func beginNativeStoreEdit(store: String) throws -> NativeStoreEditStart {
+        let request = BeginNativeStoreEditRequest(store: store)
+        let response = try send(.beginNativeStoreEdit(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let sessionID = response.editSessionID,
+              UUID(uuidString: sessionID) != nil,
+              let document = response.document,
+              document.count <= NativeStoreDocument.maximumBytes else {
+            throw ClientError.transportFailed
+        }
+        return NativeStoreEditStart(sessionID: sessionID, document: document)
+    }
+
+    public func commitNativeStoreEdit(
+        sessionID: String,
+        document: Data
+    ) throws -> NativeStoreEditCommit {
+        let request = CommitNativeStoreEditRequest(
+            editSessionID: sessionID,
+            document: document
+        )
+        let response = try send(.commitNativeStoreEdit(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let generation = response.generation,
+              generation > 0,
+              let secretCount = response.secretCount,
+              secretCount >= 0,
+              secretCount <= NativeStoreDocument.maximumSecrets else {
+            throw ClientError.transportFailed
+        }
+        return NativeStoreEditCommit(generation: generation, secretCount: secretCount)
+    }
+
+    public func cancelNativeStoreEdit(sessionID: String) {
+        let request = CancelNativeStoreEditRequest(editSessionID: sessionID)
+        _ = try? send(.cancelNativeStoreEdit(request))
+    }
+
     /// Open one authenticated, persistent connection whose output chunks are
     /// scanned against the agent's active-value registry. Raw registry values
     /// never leave `csecd`; only already-redacted bytes and value-free matches

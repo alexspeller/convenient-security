@@ -103,7 +103,7 @@ public struct StartupSecurityReport: Sendable {
             "csecd security: application-identifier=\(applicationIdentifierPresent ? "ok" : "MISSING") keychain-group=\(keychainAccessGroupPresent ? "ok" : "MISSING")",
             "csecd security: SIP=\(sipStatus.rawValue) socket=\(socketPath)",
             "csecd security: cache=\(cacheEnabled ? "secure-enclave-keychain" : "memory-only") consent=touch-id",
-            "csecd security: provider=\(providerPath ?? "missing") provider-code=\(providerTrusted ? "verified" : "UNVERIFIED")",
+            "csecd security: 1password-provider=\(providerPath ?? "missing") provider-code=\(providerTrusted ? "verified" : "UNVERIFIED")",
         ]
     }
 

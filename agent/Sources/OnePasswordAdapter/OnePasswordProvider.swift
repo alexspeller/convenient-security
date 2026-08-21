@@ -19,7 +19,7 @@ public struct OnePasswordProvider: SecretProvider {
 
     public var schemes: Set<String> { ["op"] }
 
-    public func resolve(_ ref: SecretRef) async throws -> ResolvedSecret {
+    public func resolve(_ ref: SecretRef, unlock: CacheUnlock?) async throws -> ResolvedSecret {
         guard let cliPath else { throw OnePasswordError.cliNotFound }
 
         let result = try await OnePasswordCLI.run(cliPath, ["read", "--no-newline", ref.uri])

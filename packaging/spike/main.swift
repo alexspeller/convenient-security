@@ -2,8 +2,8 @@ import Foundation
 import Security
 import LocalAuthentication
 
-// Signed-build verification for the SE-cache. It checks two properties on real
-// hardware:
+// Signed-build verification for the SE-cache and native encrypted-store key. It
+// checks these properties on real hardware:
 //
 //   1. A Developer-ID-signed, hardened, provisioned (NOT sandboxed) binary can
 //      store and retrieve a Touch-ID-gated item in the data-protection keychain
@@ -14,6 +14,11 @@ import LocalAuthentication
 //      "consent (LAContext.evaluatePolicy) → read the cached item with that SAME
 //      context". This executable performs that sequence and reports whether the
 //      read prompted again.
+//
+//   3. The native store's `.biometryAny`, `WhenUnlockedThisDeviceOnly` record
+//      is invisible to a signed-but-unentitled same-UID helper, cannot be read by
+//      a non-interactive unauthenticated context in the entitled process, then
+//      can be read and updated with the freshly evaluated biometric context.
 //
 // Run the SIGNED binary. Unsigned/unprovisioned it fails at store with -34018.
 
@@ -130,8 +135,111 @@ print(String(format: "→ read returned in %.3fs — %@", fold.seconds,
              ? "no second prompt observed. THE FOLD WORKS: one touch covers consent + cache read."
              : "that delay suggests a SECOND prompt. THE FOLD LIKELY FAILS: cold start needs a separate cache-unlock touch."))
 
-// Clean up regardless.
+// ── Native-store key test ────────────────────────────────────────────────────
+print("\n── Native-store key test — device-only `.biometryAny` record ──")
+let nativeService = "com.alexspeller.convenient-security.native-store-key-spike"
+let nativeAccount = "spike-store"
+let nativeIdentity: [String: Any] = [
+    kSecClass as String: kSecClassGenericPassword,
+    kSecUseDataProtectionKeychain as String: true,
+    kSecAttrService as String: nativeService,
+    kSecAttrAccount as String: nativeAccount,
+]
+
+var nativeAccessError: Unmanaged<CFError>?
+guard let nativeAccess = SecAccessControlCreateWithFlags(
+    kCFAllocatorDefault,
+    kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+    .biometryAny,
+    &nativeAccessError
+) else {
+    fail("native-store SecAccessControlCreateWithFlags failed")
+}
+
+let initialRecord = Data("synthetic-native-record-generation-0".utf8)
+let updatedRecord = Data("synthetic-native-record-generation-1".utf8)
+SecItemDelete(nativeIdentity as CFDictionary)
+var nativeAdd = nativeIdentity
+nativeAdd[kSecAttrAccessControl as String] = nativeAccess
+nativeAdd[kSecValueData as String] = initialRecord
+let nativeAddStatus = SecItemAdd(nativeAdd as CFDictionary, nil)
+guard nativeAddStatus == errSecSuccess else {
+    fail("native-store SecItemAdd failed", status: nativeAddStatus)
+}
+
+let helper = Bundle.main.bundleURL
+    .appendingPathComponent("Contents/MacOS/unentitled-keychain-probe").path
+let helperProcess = Process()
+helperProcess.executableURL = URL(fileURLWithPath: helper)
+helperProcess.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"]
+helperProcess.standardOutput = FileHandle.nullDevice
+helperProcess.standardError = FileHandle.nullDevice
+do {
+    try helperProcess.run()
+    helperProcess.waitUntilExit()
+} catch {
+    fail("could not execute the signed unentitled keychain probe")
+}
+guard helperProcess.terminationReason == .exit,
+      helperProcess.terminationStatus == 0 else {
+    fail("a signed process outside the provisioned access group was not cleanly excluded")
+}
+print("✓ a signed-but-unentitled same-UID helper cannot query the native-store record")
+
+// Prove the item cannot be silently read without an authenticated context. The
+// disabled-interaction context makes this a fail-closed check, never a surprise
+// second biometric prompt.
+let unauthenticatedContext = LAContext()
+unauthenticatedContext.interactionNotAllowed = true
+var deniedRead = nativeIdentity
+deniedRead[kSecReturnData as String] = true
+deniedRead[kSecUseAuthenticationContext as String] = unauthenticatedContext
+var deniedResult: CFTypeRef?
+let deniedStatus = SecItemCopyMatching(deniedRead as CFDictionary, &deniedResult)
+guard deniedStatus != errSecSuccess else {
+    fail("native-store record was readable without biometric authorization")
+}
+print("✓ native-store record rejects a non-interactive unauthenticated read")
+
+func readNativeRecord(context: LAContext) -> (OSStatus, Data?) {
+    var query = nativeIdentity
+    query[kSecReturnData as String] = true
+    query[kSecUseAuthenticationContext as String] = context
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    return (status, result as? Data)
+}
+
+let nativeRead = readNativeRecord(context: context)
+guard nativeRead.0 == errSecSuccess else {
+    fail("native-store authenticated read failed", status: nativeRead.0)
+}
+guard nativeRead.1 == initialRecord else {
+    fail("native-store initial record round-trip mismatch")
+}
+print("✓ the consent LAContext unlocks the native-store record")
+
+var nativeUpdateQuery = nativeIdentity
+nativeUpdateQuery[kSecUseAuthenticationContext as String] = context
+let nativeUpdateStatus = SecItemUpdate(
+    nativeUpdateQuery as CFDictionary,
+    [kSecValueData as String: updatedRecord] as CFDictionary
+)
+guard nativeUpdateStatus == errSecSuccess else {
+    fail("native-store authenticated update failed", status: nativeUpdateStatus)
+}
+let updatedRead = readNativeRecord(context: context)
+guard updatedRead.0 == errSecSuccess else {
+    fail("updated native-store record read failed", status: updatedRead.0)
+}
+guard updatedRead.1 == updatedRecord else {
+    fail("native-store updated record round-trip mismatch")
+}
+print("✓ the authenticated native-store pointer record updates atomically")
+
+// Clean up both synthetic items.
 SecItemDelete(identity as CFDictionary)
+SecItemDelete(nativeIdentity as CFDictionary)
 
 print("""
 
@@ -139,5 +247,5 @@ Verdict is what YOU saw: how many Touch ID prompts total?
   • 1 prompt  → the same context covered consent and the cold cache read.
   • 2 prompts → the cold cache read required a separate biometric action.
 """)
-print("✅ round-trip OK; fold measurement above.")
+print("✅ cache and native-store keychain round trips OK; fold measurement above.")
 exit(0)

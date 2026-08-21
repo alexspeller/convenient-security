@@ -7,24 +7,27 @@ import Darwin
 
 // The launcher / CLI.
 //
-//   csec get <op://reference> [--reason <text>] [--for <seconds>]
+//   csec get <reference> [--reason <text>] [--for <seconds>]
 //       Fetch a secret from the running agent and print it to stdout.
 //
-//   csec exec [options] [--set NAME=<op://ref>]… -- <cmd> [args…]
+//   csec exec [options] [--set NAME=<reference>]… -- <cmd> [args…]
 //       Resolve secret references (from the environment and any --set flags) and
 //       run <cmd> with those values injected into its environment. Environment
-//       values that are themselves references (e.g. DATABASE_URL=op://…) are
+//       values that are themselves references (e.g. DATABASE_URL=csec://…) are
 //       resolved in place, so unmodified tools like `rails`/`psql` just work.
 //
 //   csec tool-exec --destination ai -- <cmd> [args…]
 //       Run a command whose output is scanned against every active value in the
 //       resident agent before any bytes are returned to an AI command runner.
+//
+//   csec edit <store>
+//       Open the native csec:// store as strict JSON in a fileless editor.
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage:
-      csec get <op://reference> [--reason <text>] [--for <seconds>]
-      csec exec [--reason <text>] [--for <seconds>] [--set NAME=<op://ref>]…
+      csec get <reference> [--reason <text>] [--for <seconds>]
+      csec exec [--reason <text>] [--for <seconds>] [--set NAME=<reference>]…
                 [--redact-output=tty|always|never]
                 [--redact-output-label=opaque|reference] [--redact-short-values]
                 -- <cmd> [args…]
@@ -32,17 +35,19 @@ func usage() -> Never {
       csec tool-exec --destination ai -- <cmd> [args…]
       csec hook claude|codex
       csec hook-config claude|codex
+      csec edit <store>
       csec install | uninstall | status
 
     get        Fetch a secret from the running agent (csecd) and print it to stdout.
     exec       Run <cmd> with secret references resolved into its environment. Any env
-               value that is a secret reference (DATABASE_URL=op://…) is resolved in
+               value that is a secret reference (DATABASE_URL=csec://…) is resolved in
                place; --set NAME=<ref> injects additional ones. Terminal output is
                masked by default; use 'always' for captured logs and pipes.
     bridge     Private framed stdin/stdout protocol for language clients; not for terminals.
     tool-exec  Fail-closed AI command broker using csecd's active-value scanner.
     hook       PreToolUse stdin/stdout adapter for Claude Code or Codex.
     hook-config  Print a hook JSON fragment using this exact csec executable.
+    edit       Edit a csec:// store as strict JSON without a plaintext temp file.
     install    Register csecd as a login-item LaunchAgent so it runs in the background.
     uninstall  Unregister the csecd LaunchAgent.
     status     Show whether the csecd LaunchAgent is registered/enabled.
@@ -68,6 +73,8 @@ case "hook":
     runHook(Array(arguments.dropFirst()))
 case "hook-config":
     runHookConfig(Array(arguments.dropFirst()))
+case "edit":
+    runEdit(Array(arguments.dropFirst()))
 case "install":
     runInstall()
 case "uninstall":
@@ -216,6 +223,91 @@ func runToolExec(_ arguments: [String]) -> Never {
 func currentExecutablePath() -> String {
     (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
         .standardizedFileURL.resolvingSymlinksInPath().path
+}
+
+// MARK: - native encrypted store editor
+
+func runEdit(_ arguments: [String]) -> Never {
+    guard arguments.count == 1 else { usage() }
+    let store: NativeStoreName
+    do {
+        store = try NativeStoreName(arguments[0])
+    } catch {
+        FileHandle.standardError.write(Data("csec edit: \(error.localizedDescription)\n".utf8))
+        exit(2)
+    }
+
+    let client = makeAgentClient()
+    do {
+        guard try client.capabilities().features.contains(.nativeEncryptedStore) else {
+            FileHandle.standardError.write(Data(
+                "csec edit: the running agent does not provide the native encrypted store\n".utf8
+            ))
+            exit(1)
+        }
+    } catch {
+        FileHandle.standardError.write(Data("csec edit: cannot reach the trusted agent\n".utf8))
+        exit(1)
+    }
+
+    let edit: NativeStoreEditStart
+    do {
+        edit = try client.beginNativeStoreEdit(store: store.value)
+    } catch {
+        FileHandle.standardError.write(Data("csec edit: \(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+
+    var currentDocument = edit.document
+    while true {
+        let edited: Data
+        do {
+            guard let result = try NativeStoreEditor.edit(
+                store: store.value,
+                document: currentDocument
+            ) else {
+                client.cancelNativeStoreEdit(sessionID: edit.sessionID)
+                print("csec: native store unchanged")
+                exit(0)
+            }
+            edited = result
+        } catch {
+            NativeStoreEditor.showValidationError(error.localizedDescription)
+            continue
+        }
+        currentDocument = edited
+
+        let canonical: Data
+        do {
+            canonical = try NativeStoreDocument(data: edited).encoded()
+        } catch {
+            NativeStoreEditor.showValidationError(error.localizedDescription)
+            continue
+        }
+        if canonical == edit.document {
+            client.cancelNativeStoreEdit(sessionID: edit.sessionID)
+            print("csec: native store unchanged")
+            exit(0)
+        }
+
+        do {
+            let result = try client.commitNativeStoreEdit(
+                sessionID: edit.sessionID,
+                document: canonical
+            )
+            print(
+                "csec: saved encrypted store '\(store.value)' "
+                    + "(generation \(result.generation), \(result.secretCount) secrets)"
+            )
+            exit(0)
+        } catch AgentClient.ClientError.protocolFailure(.invalidStoreDocument, let message) {
+            NativeStoreEditor.showValidationError(message)
+        } catch {
+            client.cancelNativeStoreEdit(sessionID: edit.sessionID)
+            FileHandle.standardError.write(Data("csec edit: \(error.localizedDescription)\n".utf8))
+            exit(1)
+        }
+    }
 }
 
 // MARK: - get

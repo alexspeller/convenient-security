@@ -27,7 +27,10 @@ public protocol SecretProvider: Sendable {
 
     /// Resolve a reference to its value. Implementations may call
     /// `authenticate()` internally on demand (e.g. 1Password DesktopAuth).
-    func resolve(_ ref: SecretRef) async throws -> ResolvedSecret
+    /// `unlock` is the fresh biometric context produced by the agent's consent
+    /// step. Providers whose own source material is biometrically sealed may
+    /// consume it; remote providers can ignore it.
+    func resolve(_ ref: SecretRef, unlock: CacheUnlock?) async throws -> ResolvedSecret
 
     /// Establish or refresh provider auth (DesktopAuth, token, SSO…). Idempotent.
     func authenticate() async throws

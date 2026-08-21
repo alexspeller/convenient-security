@@ -76,6 +76,44 @@ identity. Re-enrolling biometrics invalidates cached items.
 An unsigned development daemon cannot use this cache and runs without
 persistence. The warm plaintext cache exists only in the daemon process.
 
+### Native encrypted stores
+
+`csec://<store>/<key>` values are held in a flat strict-JSON document and stored
+as an AES-256-GCM envelope. The authenticated data binds the store name, format,
+generation, and random file ID. A SHA-256 digest and the sole active
+generation/file pointer are stored beside the random 256-bit data key in one
+data-protection Keychain item. Consequently, modifying an envelope, moving it
+between stores, or replaying an older valid envelope fails before plaintext is
+returned.
+
+The Keychain item is in the provisioned daemon's restricted access group and is
+`WhenUnlockedThisDeviceOnly` with `.biometryAny`. A cold daemon accepts the item
+only with the `LAContext` from fresh Touch ID consent. Unlike the refillable
+cache's `.biometryCurrentSet`, `.biometryAny` deliberately survives fingerprint
+enrollment changes because invalidating this sole key would destroy the store.
+This means any biometric currently trusted by macOS can unlock it. The loaded
+record remains warm only in the hardened daemon; individual secret release is
+still controlled by process-scoped grants.
+
+Ciphertext lives in the user's Application Support directory. Store names are
+visible in filenames, and a same-UID attacker can list, copy, delete, replace,
+or permission-change those files. Modes `0700`/`0600`, `openat`, regular-file
+and owner checks, and symlink rejection reduce mistakes and races but are not a
+same-UID confidentiality boundary. Encryption protects copied bytes;
+authenticated Keychain state rejects replacement and rollback. Deletion or
+permission changes remain denial of service.
+
+`csec edit` releases the whole decrypted document only to the mutually
+authenticated signed launcher after separate fresh Touch ID consent. The edit
+session is bound to that launcher's kernel PID/start time, expires after 30
+minutes, and rejects stale concurrent saves. The built-in AppKit editor creates
+no named plaintext file and disables automatic spelling, replacement, data
+detection, and window restoration. Plaintext nevertheless exists in launcher
+and AppKit memory. User-initiated copying, screenshots, input methods,
+accessibility/screen-capture authority, and compromise of the authorized UI
+process remain outside the boundary. There is no key export or recovery path;
+loss of the Mac or Keychain record is permanent data loss.
+
 ### Output redaction
 
 Supervised `csec exec` redacts eligible values from stdout, stderr, or a PTY that
@@ -108,7 +146,8 @@ All security claims require a Developer-ID-signed, hardened, notarized,
 provisioned build with the exact product identities, the restricted keychain
 access group, no `get-task-allow`, no dangerous Hardened Runtime exception
 entitlements, and SIP enabled. The production startup self-audit refuses to run
-when its required posture or verified 1Password CLI is absent.
+when its required posture is absent or when neither the native store nor a
+verified official 1Password CLI is available.
 
 ## Irreducible boundary
 

@@ -13,6 +13,7 @@ public enum WireCapability: String, Codable, Sendable, CaseIterable {
     case planDigestBinding = "plan_digest_binding"
     case outputGuardBinding = "output_guard_binding"
     case activeOutputRedaction = "active_output_redaction"
+    case nativeEncryptedStore = "native_encrypted_store"
 }
 
 public struct ProtocolCapabilities: Codable, Sendable, Equatable {
@@ -39,6 +40,10 @@ public enum WireErrorCode: String, Codable, Sendable {
     case consentDenied = "consent_denied"
     case providerUnavailable = "provider_unavailable"
     case resolutionFailed = "resolution_failed"
+    case nativeStoreUnavailable = "native_store_unavailable"
+    case invalidStoreDocument = "invalid_store_document"
+    case editSessionExpired = "edit_session_expired"
+    case editConflict = "edit_conflict"
     case internalError = "internal_error"
 }
 
@@ -176,6 +181,38 @@ public struct EndOutputRedactionRequest: Codable, Sendable {
     }
 }
 
+public struct BeginNativeStoreEditRequest: Codable, Sendable {
+    public let requestID: String
+    public let store: String
+
+    public init(store: String, requestID: UUID = UUID()) {
+        self.requestID = requestID.uuidString.lowercased()
+        self.store = store
+    }
+}
+
+public struct CommitNativeStoreEditRequest: Codable, Sendable {
+    public let requestID: String
+    public let editSessionID: String
+    public let document: Data
+
+    public init(editSessionID: String, document: Data, requestID: UUID = UUID()) {
+        self.requestID = requestID.uuidString.lowercased()
+        self.editSessionID = editSessionID
+        self.document = document
+    }
+}
+
+public struct CancelNativeStoreEditRequest: Codable, Sendable {
+    public let requestID: String
+    public let editSessionID: String
+
+    public init(editSessionID: String, requestID: UUID = UUID()) {
+        self.requestID = requestID.uuidString.lowercased()
+        self.editSessionID = editSessionID
+    }
+}
+
 /// Requests retain the v1 flat discriminator so an upgraded agent can return a
 /// typed migration error instead of misinterpreting an old access as secure.
 public enum Request: Sendable {
@@ -185,6 +222,9 @@ public enum Request: Sendable {
     case beginOutputRedaction(BeginOutputRedactionRequest)
     case redactOutputChunk(RedactOutputChunkRequest)
     case endOutputRedaction(EndOutputRedactionRequest)
+    case beginNativeStoreEdit(BeginNativeStoreEditRequest)
+    case commitNativeStoreEdit(CommitNativeStoreEditRequest)
+    case cancelNativeStoreEdit(CancelNativeStoreEditRequest)
 }
 
 extension Request: Codable {
@@ -192,6 +232,7 @@ extension Request: Codable {
         case version, type, requestID, references, reason, ttlSeconds
         case deliveryPlan, deliveryPlanDigest
         case destination, streams, sessionID, stream, data, finish
+        case store, editSessionID, document
     }
 
     public init(from decoder: Decoder) throws {
@@ -239,6 +280,22 @@ extension Request: Codable {
                 sessionID: try container.decode(String.self, forKey: .sessionID),
                 requestID: try Self.decodeUUID(container, forKey: .requestID)
             ))
+        case "begin_native_store_edit":
+            self = .beginNativeStoreEdit(BeginNativeStoreEditRequest(
+                store: try container.decode(String.self, forKey: .store),
+                requestID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
+        case "commit_native_store_edit":
+            self = .commitNativeStoreEdit(CommitNativeStoreEditRequest(
+                editSessionID: try container.decode(String.self, forKey: .editSessionID),
+                document: try container.decode(Data.self, forKey: .document),
+                requestID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
+        case "cancel_native_store_edit":
+            self = .cancelNativeStoreEdit(CancelNativeStoreEditRequest(
+                editSessionID: try container.decode(String.self, forKey: .editSessionID),
+                requestID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: container, debugDescription: "unknown request type"
@@ -283,6 +340,22 @@ extension Request: Codable {
             try container.encode(WireProtocol.version, forKey: .version)
             try container.encode(request.requestID, forKey: .requestID)
             try container.encode(request.sessionID, forKey: .sessionID)
+        case let .beginNativeStoreEdit(request):
+            try container.encode("begin_native_store_edit", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.store, forKey: .store)
+        case let .commitNativeStoreEdit(request):
+            try container.encode("commit_native_store_edit", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.editSessionID, forKey: .editSessionID)
+            try container.encode(request.document, forKey: .document)
+        case let .cancelNativeStoreEdit(request):
+            try container.encode("cancel_native_store_edit", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.editSessionID, forKey: .editSessionID)
         }
     }
 
@@ -313,6 +386,10 @@ public struct Response: Codable, Sendable {
     public let redactionMatches: [OutputRedactionMatch]?
     public let protectedValueCount: Int?
     public let skippedShortValueCount: Int?
+    public let editSessionID: String?
+    public let document: Data?
+    public let generation: UInt64?
+    public let secretCount: Int?
     public let failure: ProtocolFailure?
     public let error: String?
 
@@ -327,6 +404,10 @@ public struct Response: Codable, Sendable {
         redactionMatches: [OutputRedactionMatch]? = nil,
         protectedValueCount: Int? = nil,
         skippedShortValueCount: Int? = nil,
+        editSessionID: String? = nil,
+        document: Data? = nil,
+        generation: UInt64? = nil,
+        secretCount: Int? = nil,
         failure: ProtocolFailure? = nil,
         error: String? = nil
     ) {
@@ -340,6 +421,10 @@ public struct Response: Codable, Sendable {
         self.redactionMatches = redactionMatches
         self.protectedValueCount = protectedValueCount
         self.skippedShortValueCount = skippedShortValueCount
+        self.editSessionID = editSessionID
+        self.document = document
+        self.generation = generation
+        self.secretCount = secretCount
         self.failure = failure
         self.error = error
     }

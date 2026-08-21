@@ -16,7 +16,7 @@ let package = Package(
             name: "CSecuritySupport",
             linkerSettings: [.linkedLibrary("bsm"), .linkedLibrary("util")]
         ),
-        // Provider-agnostic core: references, grants, cache, resolver, protocol.
+        // Security core plus the native encrypted-file provider.
         .target(name: "ConvenientSecurity", dependencies: ["CSecuritySupport"]),
         // All 1Password-specific code lives behind the provider seam.
         .target(name: "OnePasswordAdapter", dependencies: ["ConvenientSecurity"]),

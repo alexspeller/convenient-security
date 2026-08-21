@@ -25,9 +25,8 @@ public struct CallerInfo: Sendable {
 }
 
 /// The result of asking a human to approve newly-requested references. On
-/// approval it may carry a `CacheUnlock` — the biometric context that was just
-/// evaluated — so the resolver can fold the SE-cache's cold read into the same
-/// touch instead of prompting again.
+/// approval it may carry a `CacheUnlock`—the biometric context that was just
+/// evaluated—so cold cache or native-key access can fold into the same touch.
 public enum ConsentOutcome: Sendable {
     case denied
     case approved(unlock: CacheUnlock?)

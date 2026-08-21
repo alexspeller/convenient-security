@@ -3,9 +3,11 @@
 How the resident agent is turned into a Developer-ID-signed, hardened, notarized,
 provisioned `.app` + `.pkg`, and how it installs itself as a login-item
 LaunchAgent. The signed `.app`, provisioning profile, LaunchAgent, Touch ID, and
-keychain path have been proven on real hardware. The new `.pkg` root-owned bridge
-copy and inherited-fd App Store Connect key handoff are covered in source/CI but
-still require the signed physical-machine release gate described below.
+keychain path have been proven on real hardware. The native-store access-group
+exclusion, biometric ACL, and authenticated record update passed the signed
+hardware spike on 21 August 2026. The `.pkg` root-owned bridge copy and inherited-fd
+App Store Connect key handoff are covered in source/CI and retain explicit signed
+physical-machine release gates below.
 
 ## What ships
 
@@ -113,8 +115,12 @@ packaging/bin/notarize.sh packaging/build/ConvenientSecurity.pkg
 
 `packaging/bin/build-spike.sh` is separate — a minimal signed keychain spike that
 proves the data-protection-keychain + biometric foundation (and the AMFI /
-provisioning chain) independently of the full agent. Use `RUN_SPIKE=0` to build +
-sign it without the interactive Touch ID run.
+provisioning chain) independently of the full agent. It exercises both the
+cache's `.biometryCurrentSet` cold-read fold and the native store's device-only
+`.biometryAny` access-group exclusion, unauthenticated-read rejection, and
+authenticated read/update. Its separately signed helper deliberately has no
+restricted entitlement and must be unable to query the item. Use `RUN_SPIKE=0`
+to build + sign without the interactive Touch ID run.
 
 The provisioning and notarization wrappers launch `op` with an allowlisted
 environment and pass the App Store Connect private key to Fastlane/notarytool as
@@ -142,6 +148,16 @@ lands in `/Applications`. Then, **run the CLI from inside the bundle** so
 /Applications/ConvenientSecurity.app/Contents/MacOS/csec uninstall  # unregister
 ```
 
+Once the agent is running, create a native encrypted store with:
+
+```sh
+/Applications/ConvenientSecurity.app/Contents/MacOS/csec edit development
+```
+
+Only ciphertext is written beneath
+`~/Library/Application Support/ConvenientSecurity/Secrets/`; the per-store data
+key and authenticated active-version pointer use the provisioned Keychain group.
+
 `csec install` calls `SMAppService.agent(plistName:).register()`. That resolves
 the plist relative to the **calling process's** `Bundle.main`, which is why `csec`
 must be run from inside the `.app`. Once registered, launchd starts `csecd` at
@@ -155,10 +171,12 @@ the bundle context.
 
 - **Entitlements** (`packaging/agent/csecd.entitlements`): `application-identifier`
   + `keychain-access-groups`, both `8RS6GD89Y7.com.alexspeller.convenient-security`.
-  **No App Sandbox** (Developer ID doesn't need it, and the agent shells out to
-  `op` and shares a `$TMPDIR` socket). Hardened runtime via `codesign --options
-  runtime`. Never change the team prefix or group after secrets are cached — it
-  orphans them.
+  **No App Sandbox** (Developer ID doesn't need it, and the agent may shell out
+  to `op` and shares a per-user socket). The same restricted default group holds
+  refillable cache entries and native-store key/pointer records; their distinct
+  biometric ACLs are verified by `packaging/spike`. Hardened runtime is enabled
+  via `codesign --options runtime`. Never change the team prefix or group after
+  native stores exist—it makes their ciphertext unrecoverable.
 - **Signing order** (`build-agent.sh`): sign `csec` (secondary, no entitlements)
   first, then sign the bundle — which signs `csecd` (the main executable) *with*
   the keychain entitlements the embedded profile authorizes. Verified with
@@ -166,9 +184,11 @@ the bundle context.
 - **LaunchAgent plist** (`packaging/agent/LaunchAgents/…plist`): `BundleProgram`
   is bundle-relative (survives relocation), `RunAtLoad` + `KeepAlive`, and
   `ProcessType=Interactive` (it presents Touch ID). It supplies no provider or
-  credential environment; `csecd` locates fixed absolute `op` candidates,
+  credential environment. `csecd` enables the native provider when its Keychain
+  group is usable. Independently, it locates fixed absolute `op` candidates,
   verifies the official Team/identifier requirement, hardened runtime, and
-  absence of dangerous entitlements, then spawns it with a small allowlist.
+  absence of dangerous entitlements, then spawns `op` with a small allowlist.
+  Production requires at least one of those providers, not necessarily both.
 - **Socket path**: derived from `confstr(_CS_DARWIN_USER_TEMP_DIR)` (keyed on the
   uid), *not* `$TMPDIR` — so the launchd-spawned `csecd` and a shell-spawned `csec`
   always agree on `…/convenient-security-<uid>/agent.sock` regardless of the
@@ -184,6 +204,7 @@ the bundle context.
 |---------|-------------|
 | `csecd` dies instantly at launch, no output, `launchctl` shows exit `-9` | AMFI SIGKILL: an entitled binary that isn't the bundle's main executable, or a missing/invalid profile, or the missing **G2 intermediate**. Ensure `CFBundleExecutable = csecd` and the profile authorizes the access group (`security cms -D -i …/embedded.provisionprofile`). |
 | `csec status` says *not installed* / `.notFound` | Normal **before the first** `csec install`. Otherwise: `csec` isn't being run from inside the installed `.app`. |
+| `csec edit` says the native store is unavailable | The daemon could not use its provisioned Keychain group. Check the embedded profile, signed entitlements, startup log, and the native-store `build-spike` gate. An unsigned SwiftPM daemon intentionally has no native provider. |
 | Agent runs but `op` fetches fail | Install the official signed CLI at `/opt/homebrew/bin/op`, `/usr/local/bin/op`, or `/usr/bin/op`; arbitrary provider paths are intentionally rejected in release builds. |
 | `codesign` shows `0 valid identities` for a cert that's installed | Missing **G2 intermediate CA** — see prerequisites. |
 | Notarization rejected | Check for `get-task-allow` / missing hardened runtime / missing timestamp — the scripts set `--options runtime --timestamp`; don't strip them. |

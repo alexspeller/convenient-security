@@ -2,10 +2,10 @@ import Foundation
 
 /// A canonical secret reference: a URI whose scheme selects the provider.
 ///
-/// The scheme is the adapter selector. The shipping daemon registers `op://…`
-/// for the 1Password adapter. The core understands only `scheme` and an opaque,
-/// provider-specific `path`; parsing the path (for example into
-/// vault/item/field) is the adapter's job.
+/// The scheme is the adapter selector. The shipping daemon may register the
+/// 1Password `op://…` adapter, the native `csec://…` provider, or both. The core
+/// understands only `scheme` and an opaque, provider-specific `path`; parsing
+/// that path is the provider's job.
 public struct SecretRef: Hashable, Sendable, CustomStringConvertible {
     /// The full canonical URI, e.g. `op://vault/item/field`. This is the identity.
     public let uri: String
@@ -53,9 +53,17 @@ public struct SecretRef: Hashable, Sendable, CustomStringConvertible {
     public var safeInlineURI: String { Self.promptSafe(uri) }
 
     /// Human-readable display for consent prompts.
-    /// For `op://` references this breaks the path into vault / item / field
-    /// on separate lines; for other schemes it falls back to the raw URI.
+    /// For known providers this breaks the path into labeled components; for
+    /// other schemes it falls back to the raw URI.
     public var displayString: String {
+        if scheme == "csec", let slash = path.firstIndex(of: "/") {
+            let store = Self.promptSafe(String(path[..<slash]))
+            let key = Self.promptSafe(String(path[path.index(after: slash)...]))
+            if key == "*" {
+                return "native store: \(store)\nkeys: all (edit access)"
+            }
+            return "native store: \(store)\nkey: \(key)"
+        }
         guard scheme == "op" else { return Self.promptSafe(uri) }
         // op://vault/item/field
         if let range = path.range(of: "/") {

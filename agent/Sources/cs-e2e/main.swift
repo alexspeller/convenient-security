@@ -1,5 +1,6 @@
 import Foundation
 import ConvenientSecurity
+import LocalAuthentication
 
 // End-to-end check: start the agent on a temp socket, connect a client, and
 // prove the full path — socket, LOCAL_PEERTOKEN peer identity, subtree grant,
@@ -16,7 +17,7 @@ func check(_ condition: Bool, _ label: String) {
 struct StaticProvider: SecretProvider {
     let values: [String: String]
     var schemes: Set<String> { ["op"] }
-    func resolve(_ ref: SecretRef) async throws -> ResolvedSecret {
+    func resolve(_ ref: SecretRef, unlock: CacheUnlock?) async throws -> ResolvedSecret {
         guard let value = values[ref.uri] else { throw ProviderError.referenceNotFound(ref.uri) }
         return ResolvedSecret(value: value, cacheHint: .noCache)
     }
@@ -28,7 +29,7 @@ actor ConsentCounter: ConsentProvider {
     private(set) var count = 0
     func requestConsent(caller: CallerInfo, newReferences: [SecretRef], reason: String, ttl: TimeInterval) async -> ConsentOutcome {
         count += 1
-        return .approved(unlock: nil)
+        return .approved(unlock: CacheUnlock(LAContext()))
     }
     func calls() -> Int { count }
 }
@@ -53,6 +54,13 @@ await resolver.register(StaticProvider(values: [
     "op://demo/db/url-extended": "postgres://s3cr3t/extended",
     "op://demo/api/key": "sk-demo-123",
 ]))
+let nativeKeyBackend = InMemoryNativeStoreKeyBackend()
+let nativeFileBackend = InMemoryNativeStoreFileBackend()
+let nativeProvider = NativeEncryptedFileProvider(
+    keyBackend: nativeKeyBackend,
+    fileBackend: nativeFileBackend
+)
+await resolver.register(nativeProvider)
 let grants = GrantTable()
 let consent = ConsentCounter()
 let capture = RequestCapture()
@@ -60,6 +68,7 @@ let agent = Agent(
     resolver: resolver,
     grants: grants,
     consent: consent,
+    nativeStore: nativeProvider,
     allowUnverifiedPlansForTesting: true
 )
 
@@ -86,6 +95,12 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.redactOutputChunk(request: chunk, caller: caller)
     case let .endOutputRedaction(end):
         return await agent.endOutputRedaction(request: end, caller: caller)
+    case let .beginNativeStoreEdit(begin):
+        return await agent.beginNativeStoreEdit(request: begin, caller: caller)
+    case let .commitNativeStoreEdit(commit):
+        return await agent.commitNativeStoreEdit(request: commit, caller: caller)
+    case let .cancelNativeStoreEdit(cancel):
+        return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
     }
 }
 Thread.detachNewThread { try? server.run() }
@@ -119,8 +134,9 @@ do {
     check(capabilities.features.contains(.deliveryPlans)
           && capabilities.features.contains(.typedFailures)
           && capabilities.features.contains(.outputGuardBinding)
-          && capabilities.features.contains(.activeOutputRedaction),
-          "agent advertises delivery-plan, output-guard, active-redaction, and typed-failure capabilities")
+          && capabilities.features.contains(.activeOutputRedaction)
+          && capabilities.features.contains(.nativeEncryptedStore),
+          "agent advertises delivery-plan, output-guard, active-redaction, native-store, and typed-failure capabilities")
 } catch {
     check(false, "protocol capability negotiation succeeds (\(error))")
 }
@@ -315,6 +331,48 @@ do {
           "both the already-granted and the newly-granted reference resolve")
 } catch {
     check(false, "consent-delta access failed: \(error)")
+}
+
+// Native provider management stays on the same mutually authenticated socket,
+// but uses a separate exact-caller edit session rather than a secret grant.
+do {
+    let edit = try client.beginNativeStoreEdit(store: "development")
+    check((try? NativeStoreDocument(data: edit.document).values.isEmpty) == true,
+          "native-store edit begins with a decrypted empty JSON document")
+    do {
+        _ = try client.commitNativeStoreEdit(
+            sessionID: edit.sessionID,
+            document: Data(#"{"NATIVE_TOKEN":"one","NATIVE_TOKEN":"two"}"#.utf8)
+        )
+        check(false, "invalid native-store JSON returns a typed failure")
+    } catch AgentClient.ClientError.protocolFailure(.invalidStoreDocument, _) {
+        check(true, "invalid native-store JSON returns a typed failure without consuming the edit session")
+    }
+    let commit = try client.commitNativeStoreEdit(
+        sessionID: edit.sessionID,
+        document: Data(#"{"NATIVE_TOKEN":"native-synthetic-token"}"#.utf8)
+    )
+    check(commit.generation == 1 && commit.secretCount == 1,
+          "native-store edit validates, encrypts, and commits over the authenticated protocol")
+
+    let nativeValues = try client.access(
+        references: ["csec://development/NATIVE_TOKEN"],
+        reason: "native provider e2e",
+        ttlSeconds: 3600
+    )
+    check(nativeValues["csec://development/NATIVE_TOKEN"] == "native-synthetic-token",
+          "csec:// value resolves end-to-end through the native encrypted provider")
+
+    let mixed = try client.access(
+        references: ["op://demo/db/url", "csec://development/NATIVE_TOKEN"],
+        reason: "mixed provider e2e",
+        ttlSeconds: 3600
+    )
+    check(mixed["op://demo/db/url"] == "postgres://s3cr3t"
+          && mixed["csec://development/NATIVE_TOKEN"] == "native-synthetic-token",
+          "one request resolves 1Password and native-store references together")
+} catch {
+    check(false, "native-store protocol checks succeed (\(error))")
 }
 
 // Full `csec exec` path: run the actual built binary against this agent and
@@ -512,6 +570,20 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
     )
     check(explicit.status == 0 && explicit.out == "postgres://s3cr3t",
           "csec exec --set injects the resolved value (got status \(explicit.status), out \"\(explicit.out)\", err \"\(explicit.err)\")")
+
+    let mixedProviders = runCsec(
+        [
+            "exec", "--redact-output=always",
+            "--set", "REMOTE=op://demo/db/url",
+            "--set", "LOCAL=csec://development/NATIVE_TOKEN",
+            "--", "/bin/sh", "-c",
+            "test \"$REMOTE\" = 'postgres://s3cr3t' && "
+                + "test \"$LOCAL\" = 'native-synthetic-token' && printf mixed-ok",
+        ],
+        extraEnv: [:]
+    )
+    check(mixedProviders.status == 0 && mixedProviders.out == "mixed-ok",
+          "csec exec resolves 1Password and native-store assignments in one launch")
 
     let guarded = runCsec(
         [

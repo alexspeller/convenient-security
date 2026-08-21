@@ -13,7 +13,7 @@ import ConvenientSecurity
 struct StaticProvider: SecretProvider {
     let values: [String: String]
     var schemes: Set<String> { ["op"] }
-    func resolve(_ ref: SecretRef) async throws -> ResolvedSecret {
+    func resolve(_ ref: SecretRef, unlock: CacheUnlock?) async throws -> ResolvedSecret {
         guard let value = values[ref.uri] else { throw ProviderError.referenceNotFound(ref.uri) }
         return ResolvedSecret(value: value, cacheHint: .noCache)
     }
@@ -51,6 +51,12 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.redactOutputChunk(request: chunk, caller: caller)
     case let .endOutputRedaction(end):
         return await agent.endOutputRedaction(request: end, caller: caller)
+    case let .beginNativeStoreEdit(begin):
+        return await agent.beginNativeStoreEdit(request: begin, caller: caller)
+    case let .commitNativeStoreEdit(commit):
+        return await agent.commitNativeStoreEdit(request: commit, caller: caller)
+    case let .cancelNativeStoreEdit(cancel):
+        return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
     }
 }
 

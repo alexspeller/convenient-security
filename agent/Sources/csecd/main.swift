@@ -7,7 +7,7 @@ import Darwin
 #endif
 
 // The resident agent. It listens, authenticates peers, tracks subtree grants,
-// gates new references through Touch ID, and resolves through the provider,
+// gates new references through Touch ID, and resolves through registered providers,
 // caching resolved values in the biometric-gated data-protection keychain.
 //
 // There is deliberately no runtime auto-approval switch in this shipping
@@ -34,9 +34,9 @@ if isatty(fileno(stderr)) == 0 {
     freopen(logPath, "a", stderr)
 }
 
-// The at-rest SE-cache needs the provisioned access-group entitlement, which only
-// a signed build carries. Probe once (non-interactive) and fall back to no
-// persistence in an unsigned dev run, rather than failing every write.
+// The at-rest cache and native-store keys need the provisioned access-group
+// entitlement, which only a signed build carries. Probe once (non-interactive)
+// and fall back to neither feature in an unsigned development run.
 let keychainProbe = SecurityKeychainBackend.probe()
 let cacheEnabled = keychainProbe == errSecSuccess
 let cache: SecretCache = cacheEnabled ? KeychainSecretCache() : NullSecretCache()
@@ -44,6 +44,20 @@ let providerPath = OnePasswordCLI.locate()
 let providerReport = providerPath.map { OnePasswordCLI.trustReport(for: $0) }
 let providerTrusted = providerReport?.trusted == true
 let startupReport = StartupSecurityReport.currentAgent()
+var nativeStore: NativeEncryptedFileProvider?
+if cacheEnabled {
+    do {
+        let files = try SecureNativeStoreFileBackend()
+        nativeStore = NativeEncryptedFileProvider(
+            keyBackend: SecurityNativeStoreKeyBackend(),
+            fileBackend: files
+        )
+    } catch {
+        FileHandle.standardError.write(Data(
+            "csecd: native encrypted store unavailable; refusing insecure fallback\n".utf8
+        ))
+    }
+}
 
 for line in startupReport.logLines(
     socketPath: socketPath,
@@ -61,16 +75,26 @@ guard startupReport.productionReady else {
     ))
     exit(1)
 }
-guard providerTrusted, let providerPath else {
+guard providerTrusted || nativeStore != nil else {
     FileHandle.standardError.write(Data(
-        "csecd: refusing production startup without the verified official 1Password CLI.\n".utf8
+        "csecd: refusing production startup because no secure secret provider is available.\n".utf8
     ))
     exit(1)
 }
 #endif
 
 let resolver = SecretResolver(cache: cache)
-await resolver.register(OnePasswordProvider(cliPath: providerPath))
+#if DEBUG
+let registerOnePassword = providerPath != nil
+#else
+let registerOnePassword = providerTrusted
+#endif
+if registerOnePassword, let providerPath {
+    await resolver.register(OnePasswordProvider(cliPath: providerPath))
+}
+if let nativeStore {
+    await resolver.register(nativeStore)
+}
 let grants = GrantTable()
 let consent: ConsentProvider = BiometricConsent()
 #if DEBUG
@@ -78,11 +102,17 @@ let agent = Agent(
     resolver: resolver,
     grants: grants,
     consent: consent,
+    nativeStore: nativeStore,
     allowUnverifiedPlansForTesting: true
 )
 let clientTrustPolicy: SocketPeerTrustPolicy = .allowUnverifiedForTesting
 #else
-let agent = Agent(resolver: resolver, grants: grants, consent: consent)
+let agent = Agent(
+    resolver: resolver,
+    grants: grants,
+    consent: consent,
+    nativeStore: nativeStore
+)
 let clientTrustPolicy: SocketPeerTrustPolicy = .requireProductLauncher
 #endif
 
@@ -100,6 +130,12 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: clientTrustPolicy
         return await agent.redactOutputChunk(request: chunk, caller: caller)
     case let .endOutputRedaction(end):
         return await agent.endOutputRedaction(request: end, caller: caller)
+    case let .beginNativeStoreEdit(begin):
+        return await agent.beginNativeStoreEdit(request: begin, caller: caller)
+    case let .commitNativeStoreEdit(commit):
+        return await agent.commitNativeStoreEdit(request: commit, caller: caller)
+    case let .cancelNativeStoreEdit(cancel):
+        return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
     }
 }
 
@@ -116,6 +152,16 @@ if cacheEnabled {
     let message = "⚠️  at-rest cache OFF (keychain probe: OSStatus \(keychainProbe): \(detail)). "
         + "Running WITHOUT persistence — sign, provision, and run the .app build for the SE-cache.\n"
     FileHandle.standardError.write(Data(message.utf8))
+}
+if let nativeStore {
+    let directory = await nativeStore.encryptedDirectoryPath()
+    FileHandle.standardError.write(Data(
+        "csecd: native encrypted store on — ciphertext directory \(directory).\n".utf8
+    ))
+} else {
+    FileHandle.standardError.write(Data(
+        "csecd: native encrypted store OFF — a provisioned biometric keychain is required.\n".utf8
+    ))
 }
 
 do {

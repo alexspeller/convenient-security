@@ -35,7 +35,7 @@ public actor SecretResolver {
         guard let provider = providers[ref.scheme] else {
             throw ProviderError.unsupportedScheme(ref.scheme)
         }
-        let resolved = try await provider.resolve(ref)
+        let resolved = try await provider.resolve(ref, unlock: unlock)
         if case let .cacheable(maxAge) = resolved.cacheHint {
             do {
                 try await cache.put(ref.uri, value: resolved.value, maxAge: maxAge)

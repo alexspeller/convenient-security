@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Build, sign, and run the keychain spike as a Developer-ID-signed .app so it can
 # use the data-protection keychain. This is the one-command feedback loop that
-# proves the SE-cache foundation on a real signed build.
+# proves the SE-cache and native-store-key foundations on a real signed build.
 #
 # Requires two values (from the Developer ID cert + `fastlane provision`):
 #   SIGN_IDENTITY  e.g. "Developer ID Application: Stateful Ltd (8RS6GD89Y7)"
@@ -24,13 +24,31 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 
 swiftc "$here/spike/main.swift" -o "$app/Contents/MacOS/spike"
+swiftc "$here/spike/unentitled-keychain-probe.swift" \
+  -o "$app/Contents/MacOS/unentitled-keychain-probe"
 cp "$here/spike/Info.plist" "$app/Contents/Info.plist"
 cp "$PROFILE_PATH" "$app/Contents/embedded.provisionprofile"
 
+# Sign the attacker-model helper without restricted entitlements, then seal it
+# inside the provisioned bundle whose main executable receives the access group.
+codesign --force --options runtime --timestamp \
+  --sign "$SIGN_IDENTITY" \
+  "$app/Contents/MacOS/unentitled-keychain-probe"
 codesign --force --options runtime --timestamp \
   --entitlements "$here/spike/spike.entitlements" \
   --sign "$SIGN_IDENTITY" \
   "$app"
+
+codesign --verify --deep --strict "$app"
+helper_entitlements="$(
+  codesign --display --entitlements - \
+    "$app/Contents/MacOS/unentitled-keychain-probe" 2>&1
+)"
+if [[ "$helper_entitlements" == *"keychain-access-groups"* ]] || \
+   [[ "$helper_entitlements" == *"com.apple.application-identifier"* ]]; then
+  echo "error: attacker-model helper unexpectedly has restricted entitlements" >&2
+  exit 1
+fi
 
 echo "--- signature + entitlements ---"
 codesign --display --verbose=2 --entitlements - "$app" 2>&1 || true

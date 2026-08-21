@@ -17,12 +17,17 @@ Use this for consumers we control (Rails at boot). For unmodified tools, use
 require 'convenient_security'
 
 secrets = ConvenientSecurity.access(
-  ['op://Vault/DB/url'],
+  ['op://Vault/DB/url', 'csec://development/LOCAL_API_TOKEN'],
   reason: 'boot rails',
   ttl: 8 * 3600
 )
 db_url = secrets.fetch('op://Vault/DB/url') # a plain String, only in the heap
+token = secrets.fetch('csec://development/LOCAL_API_TOKEN')
 ```
+
+References from 1Password and native encrypted files can be requested together;
+the agent dispatches each URI by scheme. Native stores must first be created
+with the signed installed `csec edit <store>` command.
 
 The first call for a new reference triggers the agent's Touch ID consent. The
 signed bridge asks for a grant rooted at its Ruby parent; the agent verifies that

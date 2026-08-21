@@ -10,6 +10,7 @@ export SWIFTPM_MODULECACHE_OVERRIDE="$swift_scratch/swiftpm"
 bash -n \
   "$repo_root/packaging/bin/build-agent.sh" \
   "$repo_root/packaging/bin/build-pkg.sh" \
+  "$repo_root/packaging/bin/build-spike.sh" \
   "$repo_root/packaging/bin/notarize.sh" \
   "$repo_root/packaging/bin/provision.sh" \
   "$repo_root/packaging/pkg-scripts/postinstall"
@@ -18,6 +19,10 @@ plutil -lint \
   "$repo_root/packaging/agent/csecd.entitlements" \
   "$repo_root/packaging/agent/LaunchAgents/com.alexspeller.convenient-security.plist"
 ruby -c "$repo_root/packaging/fastlane/Fastfile"
+swiftc "$repo_root/packaging/spike/main.swift" \
+  -o "$swift_scratch/keychain-spike-compile-check"
+swiftc "$repo_root/packaging/spike/unentitled-keychain-probe.swift" \
+  -o "$swift_scratch/unentitled-keychain-probe-compile-check"
 
 # Every distributed surface must carry the same FSL terms. RubyGems represents
 # licences outside its SPDX allow-list as "Nonstandard"; LICENSE.md is the

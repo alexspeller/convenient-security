@@ -102,6 +102,269 @@ if let spoofed = try? SecretRef("op://vault/item/field\nforged prompt\u{202e}") 
     check(false, "synthetic control-character reference parses for display sanitization test")
 }
 
+print("\n# NativeEncryptedFileProvider (strict JSON + authenticated ciphertext)")
+
+check((try? NativeStoreName("development_1"))?.value == "development_1",
+      "native store names use one path-safe component")
+checkThrows("native store traversal is rejected") { _ = try NativeStoreName("../private") }
+checkThrows("native reference requires exactly store/key") {
+    _ = try NativeSecretReference(try SecretRef("csec://development/nested/key"))
+}
+if let nativeRef = try? SecretRef("csec://development/DATABASE_URL"),
+   let parsed = try? NativeSecretReference(nativeRef) {
+    check(parsed.store.value == "development" && parsed.key == "DATABASE_URL",
+          "csec reference selects one store and key")
+    check(nativeRef.displayString == "native store: development\nkey: DATABASE_URL",
+          "native references have an explicit consent display")
+} else {
+    check(false, "valid csec reference parses")
+}
+
+do {
+    let document = try NativeStoreDocument(data: Data(#"{"TOKEN":"line\nvalue","URL":"https://example.test"}"#.utf8))
+    check(document.values["TOKEN"] == "line\nvalue",
+          "strict JSON decodes explicit string escapes")
+    check(document.values["URL"] == "https://example.test",
+          "strict JSON preserves explicit string values")
+    let canonical = String(data: try document.encoded(), encoding: .utf8) ?? ""
+    check(canonical.hasSuffix("\n")
+          && canonical.range(of: "\"TOKEN\"")!.lowerBound
+             < canonical.range(of: "\"URL\"")!.lowerBound,
+          "native store JSON is normalized with sorted keys")
+} catch {
+    check(false, "valid native-store JSON parses (\(error))")
+}
+checkThrows("duplicate JSON keys are rejected before dictionary collapse") {
+    _ = try NativeStoreDocument(data: Data(#"{"TOKEN":"one","TOKEN":"two"}"#.utf8))
+}
+checkThrows("escaped duplicate JSON keys are rejected after decoding") {
+    _ = try NativeStoreDocument(data: Data(#"{"TOKEN":"one","\u0054OKEN":"two"}"#.utf8))
+}
+checkThrows("non-string JSON values are rejected") {
+    _ = try NativeStoreDocument(data: Data(#"{"TOKEN":123}"#.utf8))
+}
+checkThrows("nested JSON values are rejected") {
+    _ = try NativeStoreDocument(data: Data(#"{"TOKEN":{"nested":"value"}}"#.utf8))
+}
+checkThrows("reference-unsafe JSON keys are rejected") {
+    _ = try NativeStoreDocument(data: Data(#"{"nested/key":"value"}"#.utf8))
+}
+checkThrows("native store documents enforce the 1024-secret bound") {
+    _ = try NativeStoreDocument(values: Dictionary(uniqueKeysWithValues: (0...1024).map {
+        ("KEY_\($0)", "value")
+    }))
+}
+checkThrows("native store documents enforce the 1 MiB canonical bound") {
+    _ = try NativeStoreDocument(values: ["TOKEN": String(repeating: "x", count: 1024 * 1024)])
+}
+
+let nativeUnlock = CacheUnlock(LAContext()) // in-memory backend only; never prompts
+do {
+    let keyBackend = InMemoryNativeStoreKeyBackend()
+    let fileBackend = InMemoryNativeStoreFileBackend()
+    let provider = NativeEncryptedFileProvider(
+        keyBackend: keyBackend,
+        fileBackend: fileBackend
+    )
+    let store = try NativeStoreName("development")
+    let callerPID = getpid()
+    let callerStart = ProcessAncestry.startTime(of: callerPID) ?? 1
+
+    do {
+        _ = try await provider.beginEdit(
+            store: store,
+            callerPID: callerPID,
+            callerStartTime: callerStart,
+            unlock: nil
+        )
+        check(false, "a cold native-store edit without biometric context is rejected")
+    } catch NativeStoreError.authenticationRequired {
+        check(true, "a cold native-store edit without biometric context is rejected")
+    }
+
+    let edit = try await provider.beginEdit(
+        store: store,
+        callerPID: callerPID,
+        callerStartTime: callerStart,
+        unlock: nativeUnlock
+    )
+    check((try? NativeStoreDocument(data: edit.document).values.isEmpty) == true,
+          "first edit opens a new empty store")
+    let firstDocument = Data(#"{"DATABASE_URL":"native-postgres-secret","TOKEN":"native-token-value"}"#.utf8)
+    do {
+        _ = try await provider.commitEdit(
+            sessionID: edit.sessionID,
+            document: firstDocument,
+            callerPID: callerPID,
+            callerStartTime: callerStart + 1
+        )
+        check(false, "a native edit session rejects a different process incarnation")
+    } catch NativeStoreError.editSessionExpired {
+        check(true, "a native edit session rejects a different process incarnation")
+    }
+    let firstCommit = try await provider.commitEdit(
+        sessionID: edit.sessionID,
+        document: firstDocument,
+        callerPID: callerPID,
+        callerStartTime: callerStart
+    )
+    check(firstCommit.generation == 1 && firstCommit.secretCount == 2,
+          "first save commits one version with the validated secret count")
+
+    let firstFiles = await fileBackend.snapshot()
+    let firstCiphertext = firstFiles.values.first ?? Data()
+    check(firstFiles.count == 1 && firstFiles.keys.first?.hasSuffix(".csec") == true,
+          "one opaque versioned ciphertext file backs the logical store")
+    check(firstCiphertext.starts(with: Data("CSECSTR1".utf8))
+          && firstCiphertext.range(of: Data("native-postgres-secret".utf8)) == nil
+          && firstCiphertext.range(of: Data("native-token-value".utf8)) == nil,
+          "AES-GCM envelope contains no plaintext secret bytes")
+    let firstRecord = await keyBackend.record(for: store.value)
+    check(firstRecord?.generation == 1
+          && firstRecord?.keyData.count == 32
+          && firstRecord?.ciphertextDigest?.count == 64,
+          "biometric key record binds the active generation and ciphertext digest")
+
+    let expiryOrigin = Date(timeIntervalSince1970: 1_000)
+    let expiringEdit = try await provider.beginEdit(
+        store: store,
+        callerPID: callerPID,
+        callerStartTime: callerStart,
+        unlock: nativeUnlock,
+        now: expiryOrigin
+    )
+    do {
+        _ = try await provider.commitEdit(
+            sessionID: expiringEdit.sessionID,
+            document: firstDocument,
+            callerPID: callerPID,
+            callerStartTime: callerStart,
+            now: expiryOrigin.addingTimeInterval(30 * 60 + 1)
+        )
+        check(false, "a native edit session expires after its bounded lifetime")
+    } catch NativeStoreError.editSessionExpired {
+        check(true, "a native edit session expires after its bounded lifetime")
+    }
+
+    let ref = try SecretRef("csec://development/DATABASE_URL")
+    let warm = try await provider.resolve(ref, unlock: nil)
+    check(warm.value == "native-postgres-secret" && warm.cacheHint == .noCache,
+          "a warmed provider serves an already-granted reference without persistent value caching")
+
+    let afterRestart = NativeEncryptedFileProvider(
+        keyBackend: keyBackend,
+        fileBackend: fileBackend
+    )
+    do {
+        _ = try await afterRestart.resolve(ref, unlock: nil)
+        check(false, "a restarted provider cannot cold-decrypt without biometric context")
+    } catch NativeStoreError.authenticationRequired {
+        check(true, "a restarted provider cannot cold-decrypt without biometric context")
+    }
+    check(try await afterRestart.resolve(ref, unlock: nativeUnlock).value == "native-postgres-secret",
+          "a biometric context unlocks the durable per-store key after restart")
+
+    let concurrentA = try await afterRestart.beginEdit(
+        store: store,
+        callerPID: callerPID,
+        callerStartTime: callerStart,
+        unlock: nativeUnlock
+    )
+    let concurrentB = try await afterRestart.beginEdit(
+        store: store,
+        callerPID: callerPID,
+        callerStartTime: callerStart,
+        unlock: nativeUnlock
+    )
+    let rotatedDocument = Data(#"{"DATABASE_URL":"rotated-native-secret","TOKEN":"native-token-value"}"#.utf8)
+    let secondCommit = try await afterRestart.commitEdit(
+        sessionID: concurrentA.sessionID,
+        document: rotatedDocument,
+        callerPID: callerPID,
+        callerStartTime: callerStart
+    )
+    check(secondCommit.generation == 2, "an edit advances the authenticated generation")
+    do {
+        _ = try await afterRestart.commitEdit(
+            sessionID: concurrentB.sessionID,
+            document: rotatedDocument,
+            callerPID: callerPID,
+            callerStartTime: callerStart
+        )
+        check(false, "a concurrent stale editor cannot overwrite a newer generation")
+    } catch NativeStoreError.editConflict {
+        check(true, "a concurrent stale editor cannot overwrite a newer generation")
+    }
+
+    let secondFiles = await fileBackend.snapshot()
+    check(secondFiles.count == 1 && Set(secondFiles.keys) != Set(firstFiles.keys),
+          "committing switches to a fresh immutable file and removes the old version")
+    if let activeName = secondFiles.keys.first, var tampered = secondFiles[activeName] {
+        tampered[tampered.index(before: tampered.endIndex)] ^= 0x01
+        await fileBackend.replace(named: activeName, data: tampered)
+        do {
+            _ = try await afterRestart.resolve(ref, unlock: nil)
+            check(false, "ciphertext modification is rejected before a value is returned")
+        } catch NativeStoreError.integrityFailure {
+            check(true, "ciphertext modification is rejected before a value is returned")
+        }
+        // Replacing the active filename with a previously valid older envelope
+        // also fails because the keychain record pins its digest/generation.
+        await fileBackend.replace(named: activeName, data: firstCiphertext)
+        do {
+            _ = try await afterRestart.resolve(ref, unlock: nil)
+            check(false, "an older valid ciphertext cannot be replayed as the active store")
+        } catch NativeStoreError.integrityFailure {
+            check(true, "an older valid ciphertext cannot be replayed as the active store")
+        }
+    } else {
+        check(false, "active ciphertext is available for tamper tests")
+    }
+} catch {
+    check(false, "native encrypted-store checks succeed (\(error))")
+}
+
+do {
+    let testDirectory = NSTemporaryDirectory()
+        + "csec-native-files-\(UUID().uuidString.lowercased())"
+    defer { try? FileManager.default.removeItem(atPath: testDirectory) }
+    let files = try SecureNativeStoreFileBackend(directoryPath: testDirectory)
+    let syntheticCiphertext = Data("synthetic-ciphertext-only".utf8)
+    try await files.writeAtomically(named: "demo.0123456789abcdef0123456789abcdef.csec", data: syntheticCiphertext)
+    check(try await files.read(named: "demo.0123456789abcdef0123456789abcdef.csec") == syntheticCiphertext,
+          "production ciphertext backend round-trips through atomic openat writes")
+    do {
+        try await files.writeAtomically(
+            named: "demo.0123456789abcdef0123456789abcdef.csec",
+            data: Data("replacement".utf8)
+        )
+        check(false, "immutable ciphertext versions cannot be overwritten")
+    } catch NativeStoreError.filesystemFailure {
+        check(try await files.read(named: "demo.0123456789abcdef0123456789abcdef.csec") == syntheticCiphertext,
+              "immutable ciphertext versions cannot be overwritten")
+    }
+    let attributes = try FileManager.default.attributesOfItem(
+        atPath: testDirectory + "/demo.0123456789abcdef0123456789abcdef.csec"
+    )
+    check((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600,
+          "encrypted store files are mode 0600")
+    let directoryAttributes = try FileManager.default.attributesOfItem(atPath: testDirectory)
+    check((directoryAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o700,
+          "encrypted store directory is mode 0700")
+    try FileManager.default.createSymbolicLink(
+        atPath: testDirectory + "/symlink.csec",
+        withDestinationPath: "/etc/passwd"
+    )
+    do {
+        _ = try await files.read(named: "symlink.csec")
+        check(false, "ciphertext reads refuse symbolic links")
+    } catch NativeStoreError.filesystemFailure {
+        check(true, "ciphertext reads refuse symbolic links")
+    }
+} catch {
+    check(false, "production ciphertext filesystem checks succeed (\(error))")
+}
+
 print("\n# ProcessAncestry (against the live process tree)")
 
 let me = getpid()
@@ -313,6 +576,38 @@ do {
     }
 } catch {
     check(false, "v2 access request round-trip succeeds (\(error))")
+}
+
+do {
+    let begin = BeginNativeStoreEditRequest(
+        store: "development",
+        requestID: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+    )
+    let beginData = try JSONEncoder().encode(Request.beginNativeStoreEdit(begin))
+    let beginDecoded = try JSONDecoder().decode(Request.self, from: beginData)
+    if case let .beginNativeStoreEdit(roundTrip) = beginDecoded {
+        check(roundTrip.store == "development"
+              && roundTrip.requestID == "11111111-2222-3333-4444-555555555555",
+              "native-store edit begin round-trips with its nonce")
+    } else {
+        check(false, "native-store edit begin decodes as the correct request")
+    }
+    let commit = CommitNativeStoreEditRequest(
+        editSessionID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        document: Data(#"{"TOKEN":"synthetic"}"#.utf8),
+        requestID: UUID(uuidString: "66666666-7777-8888-9999-aaaaaaaaaaaa")!
+    )
+    let commitData = try JSONEncoder().encode(Request.commitNativeStoreEdit(commit))
+    let commitDecoded = try JSONDecoder().decode(Request.self, from: commitData)
+    if case let .commitNativeStoreEdit(roundTrip) = commitDecoded {
+        check(roundTrip.editSessionID == commit.editSessionID
+              && roundTrip.document == commit.document,
+              "native-store plaintext uses bounded Data inside the authenticated edit protocol")
+    } else {
+        check(false, "native-store edit commit decodes as the correct request")
+    }
+} catch {
+    check(false, "native-store protocol requests round-trip (\(error))")
 }
 
 let legacyJSON = Data(#"{"type":"access","references":["op://demo/key"],"reason":"old","ttlSeconds":60}"#.utf8)
@@ -563,7 +858,7 @@ if let opPath = OnePasswordCLI.locate() {
 // A provider pointed at a missing binary must fail fast, never hang.
 let brokenProvider = OnePasswordProvider(cliPath: "/nonexistent/op")
 do {
-    _ = try await brokenProvider.resolve(try! SecretRef("op://demo/db/url"))
+    _ = try await brokenProvider.resolve(try! SecretRef("op://demo/db/url"), unlock: nil)
     check(false, "resolve with a missing CLI should throw")
 } catch {
     check(true, "resolve with a missing CLI throws (\(error))")
@@ -615,6 +910,22 @@ if let many = try? ExecPlanner.plan(
     check(many.references == ["op://x", "op://y"], "references are deduped and sorted")
 } else {
     check(false, "multi-ref plan builds")
+}
+
+if let mixedProviders = try? ExecPlanner.plan(
+    environment: [
+        "REMOTE_TOKEN": "op://vault/item/token",
+        "LOCAL_TOKEN": "csec://development/TOKEN",
+    ],
+    explicit: [],
+    knownSchemes: ["op", "csec"]
+) {
+    check(mixedProviders.references == [
+        "csec://development/TOKEN",
+        "op://vault/item/token",
+    ], "environment planning resolves native and 1Password references together")
+} else {
+    check(false, "mixed-provider environment plan builds")
 }
 
 checkThrows("--set with a non-reference value throws") {

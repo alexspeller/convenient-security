@@ -64,7 +64,8 @@ The response advertises supported versions and features:
       "peer_code_identity",
       "plan_digest_binding",
       "output_guard_binding",
-      "active_output_redaction"
+      "active_output_redaction",
+      "native_encrypted_store"
     ]
   }
 }
@@ -76,7 +77,8 @@ The response advertises supported versions and features:
 {"version":2,"type":"schemes"}
 ```
 
-It returns, for example, `{"version":2,"schemes":["op"]}`.
+With both providers available it returns
+`{"version":2,"schemes":["csec","op"]}`.
 
 ## Access v2
 
@@ -231,6 +233,57 @@ opaque matches reduce abuse but do not eliminate it. A scanner session is bound
 to the launcher process, not to a separately authenticated AI parent, and the
 protocol applies no per-caller rate limit beyond its session/chunk bounds.
 
+## Native-store edit sessions
+
+Native store management is separate from ordinary per-reference access. Only a
+verified product launcher can begin an edit. `csecd` validates the path-safe
+store name and always requests fresh Touch ID consent for the synthetic
+`csec://<store>/*` reference; an existing secret grant cannot authorize an edit.
+
+The launcher begins with:
+
+```json
+{
+  "version": 2,
+  "type": "begin_native_store_edit",
+  "requestID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "store": "development"
+}
+```
+
+Success returns a fresh edit-session UUID and the complete canonical JSON
+document as JSON's base64 representation of `Data`. For a new empty store this
+is:
+
+```json
+{
+  "version": 2,
+  "requestID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "editSessionID": "11111111-2222-3333-4444-555555555555",
+  "document": "e30K"
+}
+```
+
+The session is bound to the launcher's kernel PID and start time, lasts at most
+30 minutes, and retains the biometric context needed to authenticate the
+Keychain pointer update. At most eight sessions exist at once. The document is
+limited to 1 MiB and 1024 unique, path-safe keys with string values. The signed
+launcher validates and canonicalizes it locally; the daemon independently
+validates it again.
+
+Save sends `commit_native_store_edit` with the session UUID and bounded `Data`.
+Success reports only the new positive `generation` and `secretCount`. Invalid
+JSON returns `invalid_store_document` without consuming the session so the UI
+can correct it. A save whose baseline is no longer current returns
+`edit_conflict`. `cancel_native_store_edit` removes a caller-owned session and
+returns no document.
+
+The plaintext document crosses only the existing mutually authenticated socket
+and then exists in the daemon and signed launcher's heaps. It is intentionally
+never put in argv, the environment, protocol error text, logs, or a temporary
+file. The protocol does not make the authorized launcher, AppKit editor, or
+user-directed clipboard and screen actions confidential.
+
 ## Typed, value-free failures
 
 Protocol v2 never embeds a reference, provider stderr, or secret in a failure:
@@ -248,7 +301,9 @@ Protocol v2 never embeds a reference, provider stderr, or secret in a failure:
 
 Codes are `upgrade_required`, `unverified_peer`, `policy_denied`,
 `delivery_not_supported`, `invalid_request`, `consent_denied`,
-`provider_unavailable`, `resolution_failed`, and `internal_error`.
+`provider_unavailable`, `resolution_failed`, `native_store_unavailable`,
+`invalid_store_document`, `edit_session_expired`, `edit_conflict`, and
+`internal_error`.
 
 The decoder recognizes a v1 flat `access` request only to return
 `upgrade_required`. Production never invents a secure plan for v1. Fake agents

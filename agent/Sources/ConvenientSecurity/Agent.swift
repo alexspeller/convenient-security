@@ -28,6 +28,7 @@ public actor Agent {
     private let resolver: SecretResolver
     private let grants: GrantTable
     private let consent: ConsentProvider
+    private let nativeStore: NativeEncryptedFileProvider?
     private let allowLegacyAccessForTesting: Bool
     private let allowUnverifiedPlansForTesting: Bool
     private var activeSecrets = ActiveSecretRegistry()
@@ -37,12 +38,14 @@ public actor Agent {
         resolver: SecretResolver,
         grants: GrantTable,
         consent: ConsentProvider,
+        nativeStore: NativeEncryptedFileProvider? = nil,
         allowLegacyAccessForTesting: Bool = false,
         allowUnverifiedPlansForTesting: Bool = false
     ) {
         self.resolver = resolver
         self.grants = grants
         self.consent = consent
+        self.nativeStore = nativeStore
         self.allowLegacyAccessForTesting = allowLegacyAccessForTesting
         self.allowUnverifiedPlansForTesting = allowUnverifiedPlansForTesting
     }
@@ -157,8 +160,8 @@ public actor Agent {
         let newReferences = refs.filter { !accessible.contains($0.uri) }
 
         // New references require fresh consent; already-granted ones don't. The
-        // consent touch also yields the unlock that lets the SE-cache serve a cold
-        // (post-restart) value without a second prompt.
+        // consent touch also yields the unlock for a cold cache value or native
+        // store key after an agent restart.
         var unlock: CacheUnlock?
         if !newReferences.isEmpty {
             var displayedCaller = caller
@@ -334,6 +337,120 @@ public actor Agent {
         return Response(requestID: request.requestID, redactedData: Data())
     }
 
+    public func beginNativeStoreEdit(
+        request: BeginNativeStoreEditRequest,
+        caller: CallerInfo
+    ) async -> Response {
+        guard UUID(uuidString: request.requestID) != nil,
+              request.store.utf8.count <= 64,
+              caller.startTime > 0,
+              isVerifiedLauncher(caller),
+              let nativeStore else {
+            return .failed(
+                .nativeStoreUnavailable,
+                message: "the native encrypted store is unavailable",
+                requestID: request.requestID
+            )
+        }
+        let store: NativeStoreName
+        do {
+            store = try NativeStoreName(request.store)
+        } catch {
+            return .failed(
+                .invalidRequest,
+                message: "the native store name is invalid",
+                requestID: request.requestID
+            )
+        }
+
+        let consentReference = NativeSecretReference.editConsentReference(for: store)
+        let outcome = await consent.requestConsent(
+            caller: caller,
+            newReferences: [consentReference],
+            reason: "edit native encrypted store",
+            ttl: 30 * 60
+        )
+        guard case let .approved(unlock) = outcome else {
+            return .failed(
+                .consentDenied,
+                message: "consent denied",
+                requestID: request.requestID
+            )
+        }
+
+        do {
+            let edit = try await nativeStore.beginEdit(
+                store: store,
+                callerPID: caller.pid,
+                callerStartTime: caller.startTime,
+                unlock: unlock
+            )
+            return Response(
+                requestID: request.requestID,
+                editSessionID: edit.sessionID,
+                document: edit.document
+            )
+        } catch {
+            return nativeStoreFailure(error, requestID: request.requestID)
+        }
+    }
+
+    public func commitNativeStoreEdit(
+        request: CommitNativeStoreEditRequest,
+        caller: CallerInfo
+    ) async -> Response {
+        guard UUID(uuidString: request.requestID) != nil,
+              UUID(uuidString: request.editSessionID) != nil,
+              request.document.count <= NativeStoreDocument.maximumBytes,
+              caller.startTime > 0,
+              isVerifiedLauncher(caller),
+              let nativeStore else {
+            return .failed(
+                .invalidRequest,
+                message: "the native-store edit request is invalid",
+                requestID: request.requestID
+            )
+        }
+        do {
+            let result = try await nativeStore.commitEdit(
+                sessionID: request.editSessionID,
+                document: request.document,
+                callerPID: caller.pid,
+                callerStartTime: caller.startTime
+            )
+            return Response(
+                requestID: request.requestID,
+                generation: result.generation,
+                secretCount: result.secretCount
+            )
+        } catch {
+            return nativeStoreFailure(error, requestID: request.requestID)
+        }
+    }
+
+    public func cancelNativeStoreEdit(
+        request: CancelNativeStoreEditRequest,
+        caller: CallerInfo
+    ) async -> Response {
+        guard UUID(uuidString: request.requestID) != nil,
+              UUID(uuidString: request.editSessionID) != nil,
+              caller.startTime > 0,
+              isVerifiedLauncher(caller),
+              let nativeStore else {
+            return .failed(
+                .invalidRequest,
+                message: "the native-store edit request is invalid",
+                requestID: request.requestID
+            )
+        }
+        await nativeStore.cancelEdit(
+            sessionID: request.editSessionID,
+            callerPID: caller.pid,
+            callerStartTime: caller.startTime
+        )
+        return Response(requestID: request.requestID)
+    }
+
     /// Advertise the URI schemes the agent can resolve. A capability query — no
     /// consent, no grant, no secret material — so a client can detect which
     /// environment values are secret references.
@@ -342,7 +459,64 @@ public actor Agent {
     }
 
     public func capabilities() -> Response {
-        Response(capabilities: ProtocolCapabilities())
+        let features = WireCapability.allCases.filter {
+            $0 != .nativeEncryptedStore || nativeStore != nil
+        }
+        return Response(capabilities: ProtocolCapabilities(features: features))
+    }
+
+    private func isVerifiedLauncher(_ caller: CallerInfo) -> Bool {
+        allowUnverifiedPlansForTesting || caller.peerIdentity?.code.role == .launcher
+    }
+
+    private func nativeStoreFailure(_ error: Error, requestID: String) -> Response {
+        guard let error = error as? NativeStoreError else {
+            return .failed(
+                .internalError,
+                message: "the native-store operation failed",
+                requestID: requestID
+            )
+        }
+        switch error {
+        case .invalidStoreName, .invalidReference:
+            return .failed(
+                .invalidRequest,
+                message: "the native-store request is invalid",
+                requestID: requestID
+            )
+        case .invalidDocument, .documentTooLarge, .tooManySecrets:
+            return .failed(
+                .invalidStoreDocument,
+                message: "the store must be a JSON object with unique valid keys and string values",
+                requestID: requestID
+            )
+        case .editSessionExpired:
+            return .failed(
+                .editSessionExpired,
+                message: "the native-store edit session is invalid or expired",
+                requestID: requestID
+            )
+        case .editConflict:
+            return .failed(
+                .editConflict,
+                message: "the native store changed after this edit began",
+                requestID: requestID
+            )
+        case .tooManyEditSessions:
+            return .failed(
+                .policyDenied,
+                message: "too many native-store edit sessions are active",
+                requestID: requestID
+            )
+        case .authenticationRequired, .keyUnavailable, .storeNotFound,
+             .secretNotFound, .integrityFailure, .filesystemFailure,
+             .randomGenerationFailed:
+            return .failed(
+                .nativeStoreUnavailable,
+                message: "the native encrypted store is unavailable or failed integrity validation",
+                requestID: requestID
+            )
+        }
     }
 
     private func pruneRedactionSessions(now: Date) {

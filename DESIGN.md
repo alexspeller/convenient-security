@@ -11,7 +11,8 @@ Convenient Security protects secret values from unrelated, non-root processes
 running as the same login user. It provides per-reference Touch ID consent,
 process-scoped grants, a code-identity-gated at-rest cache, heap delivery for an
 integrated Ruby client, an environment compatibility launcher, and exact-value
-output redaction.
+output redaction. It can resolve from the official 1Password CLI and from
+device-bound native encrypted files.
 
 It does not protect a value from root, from code already executing inside an
 authorized consumer, from a consumer the user deliberately launches, or from a
@@ -26,8 +27,11 @@ user who approves a misleading request.
 - **`csec`** is the signed CLI, bridge, launcher, output supervisor, and AI
   command broker. Its commands are listed by `csec help`.
 - **`OnePasswordAdapter`** invokes a verified installation of the official
-  1Password CLI with an allowlisted environment. It is the only provider adapter
-  registered by the shipping daemon.
+  1Password CLI with an allowlisted environment.
+- **`NativeEncryptedFileProvider`** owns `csec://` parsing, strict JSON,
+  AES-256-GCM encryption, per-store biometric Keychain records, immutable
+  ciphertext versions, rollback detection, and bounded edit sessions. Both
+  providers can be registered at once.
 - **The Ruby client** invokes the independently protected `csec bridge` binary
   and receives framed values through a private pipe. It does not connect to the
   agent socket itself.
@@ -77,10 +81,13 @@ references, caller-supplied purpose, and duration. Dynamic text is bounded and
 control, newline, and bidirectional-formatting characters are neutralized.
 
 Approval returns the evaluated context to the cache read so a cold cached value
-can be unlocked by the same biometric action. Denial, unavailable biometrics,
-or lockout fails closed. The shipping daemon has no runtime auto-approval
-switch; automatic consent exists only in separate test executables and injected
-test dependencies.
+or cold native-store key can be unlocked by the same biometric action. Editing
+a native file is a separate exact-launcher operation that always asks for fresh
+Touch ID and displays that every key in the named store will be exposed to the
+editor. It does not create a reusable secret grant. Denial, unavailable
+biometrics, or lockout fails closed. The shipping daemon has no runtime
+auto-approval switch; automatic consent exists only in separate test
+executables and injected test dependencies.
 
 ## Delivery
 
@@ -118,6 +125,25 @@ raw-output interface intended for a deliberate receiver; shell history,
 pipelines, redirection targets, and downstream commands remain the caller's
 responsibility.
 
+### Native store editing
+
+`csec edit <store>` asks `csecd` to begin a caller-bound, 30-minute edit
+session. After Touch ID, the complete strict-JSON document crosses the mutually
+authenticated socket into the signed launcher. A built-in AppKit `NSTextView`
+edits it without a plaintext filesystem object. Automatic spelling, grammar,
+replacement, data detection, smart punctuation, and window restoration are
+disabled. Save validates and canonicalizes the document in both the launcher
+and daemon before the daemon encrypts it; Cancel tells the daemon to discard the
+session. Sessions are bound to the launcher's kernel PID and start time, capped
+at eight, and a stale concurrent editor cannot overwrite a newer generation.
+
+There is no arbitrary `$EDITOR` mode. Ordinary editor contracts require a named
+plaintext file and commonly add swap, backup, or autosave copies, which would
+reopen the same-UID read channel this store is intended to close. The built-in
+editor still authorizes the user and AppKit/input stack to see the plaintext;
+copying, screenshots, accessibility/screen-capture privileges, or a compromised
+authorized process remain outside the boundary.
+
 ## Output redaction and AI hooks
 
 For one supervised `csec exec` launch, the launcher builds redaction rules from
@@ -143,16 +169,50 @@ at their delivery TTL and are lost when `csecd` restarts.
 
 ## Resolution and cache
 
-`SecretResolver` dispatches references by scheme; the shipping daemon registers
-only `op://`. It checks the warm in-process cache, then—only when a just-approved
-biometric context is present—the data-protection keychain, then the provider.
-Resolved provider values repopulate both cache tiers.
+`SecretResolver` dispatches each reference independently by scheme. The shipping
+daemon registers `op://` when the verified official 1Password CLI is installed
+and registers `csec://` when its provisioned Keychain group is usable. A single
+request, Ruby call, or `csec exec` launch can contain both schemes.
+
+For 1Password, resolution checks the warm in-process cache, then—only when a
+just-approved biometric context is present—the data-protection keychain, then
+the provider. Resolved values repopulate both cache tiers.
 
 The keychain stores one `kSecClassGenericPassword` item per canonical reference
 with `kSecUseDataProtectionKeychain`, the provisioned application access group,
 `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, and `.biometryCurrentSet`.
 Re-enrolling biometrics invalidates the item. The warm tier and grant table are
 memory-only.
+
+Native references use `csec://<store>/<key>`. The decrypted document is a flat
+JSON object of string keys and string values. Store and key names use a bounded
+path-safe ASCII grammar; duplicate keys, nested/non-string values, invalid JSON,
+more than 1024 entries, and canonical documents over 1 MiB are rejected. Native
+values use `.noCache`: the encrypted file remains the source of truth after an
+edit, while the per-store data key is warm only in the provider actor.
+
+Ciphertext is stored in
+`~/Library/Application Support/ConvenientSecurity/Secrets/`. Each logical store
+has a random 256-bit AES key in a data-protection Keychain item under the
+daemon's provisioned access group, `WhenUnlockedThisDeviceOnly`, and
+`.biometryAny`. The latter still requires Touch ID for a cold read but avoids
+destroying the sole decryption key when enrolled fingerprints change. The item
+does not migrate to a new device.
+
+Every save canonicalizes JSON, generates a random 96-bit GCM nonce and random
+128-bit file ID, authenticates the store name/version/generation/file ID as AAD,
+writes the new envelope to a fresh `0600` file, fsyncs and atomically renames it,
+then updates the biometric Keychain record to the new generation, file ID, and
+SHA-256 ciphertext digest. Only after that switch is the previous file removed.
+This order survives a crash without selecting a partially written file. A
+same-UID attacker can read, delete, or replace ciphertext, but cannot modify the
+Keychain pointer/digest; alteration, cross-store substitution, and replay of an
+older valid envelope therefore fail closed. Deletion remains denial of service.
+The directory is `0700`, operations reject symlinks and unexpected ownership or
+permissions, and plaintext is never written there.
+
+There is no recovery-key/export interface. Losing the device or deleting the
+native-store Keychain record makes its encrypted files unrecoverable.
 
 At startup, the daemon probes the restricted access group. A signed and
 provisioned build enables persistence. An unsigned development build reports
@@ -180,8 +240,10 @@ The shipped agent and launcher require all of the following:
   executable-page protection, or debugging; and
 - SIP enabled on the host.
 
-The startup self-audit fails production startup when the required daemon or
-provider posture is absent. The signed-package verification procedure is in
+The startup self-audit fails production startup when the required daemon posture
+is absent. It registers only providers whose own requirements are satisfied and
+refuses to start if neither the native store nor verified 1Password CLI is
+available. The signed-package verification procedure is in
 [`packaging/README.md`](packaging/README.md).
 
 ## Current security boundary
@@ -189,5 +251,8 @@ provider posture is absent. The signed-package verification procedure is in
 The strongest implemented delivery is the Ruby private-pipe path into a clean,
 hardened consumer heap. The environment launcher is a compatibility feature
 with an acknowledged same-UID disclosure channel. Output redaction is an egress
-safeguard, not a repair for that channel. The precise attacker capabilities and
-limits are recorded in [`docs/threat-model.md`](docs/threat-model.md).
+safeguard, not a repair for that channel. Native ciphertext and its rollback
+record protect durable data, while the decrypted editor buffer and values
+released to consumers remain subject to the authorized-consumer boundary. The
+precise attacker capabilities and limits are recorded in
+[`docs/threat-model.md`](docs/threat-model.md).

@@ -49,9 +49,9 @@ public struct BiometricConsent: ConsentProvider {
             }
         }
 
-        // Hand the just-evaluated context to the cache so a cold SE-cache read can
-        // fold into this touch. On a warm agent nothing cold is read; the context
-        // is simply unused. See CacheUnlock / packaging/spike.
+        // Hand the just-evaluated context to the resolver so a cold cache or
+        // native-store key read can fold into this touch. On a warm agent the
+        // context may remain unused. See CacheUnlock / packaging/spike.
         return approved ? .approved(unlock: CacheUnlock(context)) : .denied
     }
 

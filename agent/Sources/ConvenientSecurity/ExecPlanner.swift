@@ -56,7 +56,7 @@ public enum ExecPlanner {
     ///
     /// - Environment values that parse as a `SecretRef` whose scheme the agent
     ///   handles are treated as references (the `op run` ergonomic — set
-    ///   `DATABASE_URL=op://…` in your `.envrc` and it's resolved in place). A
+    ///   `DATABASE_URL=csec://…` in your `.envrc` and it's resolved in place). A
     ///   plain `https://…` URL is left untouched because its scheme isn't one the
     ///   agent resolves.
     /// - Explicit `--set NAME=ref` entries always apply and override any env-scan
