@@ -25,7 +25,8 @@ public struct BiometricConsent: ConsentProvider {
         caller: CallerInfo,
         newReferences: [SecretRef],
         reason: String,
-        ttl: TimeInterval
+        ttl: TimeInterval,
+        policySummary: String?
     ) async -> ConsentOutcome {
         let context = LAContext()
         context.localizedCancelTitle = "Deny"
@@ -40,7 +41,11 @@ public struct BiometricConsent: ConsentProvider {
         }
 
         let localizedReason = Self.prompt(
-            caller: caller, references: newReferences, reason: reason, ttl: ttl
+            caller: caller,
+            references: newReferences,
+            reason: reason,
+            ttl: ttl,
+            policySummary: policySummary
         )
 
         let approved: Bool = await withCheckedContinuation { continuation in
@@ -58,16 +63,21 @@ public struct BiometricConsent: ConsentProvider {
     /// The text shown in the Touch ID sheet: exactly what is being granted, to
     /// whom, and for how long.
     public static func prompt(
-        caller: CallerInfo, references: [SecretRef], reason: String, ttl: TimeInterval
+        caller: CallerInfo,
+        references: [SecretRef],
+        reason: String,
+        ttl: TimeInterval,
+        policySummary: String? = nil
     ) -> String {
         let list = references.map { "• \($0.displayString)" }.joined(separator: "\n")
         let count = references.count
         let noun = count == 1 ? "secret" : "secrets"
+        let policyLine = policySummary.map { "\npolicy: \(promptSafe($0))" } ?? ""
         return """
         grant \(promptSafe(caller.description)) access to \(count) \(noun):
         \(list)
         purpose: \(promptSafe(reason))
-        duration: \(formatDuration(ttl))
+        duration: \(formatDuration(ttl))\(policyLine)
         """
     }
 

@@ -462,7 +462,7 @@ func runGet(_ arguments: [String]) -> Never {
         }
         exit(0)
     } catch {
-        FileHandle.standardError.write(Data("csec: \(error)\n".utf8))
+        FileHandle.standardError.write(Data("csec: \(error.localizedDescription)\n".utf8))
         exit(1)
     }
 }
@@ -592,7 +592,7 @@ func runExec(_ arguments: [String]) -> Never {
             resolvedExecutablePath = executable.canonicalPath
             injected = try ExecPlanner.resolvedEnvironment(base: [:], plan: plan, values: values)
         } catch {
-            FileHandle.standardError.write(Data("csec exec: \(error)\n".utf8))
+            FileHandle.standardError.write(Data("csec exec: \(error.localizedDescription)\n".utf8))
             exit(1)
         }
     }

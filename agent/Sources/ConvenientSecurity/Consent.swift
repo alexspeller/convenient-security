@@ -51,7 +51,8 @@ public protocol ConsentProvider: Sendable {
         caller: CallerInfo,
         newReferences: [SecretRef],
         reason: String,
-        ttl: TimeInterval
+        ttl: TimeInterval,
+        policySummary: String?
     ) async -> ConsentOutcome
 }
 
@@ -64,7 +65,8 @@ public struct AutoApproveConsent: ConsentProvider {
         caller: CallerInfo,
         newReferences: [SecretRef],
         reason: String,
-        ttl: TimeInterval
+        ttl: TimeInterval,
+        policySummary: String?
     ) async -> ConsentOutcome {
         let refs = newReferences.map(\.uri).joined(separator: ", ")
         FileHandle.standardError.write(Data(

@@ -21,6 +21,12 @@ public actor SecretResolver {
         providers.keys.sorted()
     }
 
+    public func invalidate(references: some Sequence<String>) async {
+        for reference in Set(references) {
+            await cache.invalidate(reference)
+        }
+    }
+
     /// Resolve to a plaintext value: SE-cache first (a warm hit is free; a cold
     /// read folds into `unlock`, the consent touch), then the owning provider on a
     /// miss, persisting per the provider's cache hint.

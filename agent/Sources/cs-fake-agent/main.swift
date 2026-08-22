@@ -33,6 +33,8 @@ let agent = Agent(
     resolver: resolver,
     grants: grants,
     consent: AutoApproveConsent(),
+    riskJudgments: RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend()),
+    policyReview: AutoApprovePolicyReview(),
     allowLegacyAccessForTesting: true,
     allowUnverifiedPlansForTesting: true
 )

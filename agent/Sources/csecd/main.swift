@@ -1,5 +1,6 @@
 import Foundation
 import Security
+@preconcurrency import AppKit
 import ConvenientSecurity
 import OnePasswordAdapter
 #if canImport(Darwin)
@@ -97,11 +98,18 @@ if let nativeStore {
 }
 let grants = GrantTable()
 let consent: ConsentProvider = BiometricConsent()
+let riskBackend: RiskJudgmentBackend = cacheEnabled
+    ? SecurityRiskJudgmentBackend()
+    : InMemoryRiskJudgmentBackend()
+let riskJudgments = RiskJudgmentStore(backend: riskBackend)
+let policyReview: PolicyReviewProvider = TrustedPolicyReview()
 #if DEBUG
 let agent = Agent(
     resolver: resolver,
     grants: grants,
     consent: consent,
+    riskJudgments: riskJudgments,
+    policyReview: policyReview,
     nativeStore: nativeStore,
     allowUnverifiedPlansForTesting: true
 )
@@ -111,6 +119,8 @@ let agent = Agent(
     resolver: resolver,
     grants: grants,
     consent: consent,
+    riskJudgments: riskJudgments,
+    policyReview: policyReview,
     nativeStore: nativeStore
 )
 let clientTrustPolicy: SocketPeerTrustPolicy = .requireProductLauncher
@@ -164,9 +174,17 @@ if let nativeStore {
     ))
 }
 
-do {
-    try server.run() // blocks, accepting connections
-} catch {
-    FileHandle.standardError.write(Data("csecd: \(error)\n".utf8))
-    exit(1)
+// AppKit policy review must be presented on the main actor. Keep the socket
+// accept loop on its documented dedicated thread and run the accessory app's
+// event loop on the process main thread.
+Thread.detachNewThread {
+    do {
+        try server.run()
+    } catch {
+        FileHandle.standardError.write(Data("csecd: \(error)\n".utf8))
+        exit(1)
+    }
 }
+let application = NSApplication.shared
+application.setActivationPolicy(.accessory)
+application.run()

@@ -14,10 +14,24 @@ func check(_ condition: Bool, _ label: String) {
     if !condition { failures += 1 }
 }
 
+actor ResolutionCounter {
+    private var count = 0
+    func record() { count += 1 }
+    func calls() -> Int { count }
+}
+
 struct StaticProvider: SecretProvider {
     let values: [String: String]
+    let counter: ResolutionCounter?
+
+    init(values: [String: String], counter: ResolutionCounter? = nil) {
+        self.values = values
+        self.counter = counter
+    }
+
     var schemes: Set<String> { ["op"] }
     func resolve(_ ref: SecretRef, unlock: CacheUnlock?) async throws -> ResolvedSecret {
+        await counter?.record()
         guard let value = values[ref.uri] else { throw ProviderError.referenceNotFound(ref.uri) }
         return ResolvedSecret(value: value, cacheHint: .noCache)
     }
@@ -27,9 +41,27 @@ struct StaticProvider: SecretProvider {
 
 actor ConsentCounter: ConsentProvider {
     private(set) var count = 0
-    func requestConsent(caller: CallerInfo, newReferences: [SecretRef], reason: String, ttl: TimeInterval) async -> ConsentOutcome {
+    private(set) var lastTTL: TimeInterval?
+    func requestConsent(
+        caller: CallerInfo,
+        newReferences: [SecretRef],
+        reason: String,
+        ttl: TimeInterval,
+        policySummary: String?
+    ) async -> ConsentOutcome {
         count += 1
+        lastTTL = ttl
         return .approved(unlock: CacheUnlock(LAContext()))
+    }
+    func calls() -> Int { count }
+    func latestTTL() -> TimeInterval? { lastTTL }
+}
+
+actor DenyPolicyReview: PolicyReviewProvider {
+    private var count = 0
+    func reviewAccess(_ review: AccessPolicyReview) async -> AccessPolicyReviewOutcome {
+        count += 1
+        return .denied
     }
     func calls() -> Int { count }
 }
@@ -49,11 +81,12 @@ actor RequestCapture {
 let socketPath = NSTemporaryDirectory() + "cs-e2e-\(getpid()).sock"
 
 let resolver = SecretResolver(cache: NullSecretCache())
+let resolutionCounter = ResolutionCounter()
 await resolver.register(StaticProvider(values: [
     "op://demo/db/url": "postgres://s3cr3t",
     "op://demo/db/url-extended": "postgres://s3cr3t/extended",
     "op://demo/api/key": "sk-demo-123",
-]))
+], counter: resolutionCounter))
 let nativeKeyBackend = InMemoryNativeStoreKeyBackend()
 let nativeFileBackend = InMemoryNativeStoreFileBackend()
 let nativeProvider = NativeEncryptedFileProvider(
@@ -68,6 +101,8 @@ let agent = Agent(
     resolver: resolver,
     grants: grants,
     consent: consent,
+    riskJudgments: RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend()),
+    policyReview: AutoApprovePolicyReview(),
     nativeStore: nativeProvider,
     allowUnverifiedPlansForTesting: true
 )
@@ -253,6 +288,106 @@ if let unboundOutputRequest = try? AccessRequest(
           "unrestricted env delivery without an output-policy binding fails before consent")
 } else {
     check(false, "unbound-output request can be constructed for rejection testing")
+}
+
+// Unknown classification and a preclassified incompatible mechanism both stop
+// before the resolver/cache boundary, even for a syntactically valid request
+// constructed directly rather than through csec's normal command planner.
+do {
+    let guardedCounter = ResolutionCounter()
+    let guardedResolver = SecretResolver(cache: NullSecretCache())
+    await guardedResolver.register(StaticProvider(
+        values: ["op://production/admin/token": "never-resolve-this"],
+        counter: guardedCounter
+    ))
+    let guardedStore = RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend())
+    let denyingReview = DenyPolicyReview()
+    let guardedConsent = ConsentCounter()
+    let guardedAgent = Agent(
+        resolver: guardedResolver,
+        grants: GrantTable(),
+        consent: guardedConsent,
+        riskJudgments: guardedStore,
+        policyReview: denyingReview,
+        allowUnverifiedPlansForTesting: true
+    )
+    let directCaller = CallerInfo(
+        pid: getpid(),
+        startTime: ProcessAncestry.startTime(of: getpid()) ?? 0,
+        description: "direct policy test"
+    )
+    let heapPlan = DeliveryPlan(
+        mechanism: .directHeap,
+        executable: PlannedExecutable(canonicalPath: "/bin/sh", assurance: .unverified),
+        root: .caller,
+        descendantScope: .subtree,
+        destination: .localDevelopment,
+        requestedTTLSeconds: 3600,
+        operationContext: "unknown classification test"
+    )
+    let unknownRequest = try AccessRequest(
+        references: ["op://production/admin/token"],
+        reason: "unknown must be reviewed",
+        ttlSeconds: 3600,
+        deliveryPlan: heapPlan
+    )
+    let unknownResponse = await guardedAgent.handle(
+        request: unknownRequest,
+        caller: directCaller
+    )
+    let unknownResolutionCalls = await guardedCounter.calls()
+    let unknownConsentCalls = await guardedConsent.calls()
+    let unknownReviewCalls = await denyingReview.calls()
+    check(unknownResponse.failure?.code == .consentDenied
+          && unknownResolutionCalls == 0
+          && unknownConsentCalls == 0
+          && unknownReviewCalls == 1,
+          "unknown risk requires trusted review before biometric or provider resolution")
+
+    let highReference = try SecretRef("op://production/admin/token")
+    let descriptor = CredentialGrouping.groups(for: [highReference])[0]
+    let identity = try await guardedStore.credentialIdentity(
+        provider: descriptor.provider,
+        providerAccount: descriptor.providerAccount,
+        group: descriptor.group,
+        memberReferences: descriptor.references.map(\.uri)
+    )
+    try await guardedStore.save(RiskJudgment(
+        credential: identity,
+        level: .high,
+        evidence: [],
+        source: .explicitUser,
+        decidedAt: Date(),
+        reviewAfter: Date().addingTimeInterval(3600),
+        policyVersion: RiskPolicyV1.version
+    ))
+    let envPlan = DeliveryPlan(
+        mechanism: .unrestrictedInitialEnvironment,
+        executable: PlannedExecutable(canonicalPath: "/bin/sh", assurance: .unverified),
+        root: .caller,
+        descendantScope: .subtree,
+        destination: .localDevelopment,
+        requestedTTLSeconds: 3600,
+        operationContext: "hand-written incompatible delivery",
+        outputGuard: OutputGuardPlan(mode: .always)
+    )
+    let highRequest = try AccessRequest(
+        references: [highReference.uri],
+        reason: "must fail before resolution",
+        ttlSeconds: 3600,
+        deliveryPlan: envPlan
+    )
+    let highResponse = await guardedAgent.handle(request: highRequest, caller: directCaller)
+    let highResolutionCalls = await guardedCounter.calls()
+    let highConsentCalls = await guardedConsent.calls()
+    let highReviewCalls = await denyingReview.calls()
+    check(highResponse.failure?.code == .policyDenied
+          && highResolutionCalls == 0
+          && highConsentCalls == 0
+          && highReviewCalls == 1,
+          "a hand-written high-risk environment request is denied before review, biometric, cache, or provider")
+} catch {
+    check(false, "direct pre-resolution policy checks succeed (\(error))")
 }
 
 do {
@@ -613,12 +748,20 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
         check(false, "external-editor end-to-end checks run (\(error))")
     }
 
+    let resolutionsBeforePipedGet = await resolutionCounter.calls()
     let fetched = runCsec(
         ["get", "op://demo/db/url", "--reason", "synthetic pipe test", "--for", "60"],
         extraEnv: [:]
     )
-    check(fetched.status == 0 && fetched.out == "postgres://s3cr3t\n",
-          "piped csec get remains an explicit raw-output path with an exact caller grant")
+    let resolutionsAfterPipedGet = await resolutionCounter.calls()
+    check(fetched.status == 1
+          && fetched.out.isEmpty
+          && fetched.err.contains("policy_denied")
+          && resolutionsAfterPipedGet == resolutionsBeforePipedGet,
+          "unknown-destination piped output is denied before provider resolution "
+            + "(status \(fetched.status), out \(fetched.out.debugDescription), "
+            + "err \(fetched.err.debugDescription), resolutions "
+            + "\(resolutionsBeforePipedGet)->\(resolutionsAfterPipedGet))")
 
     // Explicit --set injects a named reference into the child.
     let explicit = runCsec(

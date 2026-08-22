@@ -10,6 +10,7 @@ public struct PolicyReviewCredential: Sendable {
     public let references: [SecretRef]
     public let storedLevel: RiskLevel
     public let scopeExpanded: Bool
+    public let compatibilityReviewOffered: Bool
     public let compatibilityAccepted: Bool
 
     public init(
@@ -17,12 +18,14 @@ public struct PolicyReviewCredential: Sendable {
         references: [SecretRef],
         storedLevel: RiskLevel,
         scopeExpanded: Bool,
+        compatibilityReviewOffered: Bool,
         compatibilityAccepted: Bool
     ) {
         self.identity = identity
         self.references = references.sorted { $0.uri < $1.uri }
         self.storedLevel = storedLevel
         self.scopeExpanded = scopeExpanded
+        self.compatibilityReviewOffered = compatibilityReviewOffered
         self.compatibilityAccepted = compatibilityAccepted
     }
 }
@@ -171,7 +174,7 @@ public struct TrustedPolicyReview: PolicyReviewProvider {
                 stack.addArrangedSubview(scope)
             }
 
-            if review.plan.mechanism.isWeakCompatibility {
+            if credential.compatibilityReviewOffered {
                 let checkbox = NSButton(checkboxWithTitle:
                     "Accept \(review.plan.mechanism.rawValue) compatibility delivery for 30 days",
                     target: nil,

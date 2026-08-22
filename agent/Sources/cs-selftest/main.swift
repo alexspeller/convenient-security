@@ -432,6 +432,80 @@ if let parentStart = ProcessAncestry.startTime(of: myParent) {
     check(false, "parent start time is readable")
 }
 
+print("\n# GrantTable (policy-bound reuse and revocation)")
+
+if let myStart = ProcessAncestry.startTime(of: me) {
+    let table = GrantTable()
+    let binding = PolicyGrantBinding(
+        credentialKey: "opaque-credential",
+        riskLevel: .standard,
+        policyVersion: RiskPolicyV1.version,
+        policyDigest: "policy-a",
+        outputPolicy: .exactMatchRedactAndWarn
+    )
+    await table.add(Grant(
+        rootPID: me,
+        rootStartTime: myStart,
+        references: ["op://vault/item/password"],
+        reason: "synthetic",
+        expiresAt: Date().addingTimeInterval(60),
+        deliveryPlanDigest: "plan-a",
+        policyBinding: binding
+    ))
+    check(await table.accessibleReferences(
+        for: me,
+        now: Date(),
+        deliveryPlanDigest: "plan-a",
+        policyBindingsByReference: ["op://vault/item/password": binding]
+    ) == ["op://vault/item/password"],
+    "a live grant is reusable only with its exact plan and policy binding")
+
+    let changedBinding = PolicyGrantBinding(
+        credentialKey: binding.credentialKey,
+        riskLevel: .high,
+        policyVersion: binding.policyVersion,
+        policyDigest: "policy-b",
+        outputPolicy: .stopAndSuppressOnMatch
+    )
+    check(await table.accessibleReferences(
+        for: me,
+        now: Date(),
+        deliveryPlanDigest: "plan-a",
+        policyBindingsByReference: ["op://vault/item/password": changedBinding]
+    ).isEmpty, "a changed risk/policy snapshot cannot reuse an old grant")
+
+    check(await table.revoke(credentialKey: binding.credentialKey)
+          == ["op://vault/item/password"],
+          "targeted risk revocation returns affected in-memory cache identities")
+    check(await table.accessibleReferences(
+        for: me,
+        now: Date(),
+        deliveryPlanDigest: "plan-a",
+        policyBindingsByReference: ["op://vault/item/password": binding]
+    ).isEmpty, "targeted risk revocation removes the live grant")
+
+    let oldVersion = PolicyGrantBinding(
+        credentialKey: "old-policy-credential",
+        riskLevel: .low,
+        policyVersion: RiskPolicyV1.version - 1,
+        policyDigest: "old-policy",
+        outputPolicy: .exactMatchRedactAndWarn
+    )
+    await table.add(Grant(
+        rootPID: me,
+        rootStartTime: myStart,
+        references: ["csec://test/TOKEN"],
+        reason: "synthetic old policy",
+        expiresAt: Date().addingTimeInterval(60),
+        policyBinding: oldVersion
+    ))
+    check(await table.revalidate(policyVersion: RiskPolicyV1.version)
+          == ["csec://test/TOKEN"],
+          "a policy-version change revokes grants created by older policy code")
+} else {
+    check(false, "policy-bound grant tests can read their root start time")
+}
+
 print("\n# AgentSocket")
 
 let socketDir = AgentSocket.directory()
@@ -1294,6 +1368,16 @@ check(promptText.contains("field: url"), "prompt identifies the field")
 check(promptText.contains("ruby (pid 4242)"), "prompt names the requesting process")
 check(promptText.contains("run migrations"), "prompt states the caller's reason")
 check(promptText.contains("8h"), "prompt states the grant duration")
+
+let policyPrompt = BiometricConsent.prompt(
+    caller: CallerInfo(pid: 4242, startTime: 1, description: "ruby"),
+    references: [promptRef],
+    reason: "run migrations",
+    ttl: 15 * 60,
+    policySummary: "risk high × 1; delivery direct_heap"
+)
+check(policyPrompt.contains("policy: risk high × 1; delivery direct_heap"),
+      "the OS authentication prompt binds the selected risk and delivery policy")
 
 let spoofedPrompt = BiometricConsent.prompt(
     caller: CallerInfo(pid: 4242, startTime: 1, description: "ruby\nverified launcher"),
