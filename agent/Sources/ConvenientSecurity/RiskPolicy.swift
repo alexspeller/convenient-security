@@ -14,7 +14,7 @@ public enum RiskLevel: String, Codable, Sendable, CaseIterable {
         self == .unknown ? .high : self
     }
 
-    fileprivate var rank: Int {
+    public var severityRank: Int {
         switch effectiveFloor {
         case .low: return 0
         case .standard: return 1
@@ -24,7 +24,11 @@ public enum RiskLevel: String, Codable, Sendable, CaseIterable {
     }
 
     public static func maximum(_ levels: some Sequence<RiskLevel>) -> RiskLevel {
-        levels.map(\.effectiveFloor).max { $0.rank < $1.rank } ?? .high
+        levels.map(\.effectiveFloor).max { $0.severityRank < $1.severityRank } ?? .high
+    }
+
+    public func isAtLeastAsRestrictive(as other: RiskLevel) -> Bool {
+        effectiveFloor.severityRank >= other.effectiveFloor.severityRank
     }
 }
 
@@ -228,11 +232,13 @@ public struct PolicyDecision: Codable, Sendable, Equatable {
     public let policyDigest: String
 }
 
-/// Single, versioned policy table. It is exercised by self-tests but is not
-/// called by the shipping agent's request handler and therefore makes no
-/// runtime authorization decision.
+/// Single, versioned policy table used by the shipping agent before it resolves
+/// plaintext. Review windows live beside the mechanism/TTL matrix so UI, grant,
+/// and persistence code cannot silently choose different policy lifetimes.
 public enum RiskPolicyV1 {
     public static let version = 1
+    public static let judgmentReviewSeconds = 90 * 24 * 60 * 60
+    public static let compatibilityAcceptanceReviewSeconds = 30 * 24 * 60 * 60
 
     public static func evaluate(_ input: RiskPolicyInput) -> PolicyDecision {
         let effective = RiskLevel.maximum(
@@ -243,9 +249,7 @@ public enum RiskPolicyV1 {
         var mechanisms = rule.mechanisms
         var denial: PolicyDenialReason?
 
-        let weakCompatibility = input.plan.mechanism == .unrestrictedInitialEnvironment
-            || input.plan.mechanism == .rawStandardOutput
-        if effective == .standard, weakCompatibility {
+        if effective == .standard, input.plan.mechanism.isWeakCompatibility {
             if input.acceptance?.permits(
                 credentialKey: input.credentialKey,
                 plan: input.plan,

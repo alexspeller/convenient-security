@@ -874,6 +874,39 @@ check(CredentialGrouping.onePasswordGroup(
     for: try! SecretRef("op://Vault Name/Item Name/section/password")
 ) == "Vault Name/Item Name", "1Password fields group initially by vault/item capability")
 
+let groupedReferences = CredentialGrouping.groups(for: [
+    try! SecretRef("op://Vault/Item/password"),
+    try! SecretRef("op://Vault/Item/username"),
+    try! SecretRef("csec://production/API_TOKEN"),
+    try! SecretRef("csec://production/DATABASE_URL"),
+])
+check(groupedReferences.count == 2
+      && groupedReferences.map(\.references.count).sorted() == [2, 2],
+      "provider grouping combines 1Password fields and native keys by logical capability")
+check(CredentialGrouping.nativeStoreGroup(
+    for: try! SecretRef("csec://production/*")
+) == "production", "native edit access and native keys share the store-level judgment")
+
+let namedFilePlan = DeliveryPlan(
+    mechanism: .namedPlaintextFile,
+    executable: baseExecutable,
+    root: .caller,
+    descendantScope: .exactProcess,
+    destination: .localDevelopment,
+    requestedTTLSeconds: 300,
+    operationContext: "external editor"
+)
+let namedFileDecision = RiskPolicyV1.evaluate(RiskPolicyInput(
+    credentialKey: "opaque-standard",
+    storedLevel: .standard,
+    evidence: [],
+    plan: namedFilePlan,
+    now: policyNow
+))
+check(!namedFileDecision.allowed
+      && namedFileDecision.denialReason == .compatibilityAcceptanceRequired,
+      "named plaintext files require separate acceptance at standard risk")
+
 print("\n# OnePasswordProvider (op CLI plumbing, no account access)")
 
 check(OnePasswordCLI.sanitizedEnvironment()["GITHUB_TOKEN"] == nil

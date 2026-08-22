@@ -12,7 +12,20 @@ public enum DeliveryMechanism: String, Codable, Sendable, CaseIterable {
     case sealedEnvironment = "sealed_environment"
     case unrestrictedInitialEnvironment = "unrestricted_initial_env"
     case rawStandardOutput = "raw_stdout"
+    case namedPlaintextFile = "named_plaintext_file"
     case credentialProtocol = "credential_protocol"
+
+    /// Compatibility mechanisms that deliberately expose plaintext outside a
+    /// protected consumer heap/fd/capability boundary. Standard-risk use needs
+    /// a separately cached acceptance; high and critical policy forbid them.
+    public var isWeakCompatibility: Bool {
+        switch self {
+        case .unrestrictedInitialEnvironment, .rawStandardOutput, .namedPlaintextFile:
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 public enum ConsumerAssurance: String, Codable, Sendable, CaseIterable {

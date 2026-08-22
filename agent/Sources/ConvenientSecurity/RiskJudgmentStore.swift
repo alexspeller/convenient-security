@@ -8,6 +8,28 @@ public protocol RiskJudgmentBackend: Sendable {
     func delete(service: String, account: String) async
 }
 
+/// Process-local backend for unsigned development builds and synthetic tests.
+/// Production uses the data-protection Keychain backend below; this type makes
+/// the absence of a signing entitlement degrade to non-persistence, never to a
+/// plaintext or filesystem record.
+public actor InMemoryRiskJudgmentBackend: RiskJudgmentBackend {
+    private var items: [String: Data] = [:]
+
+    public init() {}
+
+    public func load(service: String, account: String) async throws -> Data? {
+        items["\(service)|\(account)"]
+    }
+
+    public func store(service: String, account: String, data: Data) async throws {
+        items["\(service)|\(account)"] = data
+    }
+
+    public func delete(service: String, account: String) async {
+        items["\(service)|\(account)"] = nil
+    }
+}
+
 /// Integrity-protected judgment store. It stores no raw provider reference:
 /// account names and member identities are HMACs under an agent-only device key.
 public actor RiskJudgmentStore {
@@ -153,6 +175,18 @@ public actor RiskJudgmentStore {
         await backend.delete(service: Self.acceptanceService, account: account)
     }
 
+    public func forgetAcceptances(credentialKey: String) async {
+        for mechanism in DeliveryMechanism.allCases {
+            for assurance in ConsumerAssurance.allCases {
+                await forgetAcceptance(
+                    credentialKey: credentialKey,
+                    mechanism: mechanism,
+                    assurance: assurance
+                )
+            }
+        }
+    }
+
     private func deviceKey() async throws -> SymmetricKey {
         if let loadedKey { return loadedKey }
         if let existing = try await backend.load(
@@ -279,15 +313,95 @@ public struct SecurityRiskJudgmentBackend: RiskJudgmentBackend {
     }
 }
 
-/// Initial provider-specific grouping rule. It is pure and returns metadata
-/// only; the store HMACs the result before persistence.
+/// Transient provider grouping metadata. Raw references and logical names are
+/// used only to derive opaque identities and to render the trusted review;
+/// they are never serialized into the judgment backend.
+public struct CredentialGroupDescriptor: Sendable, Equatable {
+    public let provider: String
+    public let providerAccount: String
+    public let group: String
+    public let references: [SecretRef]
+
+    public init(
+        provider: String,
+        providerAccount: String,
+        group: String,
+        references: [SecretRef]
+    ) {
+        self.provider = provider
+        self.providerAccount = providerAccount
+        self.group = group
+        self.references = references.sorted { $0.uri < $1.uri }
+    }
+}
+
+/// Stable provider-specific grouping rules. 1Password fields are one logical
+/// vault/item credential; native-store keys and edit access are one store.
+/// Unknown future schemes fail safely to one judgment per exact reference.
 public enum CredentialGrouping {
+    public static let onePasswordAccount = "default-cli-account-v1"
+    public static let nativeStoreAccount = "this-device-v1"
+
     public static func onePasswordGroup(for reference: SecretRef) -> String? {
         guard reference.scheme == "op" else { return nil }
         let components = reference.path.split(separator: "/", omittingEmptySubsequences: false)
-        guard components.count >= 2,
-              !components[0].isEmpty,
-              !components[1].isEmpty else { return nil }
-        return components.prefix(2).joined(separator: "/")
+        guard !components.isEmpty,
+              components.count <= 64,
+              components.allSatisfy({ !$0.isEmpty }) else { return nil }
+        return components.prefix(min(2, components.count)).joined(separator: "/")
+    }
+
+    public static func nativeStoreGroup(for reference: SecretRef) -> String? {
+        guard reference.scheme == "csec",
+              let slash = reference.path.firstIndex(of: "/"),
+              slash != reference.path.startIndex else { return nil }
+        let store = String(reference.path[..<slash])
+        return (try? NativeStoreName(store))?.value
+    }
+
+    public static func groups(for references: [SecretRef]) -> [CredentialGroupDescriptor] {
+        struct Key: Hashable {
+            let provider: String
+            let account: String
+            let group: String
+        }
+
+        var grouped: [Key: Set<SecretRef>] = [:]
+        for reference in Set(references) {
+            let key: Key
+            switch reference.scheme {
+            case "op":
+                key = Key(
+                    provider: "op",
+                    account: onePasswordAccount,
+                    group: onePasswordGroup(for: reference) ?? reference.uri
+                )
+            case "csec":
+                key = Key(
+                    provider: "csec",
+                    account: nativeStoreAccount,
+                    group: nativeStoreGroup(for: reference) ?? reference.uri
+                )
+            default:
+                key = Key(
+                    provider: reference.scheme,
+                    account: "default-provider-account-v1",
+                    group: reference.uri
+                )
+            }
+            grouped[key, default: []].insert(reference)
+        }
+
+        return grouped.map { key, members in
+            CredentialGroupDescriptor(
+                provider: key.provider,
+                providerAccount: key.account,
+                group: key.group,
+                references: Array(members)
+            )
+        }.sorted {
+            ($0.provider, $0.providerAccount, $0.group)
+                < ($1.provider, $1.providerAccount, $1.group)
+        }
     }
 }
