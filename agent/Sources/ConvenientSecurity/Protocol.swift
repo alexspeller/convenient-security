@@ -14,6 +14,9 @@ public enum WireCapability: String, Codable, Sendable, CaseIterable {
     case outputGuardBinding = "output_guard_binding"
     case activeOutputRedaction = "active_output_redaction"
     case nativeEncryptedStore = "native_encrypted_store"
+    case riskPolicyV1 = "risk_policy_v1"
+    case riskManagement = "risk_management"
+    case nativeEditorPolicy = "native_editor_policy"
 }
 
 public struct ProtocolCapabilities: Codable, Sendable, Equatable {
@@ -181,13 +184,27 @@ public struct EndOutputRedactionRequest: Codable, Sendable {
     }
 }
 
+public enum NativeStoreEditorMode: String, Codable, Sendable, CaseIterable {
+    case builtInMemory = "built_in_memory"
+    case externalTemporaryFile = "external_temporary_file"
+}
+
 public struct BeginNativeStoreEditRequest: Codable, Sendable {
     public let requestID: String
     public let store: String
+    public let mode: NativeStoreEditorMode
+    public let externalEditorPath: String?
 
-    public init(store: String, requestID: UUID = UUID()) {
+    public init(
+        store: String,
+        mode: NativeStoreEditorMode = .builtInMemory,
+        externalEditorPath: String? = nil,
+        requestID: UUID = UUID()
+    ) {
         self.requestID = requestID.uuidString.lowercased()
         self.store = store
+        self.mode = mode
+        self.externalEditorPath = externalEditorPath
     }
 }
 
@@ -213,6 +230,85 @@ public struct CancelNativeStoreEditRequest: Codable, Sendable {
     }
 }
 
+public enum RiskOperation: String, Codable, Sendable, CaseIterable {
+    case inspect
+    case classify
+    case raise
+    case forget
+}
+
+public struct RiskOperationRequest: Codable, Sendable {
+    public let requestID: String
+    public let operation: RiskOperation
+    public let reference: String
+    public let level: RiskLevel?
+
+    public init(
+        operation: RiskOperation,
+        reference: String,
+        level: RiskLevel? = nil,
+        requestID: UUID = UUID()
+    ) {
+        self.requestID = requestID.uuidString.lowercased()
+        self.operation = operation
+        self.reference = reference
+        self.level = level
+    }
+}
+
+public struct RiskAcceptanceInspection: Codable, Sendable, Equatable {
+    public let mechanism: DeliveryMechanism
+    public let consumerAssurance: ConsumerAssurance
+    public let reviewAfter: Date
+
+    public init(
+        mechanism: DeliveryMechanism,
+        consumerAssurance: ConsumerAssurance,
+        reviewAfter: Date
+    ) {
+        self.mechanism = mechanism
+        self.consumerAssurance = consumerAssurance
+        self.reviewAfter = reviewAfter
+    }
+}
+
+/// Value-free result for one caller-supplied reference. Opaque credential keys,
+/// provider values, and the other raw members of its logical group never cross
+/// the socket.
+public struct RiskInspection: Codable, Sendable, Equatable {
+    public let provider: String
+    public let level: RiskLevel
+    public let effectiveLevel: RiskLevel
+    public let decidedAt: Date?
+    public let reviewAfter: Date?
+    public let policyVersion: Int
+    public let knownMemberCount: Int
+    public let referenceInKnownScope: Bool
+    public let acceptances: [RiskAcceptanceInspection]
+
+    public init(
+        provider: String,
+        level: RiskLevel,
+        effectiveLevel: RiskLevel,
+        decidedAt: Date?,
+        reviewAfter: Date?,
+        policyVersion: Int,
+        knownMemberCount: Int,
+        referenceInKnownScope: Bool,
+        acceptances: [RiskAcceptanceInspection]
+    ) {
+        self.provider = provider
+        self.level = level
+        self.effectiveLevel = effectiveLevel
+        self.decidedAt = decidedAt
+        self.reviewAfter = reviewAfter
+        self.policyVersion = policyVersion
+        self.knownMemberCount = knownMemberCount
+        self.referenceInKnownScope = referenceInKnownScope
+        self.acceptances = acceptances
+    }
+}
+
 /// Requests retain the v1 flat discriminator so an upgraded agent can return a
 /// typed migration error instead of misinterpreting an old access as secure.
 public enum Request: Sendable {
@@ -225,6 +321,7 @@ public enum Request: Sendable {
     case beginNativeStoreEdit(BeginNativeStoreEditRequest)
     case commitNativeStoreEdit(CommitNativeStoreEditRequest)
     case cancelNativeStoreEdit(CancelNativeStoreEditRequest)
+    case risk(RiskOperationRequest)
 }
 
 extension Request: Codable {
@@ -232,7 +329,8 @@ extension Request: Codable {
         case version, type, requestID, references, reason, ttlSeconds
         case deliveryPlan, deliveryPlanDigest
         case destination, streams, sessionID, stream, data, finish
-        case store, editSessionID, document
+        case store, editSessionID, document, mode, externalEditorPath
+        case operation, reference, level
     }
 
     public init(from decoder: Decoder) throws {
@@ -283,6 +381,14 @@ extension Request: Codable {
         case "begin_native_store_edit":
             self = .beginNativeStoreEdit(BeginNativeStoreEditRequest(
                 store: try container.decode(String.self, forKey: .store),
+                mode: try container.decodeIfPresent(
+                    NativeStoreEditorMode.self,
+                    forKey: .mode
+                ) ?? .builtInMemory,
+                externalEditorPath: try container.decodeIfPresent(
+                    String.self,
+                    forKey: .externalEditorPath
+                ),
                 requestID: try Self.decodeUUID(container, forKey: .requestID)
             ))
         case "commit_native_store_edit":
@@ -294,6 +400,13 @@ extension Request: Codable {
         case "cancel_native_store_edit":
             self = .cancelNativeStoreEdit(CancelNativeStoreEditRequest(
                 editSessionID: try container.decode(String.self, forKey: .editSessionID),
+                requestID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
+        case "risk":
+            self = .risk(RiskOperationRequest(
+                operation: try container.decode(RiskOperation.self, forKey: .operation),
+                reference: try container.decode(String.self, forKey: .reference),
+                level: try container.decodeIfPresent(RiskLevel.self, forKey: .level),
                 requestID: try Self.decodeUUID(container, forKey: .requestID)
             ))
         default:
@@ -345,6 +458,8 @@ extension Request: Codable {
             try container.encode(WireProtocol.version, forKey: .version)
             try container.encode(request.requestID, forKey: .requestID)
             try container.encode(request.store, forKey: .store)
+            try container.encode(request.mode, forKey: .mode)
+            try container.encodeIfPresent(request.externalEditorPath, forKey: .externalEditorPath)
         case let .commitNativeStoreEdit(request):
             try container.encode("commit_native_store_edit", forKey: .type)
             try container.encode(WireProtocol.version, forKey: .version)
@@ -356,6 +471,13 @@ extension Request: Codable {
             try container.encode(WireProtocol.version, forKey: .version)
             try container.encode(request.requestID, forKey: .requestID)
             try container.encode(request.editSessionID, forKey: .editSessionID)
+        case let .risk(request):
+            try container.encode("risk", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.operation, forKey: .operation)
+            try container.encode(request.reference, forKey: .reference)
+            try container.encodeIfPresent(request.level, forKey: .level)
         }
     }
 
@@ -390,6 +512,7 @@ public struct Response: Codable, Sendable {
     public let document: Data?
     public let generation: UInt64?
     public let secretCount: Int?
+    public let riskInspection: RiskInspection?
     public let failure: ProtocolFailure?
     public let error: String?
 
@@ -408,6 +531,7 @@ public struct Response: Codable, Sendable {
         document: Data? = nil,
         generation: UInt64? = nil,
         secretCount: Int? = nil,
+        riskInspection: RiskInspection? = nil,
         failure: ProtocolFailure? = nil,
         error: String? = nil
     ) {
@@ -425,6 +549,7 @@ public struct Response: Codable, Sendable {
         self.document = document
         self.generation = generation
         self.secretCount = secretCount
+        self.riskInspection = riskInspection
         self.failure = failure
         self.error = error
     }

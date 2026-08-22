@@ -67,7 +67,7 @@ actor FakeRiskJudgmentBackend: RiskJudgmentBackend {
         items["\(service)|\(account)"] = data
     }
 
-    func delete(service: String, account: String) async {
+    func delete(service: String, account: String) async throws {
         items["\(service)|\(account)"] = nil
     }
 
@@ -270,6 +270,7 @@ do {
         callerPID: callerPID,
         callerStartTime: callerStart,
         unlock: nativeUnlock,
+        authorizedTTL: 60,
         now: expiryOrigin
     )
     do {
@@ -278,11 +279,11 @@ do {
             document: firstDocument,
             callerPID: callerPID,
             callerStartTime: callerStart,
-            now: expiryOrigin.addingTimeInterval(30 * 60 + 1)
+            now: expiryOrigin.addingTimeInterval(61)
         )
-        check(false, "a native edit session expires after its bounded lifetime")
+        check(false, "a native edit session expires at its shorter policy authorization")
     } catch NativeStoreError.editSessionExpired {
-        check(true, "a native edit session expires after its bounded lifetime")
+        check(true, "a native edit session expires at its shorter policy authorization")
     }
 
     let ref = try SecretRef("csec://development/DATABASE_URL")
@@ -694,14 +695,18 @@ do {
 do {
     let begin = BeginNativeStoreEditRequest(
         store: "development",
+        mode: .externalTemporaryFile,
+        externalEditorPath: "/usr/bin/vi",
         requestID: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
     )
     let beginData = try JSONEncoder().encode(Request.beginNativeStoreEdit(begin))
     let beginDecoded = try JSONDecoder().decode(Request.self, from: beginData)
     if case let .beginNativeStoreEdit(roundTrip) = beginDecoded {
         check(roundTrip.store == "development"
+              && roundTrip.mode == .externalTemporaryFile
+              && roundTrip.externalEditorPath == "/usr/bin/vi"
               && roundTrip.requestID == "11111111-2222-3333-4444-555555555555",
-              "native-store edit begin round-trips with its nonce")
+              "native-store edit begin round-trips with its mode and nonce")
     } else {
         check(false, "native-store edit begin decodes as the correct request")
     }
@@ -718,6 +723,22 @@ do {
               "native-store plaintext uses bounded Data inside the authenticated edit protocol")
     } else {
         check(false, "native-store edit commit decodes as the correct request")
+    }
+    let risk = RiskOperationRequest(
+        operation: .classify,
+        reference: "csec://development/TOKEN",
+        level: .high,
+        requestID: UUID(uuidString: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff")!
+    )
+    let riskData = try JSONEncoder().encode(Request.risk(risk))
+    let riskDecoded = try JSONDecoder().decode(Request.self, from: riskData)
+    if case let .risk(roundTrip) = riskDecoded {
+        check(roundTrip.operation == .classify
+              && roundTrip.reference == "csec://development/TOKEN"
+              && roundTrip.level == .high,
+              "value-free risk operations round-trip with explicit level semantics")
+    } else {
+        check(false, "risk operation decodes as the correct request")
     }
 } catch {
     check(false, "native-store protocol requests round-trip (\(error))")

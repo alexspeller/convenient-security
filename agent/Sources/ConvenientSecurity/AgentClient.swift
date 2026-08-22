@@ -108,8 +108,16 @@ public struct AgentClient {
     /// Begin an exact-caller native-store edit session. The agent performs a
     /// fresh Touch ID check before returning the complete decrypted JSON
     /// document to the authenticated product launcher.
-    public func beginNativeStoreEdit(store: String) throws -> NativeStoreEditStart {
-        let request = BeginNativeStoreEditRequest(store: store)
+    public func beginNativeStoreEdit(
+        store: String,
+        mode: NativeStoreEditorMode = .builtInMemory,
+        externalEditorPath: String? = nil
+    ) throws -> NativeStoreEditStart {
+        let request = BeginNativeStoreEditRequest(
+            store: store,
+            mode: mode,
+            externalEditorPath: externalEditorPath
+        )
         let response = try send(.beginNativeStoreEdit(request))
         try Self.check(response: response, requestID: request.requestID)
         guard let sessionID = response.editSessionID,
@@ -144,6 +152,24 @@ public struct AgentClient {
     public func cancelNativeStoreEdit(sessionID: String) {
         let request = CancelNativeStoreEditRequest(editSessionID: sessionID)
         _ = try? send(.cancelNativeStoreEdit(request))
+    }
+
+    public func risk(
+        _ operation: RiskOperation,
+        reference: String,
+        level: RiskLevel? = nil
+    ) throws -> RiskInspection {
+        let request = RiskOperationRequest(
+            operation: operation,
+            reference: reference,
+            level: level
+        )
+        let response = try send(.risk(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let inspection = response.riskInspection else {
+            throw ClientError.transportFailed
+        }
+        return inspection
     }
 
     /// Open one authenticated, persistent connection whose output chunks are

@@ -41,6 +41,7 @@ struct StaticProvider: SecretProvider {
 
 actor ConsentCounter: ConsentProvider {
     private(set) var count = 0
+    private(set) var authenticationCount = 0
     private(set) var lastTTL: TimeInterval?
     func requestConsent(
         caller: CallerInfo,
@@ -55,6 +56,11 @@ actor ConsentCounter: ConsentProvider {
     }
     func calls() -> Int { count }
     func latestTTL() -> TimeInterval? { lastTTL }
+    func authenticate(reason: String) async -> ConsentOutcome {
+        authenticationCount += 1
+        return .approved(unlock: CacheUnlock(LAContext()))
+    }
+    func authentications() -> Int { authenticationCount }
 }
 
 actor DenyPolicyReview: PolicyReviewProvider {
@@ -63,6 +69,7 @@ actor DenyPolicyReview: PolicyReviewProvider {
         count += 1
         return .denied
     }
+    func reviewRiskChange(_ review: RiskChangeReview) async -> Bool { false }
     func calls() -> Int { count }
 }
 
@@ -136,6 +143,8 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.commitNativeStoreEdit(request: commit, caller: caller)
     case let .cancelNativeStoreEdit(cancel):
         return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
+    case let .risk(risk):
+        return await agent.handleRiskOperation(request: risk, caller: caller)
     }
 }
 Thread.detachNewThread { try? server.run() }
@@ -170,8 +179,11 @@ do {
           && capabilities.features.contains(.typedFailures)
           && capabilities.features.contains(.outputGuardBinding)
           && capabilities.features.contains(.activeOutputRedaction)
-          && capabilities.features.contains(.nativeEncryptedStore),
-          "agent advertises delivery-plan, output-guard, active-redaction, native-store, and typed-failure capabilities")
+          && capabilities.features.contains(.nativeEncryptedStore)
+          && capabilities.features.contains(.riskPolicyV1)
+          && capabilities.features.contains(.riskManagement)
+          && capabilities.features.contains(.nativeEditorPolicy),
+          "agent advertises delivery, redaction, native-store, and enforced risk-policy capabilities")
 } catch {
     check(false, "protocol capability negotiation succeeds (\(error))")
 }
@@ -471,6 +483,87 @@ do {
 // Native provider management stays on the same mutually authenticated socket,
 // but uses a separate exact-caller edit session rather than a secret grant.
 do {
+    let consentBeforeUnboundEditor = await consent.calls()
+    do {
+        _ = try client.beginNativeStoreEdit(
+            store: "unbound_editor",
+            mode: .externalTemporaryFile
+        )
+        check(false, "external editor mode requires its actual executable path")
+    } catch AgentClient.ClientError.protocolFailure(.invalidRequest, _) {
+        check(await consent.calls() == consentBeforeUnboundEditor,
+              "external editor mode is bound to its executable before policy or biometric")
+    }
+
+    _ = try client.risk(
+        .classify,
+        reference: "csec://high_editor/*",
+        level: .high
+    )
+    let consentBeforeForbiddenEditor = await consent.calls()
+    do {
+        _ = try client.beginNativeStoreEdit(
+            store: "high_editor",
+            mode: .externalTemporaryFile,
+            externalEditorPath: "/usr/bin/false"
+        )
+        check(false, "high-risk native stores reject the named-plaintext editor")
+    } catch AgentClient.ClientError.protocolFailure(.policyDenied, _) {
+        let consentAfterForbiddenEditor = await consent.calls()
+        let forbiddenEditorKey = await nativeKeyBackend.record(for: "high_editor")
+        check(consentAfterForbiddenEditor == consentBeforeForbiddenEditor
+              && forbiddenEditorKey == nil,
+              "high-risk named-plaintext editing is denied before biometric or decryption")
+    }
+    let protectedHighEdit = try client.beginNativeStoreEdit(
+        store: "high_editor",
+        mode: .builtInMemory
+    )
+    check(await consent.latestTTL() == 15 * 60,
+          "high-risk built-in editing applies the 15-minute policy cap")
+    client.cancelNativeStoreEdit(sessionID: protectedHighEdit.sessionID)
+
+    _ = try client.risk(
+        .classify,
+        reference: "csec://standard_editor/*",
+        level: .standard
+    )
+    let standardEdit = try client.beginNativeStoreEdit(
+        store: "standard_editor",
+        mode: .externalTemporaryFile,
+        externalEditorPath: "/usr/bin/false"
+    )
+    client.cancelNativeStoreEdit(sessionID: standardEdit.sessionID)
+    let standardInspection = try client.risk(
+        .inspect,
+        reference: "csec://standard_editor/*"
+    )
+    check(standardInspection.acceptances.contains {
+        $0.mechanism == .namedPlaintextFile
+            && $0.consumerAssurance == .unverified
+    }, "standard-risk external editing records separate named-file acceptance")
+
+    _ = try client.risk(
+        .classify,
+        reference: "csec://revoked_editor/*",
+        level: .low
+    )
+    let revokedEdit = try client.beginNativeStoreEdit(store: "revoked_editor")
+    _ = try client.risk(
+        .raise,
+        reference: "csec://revoked_editor/*",
+        level: .high
+    )
+    do {
+        _ = try client.commitNativeStoreEdit(
+            sessionID: revokedEdit.sessionID,
+            document: Data(#"{"TOKEN":"must-not-commit"}"#.utf8)
+        )
+        check(false, "a risk change revokes an open native edit session")
+    } catch AgentClient.ClientError.protocolFailure(.invalidRequest, _) {
+        check(true, "a risk change revokes an open native edit session")
+    }
+
     let edit = try client.beginNativeStoreEdit(store: "development")
     check((try? NativeStoreDocument(data: edit.document).values.isEmpty) == true,
           "native-store edit begins with a decrypted empty JSON document")
@@ -698,6 +791,57 @@ func runCsecWithExternalTermination() -> (status: Int32, out: String, err: Strin
 }
 
 if FileManager.default.isExecutableFile(atPath: csecURL.path) {
+    let policyReference = "op://policy-tests/credential/token"
+    let resolutionsBeforeRiskCLI = await resolutionCounter.calls()
+    let initialRisk = runCsec(["risk", "inspect", policyReference], extraEnv: [:])
+    let authenticationBeforeRiskCLI = await consent.authentications()
+    let classifiedLow = runCsec(
+        ["risk", "classify", "low", policyReference],
+        extraEnv: [:]
+    )
+    let authenticationAfterLow = await consent.authentications()
+    let raisedHigh = runCsec(
+        ["risk", "raise", "high", policyReference],
+        extraEnv: [:]
+    )
+    let authenticationAfterRaise = await consent.authentications()
+    let rejectedLowerRaise = runCsec(
+        ["risk", "raise", "low", policyReference],
+        extraEnv: [:]
+    )
+    let classifiedBackToLow = runCsec(
+        ["risk", "classify", "low", policyReference],
+        extraEnv: [:]
+    )
+    let authenticationAfterDowngrade = await consent.authentications()
+    let forgottenRisk = runCsec(["risk", "forget", policyReference], extraEnv: [:])
+    let authenticationAfterForget = await consent.authentications()
+    let resolutionsAfterRiskCLI = await resolutionCounter.calls()
+    check(initialRisk.status == 0
+          && initialRisk.out.contains("classification: unknown")
+          && initialRisk.out.contains("effective-risk: high"),
+          "risk inspect reports fail-safe unknown without resolving a value")
+    check(classifiedLow.status == 0
+          && classifiedLow.out.contains("classification: low")
+          && authenticationAfterLow == authenticationBeforeRiskCLI + 1,
+          "classifying below the unknown high floor requires authentication")
+    check(raisedHigh.status == 0
+          && raisedHigh.out.contains("classification: high")
+          && authenticationAfterRaise == authenticationAfterLow,
+          "risk raise increases enforcement without an unnecessary biometric")
+    check(rejectedLowerRaise.status == 1
+          && rejectedLowerRaise.err.contains("policy_denied"),
+          "risk raise cannot be used to lower a classification")
+    check(classifiedBackToLow.status == 0
+          && authenticationAfterDowngrade == authenticationAfterRaise + 1,
+          "an explicit high-to-low reclassification requires authentication")
+    check(forgottenRisk.status == 0
+          && forgottenRisk.out.contains("classification: unknown")
+          && authenticationAfterForget == authenticationAfterDowngrade + 1,
+          "risk forget resets to fail-safe unknown behind authentication")
+    check(resolutionsAfterRiskCLI == resolutionsBeforeRiskCLI,
+          "risk management reads and writes no provider value")
+
     do {
         let fixtureDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("csec editor fixture \(UUID().uuidString)", isDirectory: true)

@@ -14,6 +14,23 @@ public actor Agent {
         var acceptanceWasAdded = false
     }
 
+    private struct RiskContext {
+        let descriptor: CredentialGroupDescriptor
+        let identity: CredentialIdentity
+        let judgment: RiskJudgment?
+        let acceptances: [DeliveryAcceptance]
+        let referenceInKnownScope: Bool
+    }
+
+    private struct NativeEditAuthorization {
+        let callerPID: pid_t
+        let callerStartTime: UInt64
+        let reference: SecretRef
+        let plan: DeliveryPlan
+        let policyBinding: PolicyGrantBinding
+        let expiresAt: Date
+    }
+
     private struct RedactionCaller: Sendable {
         let pid: pid_t
         let startTime: UInt64
@@ -46,6 +63,8 @@ public actor Agent {
     private let allowUnverifiedPlansForTesting: Bool
     private var activeSecrets = ActiveSecretRegistry()
     private var redactionSessions: [String: RedactionSession] = [:]
+    private var knownReferencesByCredentialKey: [String: Set<String>] = [:]
+    private var nativeEditAuthorizations: [String: NativeEditAuthorization] = [:]
 
     public init(
         resolver: SecretResolver,
@@ -246,6 +265,8 @@ public actor Agent {
                     decision: decision,
                     scopeExpanded: judgment != nil && !requestedMembers.isSubset(of: knownMembers)
                 ))
+                knownReferencesByCredentialKey[identity.credentialKey, default: []]
+                    .formUnion(descriptor.references.map(\.uri))
             }
         } catch {
             return .failed(
@@ -586,6 +607,217 @@ public actor Agent {
         )
     }
 
+    public func handleRiskOperation(
+        request: RiskOperationRequest,
+        caller: CallerInfo
+    ) async -> Response {
+        guard UUID(uuidString: request.requestID) != nil,
+              caller.startTime > 0,
+              isVerifiedLauncher(caller),
+              !request.reference.isEmpty,
+              request.reference.utf8.count <= 4_096,
+              !request.reference.utf8.contains(0),
+              let reference = try? SecretRef(request.reference),
+              ((request.operation == .inspect || request.operation == .forget)
+                    ? request.level == nil
+                    : request.level != nil && request.level != .unknown) else {
+            return .failed(
+                .invalidRequest,
+                message: "the risk operation is invalid",
+                requestID: request.requestID
+            )
+        }
+
+        let now = Date()
+        let context: RiskContext
+        do {
+            context = try await riskContext(for: reference, now: now)
+        } catch {
+            return .failed(
+                .internalError,
+                message: "risk metadata is unavailable; no secret was resolved",
+                requestID: request.requestID
+            )
+        }
+        knownReferencesByCredentialKey[context.identity.credentialKey, default: []]
+            .insert(reference.uri)
+
+        if request.operation == .inspect {
+            return Response(
+                requestID: request.requestID,
+                riskInspection: riskInspection(context)
+            )
+        }
+
+        let currentLevel = context.judgment?.level ?? .unknown
+        if request.operation == .raise,
+           let requestedLevel = request.level,
+           !requestedLevel.isAtLeastAsRestrictive(as: currentLevel) {
+            return .failed(
+                .policyDenied,
+                message: "raise cannot lower the current effective risk level",
+                requestID: request.requestID
+            )
+        }
+
+        let resultingLevel = request.operation == .forget ? nil : request.level
+        let requiresBiometric = request.operation == .forget
+            || (resultingLevel?.effectiveFloor.severityRank ?? Int.max)
+                < currentLevel.effectiveFloor.severityRank
+        let review = RiskChangeReview(
+            caller: caller,
+            operation: request.operation,
+            reference: reference,
+            currentLevel: currentLevel,
+            requestedLevel: resultingLevel,
+            knownMemberCount: context.judgment?.credential.memberReferenceKeys.count ?? 0,
+            scopeExpanded: context.judgment != nil && !context.referenceInKnownScope,
+            requiresBiometric: requiresBiometric
+        )
+        guard await policyReview.reviewRiskChange(review) else {
+            return .failed(
+                .consentDenied,
+                message: "risk change review denied",
+                requestID: request.requestID
+            )
+        }
+        if requiresBiometric {
+            let result = resultingLevel?.rawValue ?? "unknown"
+            let outcome = await consent.authenticate(reason:
+                "confirm \(request.operation.rawValue) risk change from "
+                    + "\(currentLevel.rawValue) to \(result) for \(reference.safeInlineURI)"
+            )
+            guard outcome.isApproved else {
+                return .failed(
+                    .consentDenied,
+                    message: "risk change authentication denied",
+                    requestID: request.requestID
+                )
+            }
+        }
+
+        do {
+            if request.operation == .forget {
+                try await riskJudgments.forget(
+                    credentialKey: context.identity.credentialKey
+                )
+                try await riskJudgments.forgetAcceptances(
+                    credentialKey: context.identity.credentialKey
+                )
+            } else if let resultingLevel {
+                if context.judgment?.level != resultingLevel {
+                    try await riskJudgments.forgetAcceptances(
+                        credentialKey: context.identity.credentialKey
+                    )
+                }
+                let members = Set(
+                    context.judgment?.credential.memberReferenceKeys ?? []
+                ).union(context.identity.memberReferenceKeys)
+                try await riskJudgments.save(RiskJudgment(
+                    credential: CredentialIdentity(
+                        provider: context.identity.provider,
+                        providerAccountKey: context.identity.providerAccountKey,
+                        credentialKey: context.identity.credentialKey,
+                        memberReferenceKeys: Array(members)
+                    ),
+                    level: resultingLevel,
+                    evidence: context.judgment?.evidence ?? [],
+                    source: .explicitUser,
+                    decidedAt: now,
+                    reviewAfter: now.addingTimeInterval(
+                        TimeInterval(RiskPolicyV1.judgmentReviewSeconds)
+                    ),
+                    policyVersion: RiskPolicyV1.version,
+                    providerRevision: context.judgment?.providerRevision,
+                    observedScopeDigest: context.judgment?.observedScopeDigest
+                ))
+            }
+        } catch {
+            return .failed(
+                .internalError,
+                message: "risk change could not be stored; existing grants were left unchanged",
+                requestID: request.requestID
+            )
+        }
+
+        var invalidated = await grants.revoke(
+            credentialKey: context.identity.credentialKey
+        )
+        invalidated.formUnion(
+            knownReferencesByCredentialKey.removeValue(
+                forKey: context.identity.credentialKey
+            ) ?? []
+        )
+        invalidated.insert(reference.uri)
+        await resolver.invalidate(references: invalidated)
+        await revokeNativeEdits(credentialKey: context.identity.credentialKey)
+
+        do {
+            let updated = try await riskContext(for: reference, now: Date())
+            return Response(
+                requestID: request.requestID,
+                riskInspection: riskInspection(updated)
+            )
+        } catch {
+            return .failed(
+                .internalError,
+                message: "risk changed but its updated metadata could not be inspected",
+                requestID: request.requestID
+            )
+        }
+    }
+
+    private func riskContext(for reference: SecretRef, now: Date) async throws -> RiskContext {
+        guard let descriptor = CredentialGrouping.groups(for: [reference]).first else {
+            throw RiskJudgmentStoreError.invalidOpaqueMetadata
+        }
+        let identity = try await riskJudgments.credentialIdentity(
+            provider: descriptor.provider,
+            providerAccount: descriptor.providerAccount,
+            group: descriptor.group,
+            memberReferences: descriptor.references.map(\.uri)
+        )
+        let judgment = try await riskJudgments.load(
+            credentialKey: identity.credentialKey,
+            policyVersion: RiskPolicyV1.version,
+            at: now
+        )
+        let acceptances = try await riskJudgments.loadAcceptances(
+            credentialKey: identity.credentialKey,
+            policyVersion: RiskPolicyV1.version,
+            at: now
+        )
+        let knownMembers = Set(judgment?.credential.memberReferenceKeys ?? [])
+        return RiskContext(
+            descriptor: descriptor,
+            identity: identity,
+            judgment: judgment,
+            acceptances: acceptances,
+            referenceInKnownScope: Set(identity.memberReferenceKeys).isSubset(of: knownMembers)
+        )
+    }
+
+    private func riskInspection(_ context: RiskContext) -> RiskInspection {
+        let level = context.judgment?.level ?? .unknown
+        return RiskInspection(
+            provider: context.descriptor.provider,
+            level: level,
+            effectiveLevel: level.effectiveFloor,
+            decidedAt: context.judgment?.decidedAt,
+            reviewAfter: context.judgment?.reviewAfter,
+            policyVersion: RiskPolicyV1.version,
+            knownMemberCount: context.judgment?.credential.memberReferenceKeys.count ?? 0,
+            referenceInKnownScope: context.referenceInKnownScope,
+            acceptances: context.acceptances.map {
+                RiskAcceptanceInspection(
+                    mechanism: $0.mechanism,
+                    consumerAssurance: $0.consumerAssurance,
+                    reviewAfter: $0.reviewAfter
+                )
+            }
+        )
+    }
+
     private func biometricPolicySummary(
         _ states: [CredentialPolicyState],
         plan: DeliveryPlan
@@ -722,7 +954,14 @@ public actor Agent {
               request.store.utf8.count <= 64,
               caller.startTime > 0,
               isVerifiedLauncher(caller),
-              let nativeStore else {
+              Self.hasValidNativeEditorMetadata(request) else {
+            return .failed(
+                .invalidRequest,
+                message: "the native-store edit request is invalid",
+                requestID: request.requestID
+            )
+        }
+        guard let nativeStore else {
             return .failed(
                 .nativeStoreUnavailable,
                 message: "the native encrypted store is unavailable",
@@ -740,28 +979,207 @@ public actor Agent {
             )
         }
 
-        let consentReference = NativeSecretReference.editConsentReference(for: store)
-        let outcome = await consent.requestConsent(
-            caller: caller,
-            newReferences: [consentReference],
-            reason: "edit native encrypted store",
-            ttl: 30 * 60,
-            policySummary: nil
-        )
-        guard case let .approved(unlock) = outcome else {
-            return .failed(
-                .consentDenied,
-                message: "consent denied",
-                requestID: request.requestID
+        let plannedExecutable: PlannedExecutable
+        switch request.mode {
+        case .builtInMemory:
+            guard let executablePath = ProcessAncestry.executablePath(of: caller.pid) else {
+                return .failed(
+                    .unverifiedPeer,
+                    message: "the native-store editor process is unavailable",
+                    requestID: request.requestID
+                )
+            }
+            plannedExecutable = PlannedExecutable(
+                canonicalPath: executablePath,
+                signingIdentifier: ProductCodeIdentity.launcherIdentifier,
+                teamIdentifier: ProductCodeIdentity.teamIdentifier,
+                assurance: .verifiedProduct
+            )
+        case .externalTemporaryFile:
+            plannedExecutable = PlannedExecutable(
+                canonicalPath: request.externalEditorPath!,
+                assurance: .unverified
             )
         }
+        let consentReference = NativeSecretReference.editConsentReference(for: store)
+        let plan = DeliveryPlan(
+            mechanism: request.mode == .builtInMemory ? .directHeap : .namedPlaintextFile,
+            executable: plannedExecutable,
+            root: .caller,
+            descendantScope: .exactProcess,
+            destination: .localDevelopment,
+            requestedTTLSeconds: 30 * 60,
+            operationContext: request.mode == .builtInMemory
+                ? "built-in native-store editor"
+                : "external native-store editor using a named plaintext file"
+        )
 
         do {
+            let now = Date()
+            let context = try await riskContext(for: consentReference, now: now)
+            knownReferencesByCredentialKey[context.identity.credentialKey, default: []]
+                .insert(consentReference.uri)
+            var storedLevel = context.judgment?.level ?? .unknown
+            var acceptance = context.acceptances.first {
+                $0.mechanism == plan.mechanism
+                    && $0.consumerAssurance == plan.executable.assurance
+            }
+            var decision = RiskPolicyV1.evaluate(RiskPolicyInput(
+                credentialKey: context.identity.credentialKey,
+                storedLevel: storedLevel,
+                evidence: context.judgment?.evidence ?? [],
+                plan: plan,
+                acceptance: acceptance,
+                now: now
+            ))
+            let scopeExpanded = context.judgment != nil && !context.referenceInKnownScope
+
+            if storedLevel != .unknown,
+               !decision.allowed,
+               decision.denialReason != .compatibilityAcceptanceRequired {
+                return policyDenied(decision, plan: plan, requestID: request.requestID)
+            }
+
+            let reviewCredential = PolicyReviewCredential(
+                identity: context.identity,
+                references: [consentReference],
+                storedLevel: storedLevel,
+                scopeExpanded: scopeExpanded,
+                compatibilityReviewOffered: plan.mechanism.isWeakCompatibility
+                    && (storedLevel == .unknown
+                        || decision.denialReason == .compatibilityAcceptanceRequired
+                        || acceptance != nil),
+                compatibilityAccepted: acceptance != nil
+            )
+            let review = AccessPolicyReview(
+                caller: caller,
+                reason: plan.operationContext,
+                plan: plan,
+                credentials: [reviewCredential]
+            )
+            guard case let .approved(approval) = await policyReview.reviewAccess(review) else {
+                return .failed(
+                    .consentDenied,
+                    message: "native-store policy review denied",
+                    requestID: request.requestID
+                )
+            }
+            if storedLevel == .unknown {
+                guard let selected = approval.classifications[context.identity.credentialKey],
+                      selected != .unknown else {
+                    return .failed(
+                        .policyDenied,
+                        message: "an explicit native-store risk classification is required",
+                        requestID: request.requestID
+                    )
+                }
+                storedLevel = selected
+            }
+            decision = RiskPolicyV1.evaluate(RiskPolicyInput(
+                credentialKey: context.identity.credentialKey,
+                storedLevel: storedLevel,
+                evidence: context.judgment?.evidence ?? [],
+                plan: plan,
+                acceptance: acceptance,
+                now: now
+            ))
+            var acceptanceWasAdded = false
+            if acceptance == nil,
+               decision.denialReason == .compatibilityAcceptanceRequired,
+               approval.acceptedCompatibilityCredentialKeys.contains(
+                   context.identity.credentialKey
+               ) {
+                acceptance = DeliveryAcceptance(
+                    credentialKey: context.identity.credentialKey,
+                    mechanism: plan.mechanism,
+                    consumerAssurance: plan.executable.assurance,
+                    policyVersion: RiskPolicyV1.version,
+                    acceptedAt: now,
+                    reviewAfter: now.addingTimeInterval(
+                        TimeInterval(RiskPolicyV1.compatibilityAcceptanceReviewSeconds)
+                    )
+                )
+                acceptanceWasAdded = true
+                decision = RiskPolicyV1.evaluate(RiskPolicyInput(
+                    credentialKey: context.identity.credentialKey,
+                    storedLevel: storedLevel,
+                    evidence: context.judgment?.evidence ?? [],
+                    plan: plan,
+                    acceptance: acceptance,
+                    now: now
+                ))
+            }
+            guard decision.allowed, decision.grantedTTLSeconds > 0 else {
+                return policyDenied(decision, plan: plan, requestID: request.requestID)
+            }
+
+            let policySummary = "risk \(decision.effectiveLevel.rawValue) × 1; "
+                + "delivery \(plan.mechanism.rawValue); scope exact_process; "
+                + "destination local_development"
+                + (plan.mechanism.isWeakCompatibility ? "; weak compatibility accepted" : "")
+            let outcome = await consent.requestConsent(
+                caller: caller,
+                newReferences: [consentReference],
+                reason: plan.operationContext,
+                ttl: TimeInterval(decision.grantedTTLSeconds),
+                policySummary: policySummary
+            )
+            guard case let .approved(unlock) = outcome else {
+                return .failed(
+                    .consentDenied,
+                    message: "consent denied",
+                    requestID: request.requestID
+                )
+            }
+
+            if context.judgment == nil || scopeExpanded {
+                let members = Set(
+                    context.judgment?.credential.memberReferenceKeys ?? []
+                ).union(context.identity.memberReferenceKeys)
+                try await riskJudgments.save(RiskJudgment(
+                    credential: CredentialIdentity(
+                        provider: context.identity.provider,
+                        providerAccountKey: context.identity.providerAccountKey,
+                        credentialKey: context.identity.credentialKey,
+                        memberReferenceKeys: Array(members)
+                    ),
+                    level: storedLevel,
+                    evidence: context.judgment?.evidence ?? [],
+                    source: .explicitUser,
+                    decidedAt: now,
+                    reviewAfter: now.addingTimeInterval(
+                        TimeInterval(RiskPolicyV1.judgmentReviewSeconds)
+                    ),
+                    policyVersion: RiskPolicyV1.version,
+                    providerRevision: context.judgment?.providerRevision,
+                    observedScopeDigest: context.judgment?.observedScopeDigest
+                ))
+            }
+            if acceptanceWasAdded, let acceptance {
+                try await riskJudgments.save(acceptance)
+            }
+
             let edit = try await nativeStore.beginEdit(
                 store: store,
                 callerPID: caller.pid,
                 callerStartTime: caller.startTime,
-                unlock: unlock
+                unlock: unlock,
+                authorizedTTL: TimeInterval(decision.grantedTTLSeconds),
+                now: now
+            )
+            nativeEditAuthorizations[edit.sessionID] = NativeEditAuthorization(
+                callerPID: caller.pid,
+                callerStartTime: caller.startTime,
+                reference: consentReference,
+                plan: plan,
+                policyBinding: PolicyGrantBinding(
+                    credentialKey: context.identity.credentialKey,
+                    riskLevel: decision.effectiveLevel,
+                    policyVersion: decision.policyVersion,
+                    policyDigest: decision.policyDigest,
+                    outputPolicy: decision.outputPolicy
+                ),
+                expiresAt: now.addingTimeInterval(TimeInterval(decision.grantedTTLSeconds))
             )
             return Response(
                 requestID: request.requestID,
@@ -782,10 +1200,41 @@ public actor Agent {
               request.document.count <= NativeStoreDocument.maximumBytes,
               caller.startTime > 0,
               isVerifiedLauncher(caller),
-              let nativeStore else {
+              let nativeStore,
+              let authorization = nativeEditAuthorizations[request.editSessionID],
+              authorization.callerPID == caller.pid,
+              authorization.callerStartTime == caller.startTime else {
             return .failed(
                 .invalidRequest,
                 message: "the native-store edit request is invalid",
+                requestID: request.requestID
+            )
+        }
+        do {
+            guard Date() < authorization.expiresAt,
+                  try await nativeEditPolicyIsCurrent(authorization) else {
+                await nativeStore.cancelEdit(
+                    sessionID: request.editSessionID,
+                    callerPID: caller.pid,
+                    callerStartTime: caller.startTime
+                )
+                nativeEditAuthorizations[request.editSessionID] = nil
+                return .failed(
+                    .policyDenied,
+                    message: "native-store edit authorization changed or expired",
+                    requestID: request.requestID
+                )
+            }
+        } catch {
+            await nativeStore.cancelEdit(
+                sessionID: request.editSessionID,
+                callerPID: caller.pid,
+                callerStartTime: caller.startTime
+            )
+            nativeEditAuthorizations[request.editSessionID] = nil
+            return .failed(
+                .internalError,
+                message: "native-store risk metadata is unavailable; edit cancelled",
                 requestID: request.requestID
             )
         }
@@ -796,6 +1245,7 @@ public actor Agent {
                 callerPID: caller.pid,
                 callerStartTime: caller.startTime
             )
+            nativeEditAuthorizations[request.editSessionID] = nil
             return Response(
                 requestID: request.requestID,
                 generation: result.generation,
@@ -826,7 +1276,50 @@ public actor Agent {
             callerPID: caller.pid,
             callerStartTime: caller.startTime
         )
+        nativeEditAuthorizations[request.editSessionID] = nil
         return Response(requestID: request.requestID)
+    }
+
+    private func nativeEditPolicyIsCurrent(
+        _ authorization: NativeEditAuthorization
+    ) async throws -> Bool {
+        let now = Date()
+        let context = try await riskContext(for: authorization.reference, now: now)
+        let acceptance = context.acceptances.first {
+            $0.mechanism == authorization.plan.mechanism
+                && $0.consumerAssurance == authorization.plan.executable.assurance
+        }
+        let decision = RiskPolicyV1.evaluate(RiskPolicyInput(
+            credentialKey: context.identity.credentialKey,
+            storedLevel: context.judgment?.level ?? .unknown,
+            evidence: context.judgment?.evidence ?? [],
+            plan: authorization.plan,
+            acceptance: acceptance,
+            now: now
+        ))
+        let current = PolicyGrantBinding(
+            credentialKey: context.identity.credentialKey,
+            riskLevel: decision.effectiveLevel,
+            policyVersion: decision.policyVersion,
+            policyDigest: decision.policyDigest,
+            outputPolicy: decision.outputPolicy
+        )
+        return decision.allowed && current == authorization.policyBinding
+    }
+
+    private func revokeNativeEdits(credentialKey: String) async {
+        guard let nativeStore else { return }
+        let affected = nativeEditAuthorizations.filter {
+            $0.value.policyBinding.credentialKey == credentialKey
+        }
+        for (sessionID, authorization) in affected {
+            await nativeStore.cancelEdit(
+                sessionID: sessionID,
+                callerPID: authorization.callerPID,
+                callerStartTime: authorization.callerStartTime
+            )
+            nativeEditAuthorizations[sessionID] = nil
+        }
     }
 
     /// Advertise the URI schemes the agent can resolve. A capability query — no
@@ -838,7 +1331,12 @@ public actor Agent {
 
     public func capabilities() -> Response {
         let features = WireCapability.allCases.filter {
-            $0 != .nativeEncryptedStore || nativeStore != nil
+            switch $0 {
+            case .nativeEncryptedStore, .nativeEditorPolicy:
+                return nativeStore != nil
+            default:
+                return true
+            }
         }
         return Response(capabilities: ProtocolCapabilities(features: features))
     }
@@ -938,6 +1436,20 @@ public actor Agent {
             && (executable.cdHash.map {
                 !$0.isEmpty && $0.utf8.count <= 128 && $0.utf8.allSatisfy(isLowerHex)
             } ?? true)
+    }
+
+    private static func hasValidNativeEditorMetadata(
+        _ request: BeginNativeStoreEditRequest
+    ) -> Bool {
+        switch request.mode {
+        case .builtInMemory:
+            return request.externalEditorPath == nil
+        case .externalTemporaryFile:
+            guard let path = request.externalEditorPath else { return false }
+            return path.hasPrefix("/")
+                && path.utf8.count <= 4_096
+                && !path.utf8.contains(0)
+        }
     }
 
     private static func isSHA256Digest(_ value: String) -> Bool {

@@ -59,6 +59,8 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.commitNativeStoreEdit(request: commit, caller: caller)
     case let .cancelNativeStoreEdit(cancel):
         return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
+    case let .risk(risk):
+        return await agent.handleRiskOperation(request: risk, caller: caller)
     }
 }
 

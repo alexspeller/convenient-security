@@ -24,6 +24,10 @@ import Darwin
 //       Open the native csec:// store as strict JSON. The built-in fileless
 //       editor is the default; --editor opts into a named plaintext file for
 //       compatibility with the command in $EDITOR.
+//
+//   csec risk inspect|forget <reference>
+//   csec risk classify|raise <level> <reference>
+//       Inspect or change value-free risk metadata without resolving a value.
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
@@ -38,6 +42,10 @@ func usage() -> Never {
       csec hook claude|codex
       csec hook-config claude|codex
       csec edit [--editor] <store>
+      csec risk inspect <reference>
+      csec risk classify low|standard|high|critical <reference>
+      csec risk raise low|standard|high|critical <reference>
+      csec risk forget <reference>
       csec install | uninstall | status
 
     get        Fetch a secret from the running agent (csecd) and print it to stdout.
@@ -51,6 +59,9 @@ func usage() -> Never {
     hook-config  Print a hook JSON fragment using this exact csec executable.
     edit       Edit a csec:// store as strict JSON. The default built-in editor is
                fileless; --editor uses $EDITOR with a temporary plaintext file.
+    risk       Inspect or change a logical credential's value-free risk policy.
+               classify may set any level; raise cannot lower one; forget resets
+               it to fail-safe unknown. Downgrades and forget require Touch ID.
     install    Register csecd as a login-item LaunchAgent so it runs in the background.
     uninstall  Unregister the csecd LaunchAgent.
     status     Show whether the csecd LaunchAgent is registered/enabled.
@@ -78,6 +89,8 @@ case "hook-config":
     runHookConfig(Array(arguments.dropFirst()))
 case "edit":
     runEdit(Array(arguments.dropFirst()))
+case "risk":
+    runRisk(Array(arguments.dropFirst()))
 case "install":
     runInstall()
 case "uninstall":
@@ -228,6 +241,71 @@ func currentExecutablePath() -> String {
         .standardizedFileURL.resolvingSymlinksInPath().path
 }
 
+// MARK: - value-free risk management
+
+func runRisk(_ arguments: [String]) -> Never {
+    guard let operationText = arguments.first,
+          let operation = RiskOperation(rawValue: operationText) else { usage() }
+
+    let referenceText: String
+    let level: RiskLevel?
+    switch operation {
+    case .inspect, .forget:
+        guard arguments.count == 2 else { usage() }
+        referenceText = arguments[1]
+        level = nil
+    case .classify, .raise:
+        guard arguments.count == 3,
+              let parsed = RiskLevel(rawValue: arguments[1]),
+              parsed != .unknown else { usage() }
+        level = parsed
+        referenceText = arguments[2]
+    }
+    guard let reference = try? SecretRef(referenceText) else {
+        FileHandle.standardError.write(Data("csec risk: invalid secret reference\n".utf8))
+        exit(2)
+    }
+
+    do {
+        let inspection = try makeAgentClient().risk(
+            operation,
+            reference: reference.uri,
+            level: level
+        )
+        let formatter = ISO8601DateFormatter()
+        print("reference: \(reference.safeInlineURI)")
+        print("provider: \(inspection.provider)")
+        print("classification: \(inspection.level.rawValue)")
+        print("effective-risk: \(inspection.effectiveLevel.rawValue)")
+        print("policy-version: \(inspection.policyVersion)")
+        print("known-members: \(inspection.knownMemberCount)")
+        print("reference-in-known-scope: \(inspection.referenceInKnownScope ? "yes" : "no")")
+        if let decidedAt = inspection.decidedAt {
+            print("decided-at: \(formatter.string(from: decidedAt))")
+        }
+        if let reviewAfter = inspection.reviewAfter {
+            print("review-after: \(formatter.string(from: reviewAfter))")
+        }
+        if inspection.acceptances.isEmpty {
+            print("compatibility-acceptances: none")
+        } else {
+            for acceptance in inspection.acceptances {
+                print(
+                    "compatibility-acceptance: \(acceptance.mechanism.rawValue) "
+                        + "\(acceptance.consumerAssurance.rawValue) until "
+                        + formatter.string(from: acceptance.reviewAfter)
+                )
+            }
+        }
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data(
+            "csec risk: \(error.localizedDescription)\n".utf8
+        ))
+        exit(1)
+    }
+}
+
 // MARK: - native encrypted store editor
 
 func runEdit(_ arguments: [String]) -> Never {
@@ -289,7 +367,11 @@ func runEdit(_ arguments: [String]) -> Never {
 
     let edit: NativeStoreEditStart
     do {
-        edit = try client.beginNativeStoreEdit(store: store.value)
+        edit = try client.beginNativeStoreEdit(
+            store: store.value,
+            mode: useExternalEditor ? .externalTemporaryFile : .builtInMemory,
+            externalEditorPath: externalEditor?.executablePath
+        )
     } catch {
         FileHandle.standardError.write(Data("csec edit: \(error.localizedDescription)\n".utf8))
         exit(1)

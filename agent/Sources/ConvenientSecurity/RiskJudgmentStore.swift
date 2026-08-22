@@ -5,7 +5,7 @@ import Security
 public protocol RiskJudgmentBackend: Sendable {
     func load(service: String, account: String) async throws -> Data?
     func store(service: String, account: String, data: Data) async throws
-    func delete(service: String, account: String) async
+    func delete(service: String, account: String) async throws
 }
 
 /// Process-local backend for unsigned development builds and synthetic tests.
@@ -25,7 +25,7 @@ public actor InMemoryRiskJudgmentBackend: RiskJudgmentBackend {
         items["\(service)|\(account)"] = data
     }
 
-    public func delete(service: String, account: String) async {
+    public func delete(service: String, account: String) async throws {
         items["\(service)|\(account)"] = nil
     }
 }
@@ -110,19 +110,19 @@ public actor RiskJudgmentStore {
               judgment.level != .unknown,
               judgment.decidedAt < judgment.reviewAfter,
               Self.hasValidOpaqueMetadata(judgment) else {
-            await forget(credentialKey: credentialKey)
+            try? await forget(credentialKey: credentialKey)
             return nil
         }
 
         guard judgment.isCurrent(at: date, policyVersion: policyVersion) else {
-            await forget(credentialKey: credentialKey)
+            try? await forget(credentialKey: credentialKey)
             return nil
         }
         return judgment
     }
 
-    public func forget(credentialKey: String) async {
-        await backend.delete(service: Self.policyService, account: credentialKey)
+    public func forget(credentialKey: String) async throws {
+        try await backend.delete(service: Self.policyService, account: credentialKey)
     }
 
     public func save(_ acceptance: DeliveryAcceptance) async throws {
@@ -160,7 +160,7 @@ public actor RiskJudgmentStore {
               acceptance.acceptedAt < acceptance.reviewAfter,
               acceptance.policyVersion == policyVersion,
               date < acceptance.reviewAfter else {
-            await backend.delete(service: Self.acceptanceService, account: account)
+            try? await backend.delete(service: Self.acceptanceService, account: account)
             return nil
         }
         return acceptance
@@ -170,20 +170,45 @@ public actor RiskJudgmentStore {
         credentialKey: String,
         mechanism: DeliveryMechanism,
         assurance: ConsumerAssurance
-    ) async {
+    ) async throws {
         let account = "\(credentialKey).\(mechanism.rawValue).\(assurance.rawValue)"
-        await backend.delete(service: Self.acceptanceService, account: account)
+        try await backend.delete(service: Self.acceptanceService, account: account)
     }
 
-    public func forgetAcceptances(credentialKey: String) async {
+    public func forgetAcceptances(credentialKey: String) async throws {
         for mechanism in DeliveryMechanism.allCases {
             for assurance in ConsumerAssurance.allCases {
-                await forgetAcceptance(
+                try await forgetAcceptance(
                     credentialKey: credentialKey,
                     mechanism: mechanism,
                     assurance: assurance
                 )
             }
+        }
+    }
+
+    public func loadAcceptances(
+        credentialKey: String,
+        policyVersion: Int,
+        at date: Date = Date()
+    ) async throws -> [DeliveryAcceptance] {
+        var result: [DeliveryAcceptance] = []
+        for mechanism in DeliveryMechanism.allCases {
+            for assurance in ConsumerAssurance.allCases {
+                if let acceptance = try await loadAcceptance(
+                    credentialKey: credentialKey,
+                    mechanism: mechanism,
+                    assurance: assurance,
+                    policyVersion: policyVersion,
+                    at: date
+                ) {
+                    result.append(acceptance)
+                }
+            }
+        }
+        return result.sorted {
+            ($0.mechanism.rawValue, $0.consumerAssurance.rawValue)
+                < ($1.mechanism.rawValue, $1.consumerAssurance.rawValue)
         }
     }
 
@@ -289,9 +314,12 @@ public struct SecurityRiskJudgmentBackend: RiskJudgmentBackend {
         }
     }
 
-    public func delete(service: String, account: String) async {
-        _ = try? await blocking {
-            SecItemDelete(identity(service: service, account: account) as CFDictionary)
+    public func delete(service: String, account: String) async throws {
+        try await blocking {
+            let status = SecItemDelete(identity(service: service, account: account) as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else {
+                throw KeychainError(operation: "judgment delete", status: status)
+            }
         }
     }
 

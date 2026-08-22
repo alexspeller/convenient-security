@@ -733,6 +733,7 @@ public actor NativeEncryptedFileProvider: SecretProvider {
         callerPID: pid_t,
         callerStartTime: UInt64,
         unlock: CacheUnlock?,
+        authorizedTTL: TimeInterval? = nil,
         now: Date = Date()
     ) async throws -> NativeStoreEditStart {
         pruneSessions(now: now)
@@ -767,12 +768,14 @@ public actor NativeEncryptedFileProvider: SecretProvider {
             document = try await loadDocument(store: store, record: record)
         }
         let sessionID = UUID().uuidString.lowercased()
+        let sessionTTL = min(editTTL, authorizedTTL ?? editTTL)
+        guard sessionTTL > 0 else { throw NativeStoreError.editSessionExpired }
         editSessions[sessionID] = EditSession(
             caller: EditCaller(pid: callerPID, startTime: callerStartTime),
             store: store,
             baseline: record,
             unlock: unlock,
-            expiresAt: now.addingTimeInterval(editTTL)
+            expiresAt: now.addingTimeInterval(sessionTTL)
         )
         return NativeStoreEditStart(sessionID: sessionID, document: try document.encoded())
     }

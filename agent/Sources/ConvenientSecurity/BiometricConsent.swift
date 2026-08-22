@@ -28,6 +28,21 @@ public struct BiometricConsent: ConsentProvider {
         ttl: TimeInterval,
         policySummary: String?
     ) async -> ConsentOutcome {
+        let localizedReason = Self.prompt(
+            caller: caller,
+            references: newReferences,
+            reason: reason,
+            ttl: ttl,
+            policySummary: policySummary
+        )
+        return await evaluate(localizedReason: localizedReason)
+    }
+
+    public func authenticate(reason: String) async -> ConsentOutcome {
+        await evaluate(localizedReason: Self.promptSafe(reason))
+    }
+
+    private func evaluate(localizedReason: String) async -> ConsentOutcome {
         let context = LAContext()
         context.localizedCancelTitle = "Deny"
 
@@ -39,14 +54,6 @@ public struct BiometricConsent: ConsentProvider {
             ))
             return .denied
         }
-
-        let localizedReason = Self.prompt(
-            caller: caller,
-            references: newReferences,
-            reason: reason,
-            ttl: ttl,
-            policySummary: policySummary
-        )
 
         let approved: Bool = await withCheckedContinuation { continuation in
             context.evaluatePolicy(policy, localizedReason: localizedReason) { success, _ in

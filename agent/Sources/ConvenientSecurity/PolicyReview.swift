@@ -70,8 +70,40 @@ public enum AccessPolicyReviewOutcome: Sendable {
     case approved(AccessPolicyApproval)
 }
 
+public struct RiskChangeReview: Sendable {
+    public let caller: CallerInfo
+    public let operation: RiskOperation
+    public let reference: SecretRef
+    public let currentLevel: RiskLevel
+    public let requestedLevel: RiskLevel?
+    public let knownMemberCount: Int
+    public let scopeExpanded: Bool
+    public let requiresBiometric: Bool
+
+    public init(
+        caller: CallerInfo,
+        operation: RiskOperation,
+        reference: SecretRef,
+        currentLevel: RiskLevel,
+        requestedLevel: RiskLevel?,
+        knownMemberCount: Int,
+        scopeExpanded: Bool,
+        requiresBiometric: Bool
+    ) {
+        self.caller = caller
+        self.operation = operation
+        self.reference = reference
+        self.currentLevel = currentLevel
+        self.requestedLevel = requestedLevel
+        self.knownMemberCount = knownMemberCount
+        self.scopeExpanded = scopeExpanded
+        self.requiresBiometric = requiresBiometric
+    }
+}
+
 public protocol PolicyReviewProvider: Sendable {
     func reviewAccess(_ review: AccessPolicyReview) async -> AccessPolicyReviewOutcome
+    func reviewRiskChange(_ review: RiskChangeReview) async -> Bool
 }
 
 /// Test-only reviewer. It is constructor-injected and is not selectable through
@@ -101,6 +133,13 @@ public struct AutoApprovePolicyReview: PolicyReviewProvider {
             acceptedCompatibilityCredentialKeys: accepted
         ))
     }
+
+    public func reviewRiskChange(_ review: RiskChangeReview) async -> Bool {
+        FileHandle.standardError.write(Data(
+            "⚠️  AutoApprovePolicyReview: approving a risk change WITHOUT a human. DEV ONLY.\n".utf8
+        ))
+        return true
+    }
 }
 
 /// AppKit review rendered by the authenticated resident agent. The selection
@@ -114,6 +153,14 @@ public struct TrustedPolicyReview: PolicyReviewProvider {
         return await MainActor.run { Self.present(review) }
         #else
         return .denied
+        #endif
+    }
+
+    public func reviewRiskChange(_ review: RiskChangeReview) async -> Bool {
+        #if canImport(AppKit)
+        return await MainActor.run { Self.presentRiskChange(review) }
+        #else
+        return false
         #endif
     }
 
@@ -236,6 +283,37 @@ public struct TrustedPolicyReview: PolicyReviewProvider {
 
         Classification describes the credential itself. Compatibility delivery is accepted separately. No secret values are shown in this window.
         """
+    }
+
+    @MainActor
+    private static func presentRiskChange(_ review: RiskChangeReview) -> Bool {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let alert = NSAlert()
+        alert.alertStyle = review.operation == .forget ? .warning : .informational
+        alert.messageText = "Confirm secret risk change"
+        let requested = review.requestedLevel?.rawValue ?? "unknown (forgotten)"
+        let scope = review.scopeExpanded
+            ? " The supplied reference will be added to the known credential scope."
+            : ""
+        let authentication = review.requiresBiometric
+            ? " Touch ID will confirm this downgrade or reset."
+            : ""
+        alert.informativeText = """
+        Operation: \(review.operation.rawValue)
+        Reference: \(review.reference.safeInlineURI)
+        Current risk: \(review.currentLevel.rawValue)
+        Resulting risk: \(requested)
+        Known members: \(review.knownMemberCount)
+
+        This changes only value-free policy metadata; no secret value is read.\(scope)\(authentication)
+        """
+        alert.addButton(withTitle: review.requiresBiometric ? "Continue to Touch ID" : "Confirm")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.title = "Convenient Security"
+        alert.window.isRestorable = false
+        application.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     private static func safe(_ value: String) -> String {

@@ -54,6 +54,9 @@ public protocol ConsentProvider: Sendable {
         ttl: TimeInterval,
         policySummary: String?
     ) async -> ConsentOutcome
+
+    /// Fresh OS authentication for a policy mutation that releases no value.
+    func authenticate(reason: String) async -> ConsentOutcome
 }
 
 /// Dev-only consent that approves everything, announcing itself loudly so it can
@@ -74,6 +77,13 @@ public struct AutoApproveConsent: ConsentProvider {
         ))
         // No biometric context (there was no human/touch); cold cache reads stay
         // suppressed, which is correct for a headless approval.
+        return .approved(unlock: nil)
+    }
+
+    public func authenticate(reason: String) async -> ConsentOutcome {
+        FileHandle.standardError.write(Data(
+            "⚠️  AutoApproveConsent: authenticating policy metadata WITHOUT a human. DEV ONLY.\n".utf8
+        ))
         return .approved(unlock: nil)
     }
 }
