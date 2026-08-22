@@ -1,48 +1,5 @@
 import Foundation
-
-/// Which standard-output destinations the launcher is allowed to interpose.
-public enum OutputGuardMode: String, Codable, Sendable, CaseIterable {
-    /// Guard only stdout/stderr channels that currently point at a terminal.
-    case tty
-    /// Guard stdout and stderr even when they feed a pipe or capture file.
-    case always
-    /// Preserve byte-exact output. Environment delivery can use direct exec
-    /// replacement; inherited-fd delivery retains its pipe-feeding supervisor.
-    case never
-}
-
-/// How `csec exec` should identify a protected value after detecting it in
-/// child output. Opaque labels are the safe default: a secret reference can
-/// itself disclose vault, item, customer, or environment metadata.
-public enum OutputRedactionLabelStyle: String, Codable, Sendable, CaseIterable {
-    case opaque
-    case reference
-}
-
-/// Value-free configuration bound into a delivery-plan digest. This prevents a
-/// grant bound to guarded output from being silently reused with masking
-/// disabled or metadata-bearing labels. The shipping consent path does not
-/// separately display this field, so the binding is not human-reviewed policy.
-public struct OutputGuardPlan: Codable, Sendable, Equatable {
-    public static let currentMatcherVersion = 1
-
-    public let mode: OutputGuardMode
-    public let labelStyle: OutputRedactionLabelStyle
-    public let includeShortValues: Bool
-    public let matcherVersion: Int
-
-    public init(
-        mode: OutputGuardMode,
-        labelStyle: OutputRedactionLabelStyle = .opaque,
-        includeShortValues: Bool = false,
-        matcherVersion: Int = Self.currentMatcherVersion
-    ) {
-        self.mode = mode
-        self.labelStyle = labelStyle
-        self.includeShortValues = includeShortValues
-        self.matcherVersion = matcherVersion
-    }
-}
+import CSECRootProtocol
 
 /// A representation of a protected value that the output guard knows how to
 /// recognize. These are deliberately finite, deterministic encodings; this is

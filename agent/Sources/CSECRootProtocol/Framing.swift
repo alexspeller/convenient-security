@@ -8,7 +8,7 @@ import Darwin
 
 private let maxFrameBytes = 8 * 1024 * 1024
 
-func readExactly(_ fd: Int32, _ count: Int) -> [UInt8]? {
+public func readExactly(_ fd: Int32, _ count: Int) -> [UInt8]? {
     guard count > 0 else { return [] }
     var buffer = [UInt8](repeating: 0, count: count)
     var offset = 0
@@ -23,7 +23,7 @@ func readExactly(_ fd: Int32, _ count: Int) -> [UInt8]? {
     return buffer
 }
 
-func writeExactly(_ fd: Int32, _ bytes: [UInt8]) -> Bool {
+public func writeExactly(_ fd: Int32, _ bytes: [UInt8]) -> Bool {
     var offset = 0
     while offset < bytes.count {
         let n = bytes.withUnsafeBytes { raw -> Int in

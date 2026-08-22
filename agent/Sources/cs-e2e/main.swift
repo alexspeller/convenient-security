@@ -86,6 +86,9 @@ actor RequestCapture {
 }
 
 let socketPath = NSTemporaryDirectory() + "cs-e2e-\(getpid()).sock"
+let rootFixtureDirectory = NSTemporaryDirectory() + "cs-root-e2e-\(getpid())"
+let rootSocketPath = rootFixtureDirectory + "/rootd.sock"
+setenv("CSEC_ROOT_SOCKET", rootSocketPath, 1)
 
 let resolver = SecretResolver(cache: NullSecretCache())
 let resolutionCounter = ResolutionCounter()
@@ -106,6 +109,8 @@ await resolver.register(StaticProvider(values: [
     "op://fd-presets/aws/content": "[default]\naws_access_key_id=AKIAFD\naws_secret_access_key=aws-fd-secret",
     "op://fd-presets/google/content": "{\"type\":\"service_account\",\"private_key\":\"google-fd-secret\"}",
     "op://fd-high/pgpass/content": "high-fd-synthetic-secret",
+    "op://file-delivery/config/content": "regular-file-synthetic-secret",
+    "op://github/profile/token": "github-regular-file-synthetic-token",
 ], counter: resolutionCounter))
 let nativeKeyBackend = InMemoryNativeStoreKeyBackend()
 let nativeFileBackend = InMemoryNativeStoreFileBackend()
@@ -160,6 +165,49 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
     case let .risk(risk):
         return await agent.handleRiskOperation(request: risk, caller: caller)
+    case let .approveProtectedLaunch(approval):
+        guard approval.validate(caller: caller) else {
+            return .failed(
+                .invalidRequest,
+                message: "invalid synthetic protected launch",
+                requestID: approval.requestID
+            )
+        }
+        let access = await agent.handle(request: approval.accessRequest, caller: caller)
+        if let failure = access.failure {
+            return Response(requestID: approval.requestID, failure: failure)
+        }
+        guard let values = access.values, let expiresAt = access.accessExpiresAt else {
+            return .failed(
+                .internalError,
+                message: "synthetic protected launch was not bounded",
+                requestID: approval.requestID
+            )
+        }
+        do {
+            try RootHelperClient(
+                path: rootSocketPath,
+                trustPolicy: .allowUnverifiedForTesting
+            ).approve(
+                nonce: approval.rendezvousNonce,
+                planDigest: approval.launchPlanDigest,
+                payloads: try ProtectedFilePayloadRenderer.render(
+                    bindings: approval.launchPlan.files,
+                    values: values
+                ),
+                expiresAt: expiresAt
+            )
+            return Response(
+                requestID: approval.requestID,
+                protectedLaunchApproved: true
+            )
+        } catch {
+            return .failed(
+                .deliveryNotSupported,
+                message: "synthetic root helper rejected the launch",
+                requestID: approval.requestID
+            )
+        }
     }
 }
 Thread.detachNewThread { try? server.run() }
@@ -200,8 +248,9 @@ do {
           && capabilities.features.contains(.nativeEditorPolicy)
           && capabilities.features.contains(.registeredSessionRoots)
           && capabilities.features.contains(.credentialProtocols)
-          && capabilities.features.contains(.inheritedFileDescriptors),
-          "agent advertises delivery, redaction, native-store, risk-policy, and no-root capabilities")
+          && capabilities.features.contains(.inheritedFileDescriptors)
+          && capabilities.features.contains(.protectedRegularFiles),
+          "agent advertises delivery, redaction, native-store, risk-policy, and secure-file capabilities")
 } catch {
     check(false, "protocol capability negotiation succeeds (\(error))")
 }
@@ -731,8 +780,39 @@ do {
 // csec at our temp agent; the fake value is safe to print.
 let selfURL = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
 let csecURL = selfURL.deletingLastPathComponent().appendingPathComponent("csec")
+let fileProbeURL = selfURL.deletingLastPathComponent().appendingPathComponent("cs-file-probe")
+let ghFixtureURL = selfURL.deletingLastPathComponent().appendingPathComponent("cs-gh-fixture")
+let fakeRootURL = selfURL.deletingLastPathComponent().appendingPathComponent("cs-fake-rootd")
 let processTitleFixtureURL = selfURL.deletingLastPathComponent()
     .appendingPathComponent("cs-process-title-fixture")
+
+let fakeRoot = Process()
+fakeRoot.executableURL = fakeRootURL
+var fakeRootEnvironment = ProcessInfo.processInfo.environment
+fakeRootEnvironment["CSEC_ROOT_SOCKET"] = rootSocketPath
+fakeRoot.environment = fakeRootEnvironment
+fakeRoot.standardInput = FileHandle.nullDevice
+fakeRoot.standardOutput = FileHandle.nullDevice
+fakeRoot.standardError = FileHandle.nullDevice
+try? FileManager.default.removeItem(atPath: rootFixtureDirectory)
+try? fakeRoot.run()
+var rootWaited = 0
+while !FileManager.default.fileExists(atPath: rootSocketPath) && rootWaited < 100 {
+    usleep(20_000)
+    rootWaited += 1
+}
+check(FileManager.default.fileExists(atPath: rootSocketPath), "synthetic root-helper socket is listening")
+let fakeGHURL = URL(fileURLWithPath: rootFixtureDirectory).appendingPathComponent("gh")
+try? FileManager.default.removeItem(at: fakeGHURL)
+do {
+    try FileManager.default.copyItem(at: ghFixtureURL, to: fakeGHURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeGHURL.path
+    )
+} catch {
+    check(false, "synthetic gh fixture can be installed (\(error))")
+}
 
 func runCsec(
     _ arguments: [String],
@@ -743,6 +823,10 @@ func runCsec(
     process.arguments = arguments
     var environment = ProcessInfo.processInfo.environment
     environment["CSEC_SOCKET"] = socketPath
+    for name in [
+        "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+        "GH_CONFIG_DIR",
+    ] { environment.removeValue(forKey: name) }
     for (key, value) in extraEnv { environment[key] = value }
     process.environment = environment
     let outPipe = Pipe(), errPipe = Pipe()
@@ -763,6 +847,12 @@ func runCsec(
         String(data: errData, encoding: .utf8) ?? ""
     )
 }
+
+let rootStatus = runCsec(["root-status"], extraEnv: [:])
+check(rootStatus.status == 0
+      && rootStatus.out == "csec: authenticated root helper reachable\n"
+      && rootStatus.err.isEmpty,
+      "root-status verifies the authenticated root-helper protocol endpoint")
 
 func runCsecWithInput(
     _ arguments: [String],
@@ -1205,6 +1295,95 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
           && !genericFD.err.contains("google-fd-secret"),
           "generic --fd maps an exact reference payload to a caller-selected path variable")
 
+    let consentBeforeRegularFiles = await consent.calls()
+    let resolutionsBeforeRegularFiles = await resolutionCounter.calls()
+    let regularFileProbe = runCsec(
+        [
+            "exec-file", "--redact-output=always", "--for", "60",
+            "--file", "PROTECTED_FILE=op://file-delivery/config/content",
+            "--", fileProbeURL.path, "--parent", "400",
+        ],
+        extraEnv: [:]
+    )
+    check(regularFileProbe.status == 0
+          && regularFileProbe.out == "file-probe-ok\n"
+          && !regularFileProbe.err.contains("regular-file-synthetic-secret"),
+          "exec-file supports stat, open, reopen, seek, mmap, and fork/exec inheritance "
+            + "(status=\(regularFileProbe.status), out=\(regularFileProbe.out.debugDescription), "
+            + "err=\(regularFileProbe.err.debugDescription))")
+
+    let regularFileLeak = runCsec(
+        [
+            "exec-file", "--redact-output=always", "--for", "60",
+            "--file", "TOOL_CONFIG=op://file-delivery/config/content",
+            "--", "/bin/sh", "-c", "/bin/cat \"$TOOL_CONFIG\"",
+        ],
+        extraEnv: [:]
+    )
+    let consentAfterRegularFiles = await consent.calls()
+    let resolutionsAfterRegularFiles = await resolutionCounter.calls()
+    check(regularFileLeak.status == 0
+          && regularFileLeak.out.hasPrefix("[csec:secret-")
+          && regularFileLeak.out.hasSuffix("]")
+          && !regularFileLeak.out.contains("regular-file-synthetic-secret")
+          && !regularFileLeak.err.contains("regular-file-synthetic-secret"),
+          "exec-file output scanning redacts a protected file deliberately printed by its target "
+            + "(status=\(regularFileLeak.status), out=\(regularFileLeak.out.debugDescription), "
+            + "err=\(regularFileLeak.err.debugDescription))")
+    check(consentAfterRegularFiles == consentBeforeRegularFiles + 2
+          && resolutionsAfterRegularFiles == resolutionsBeforeRegularFiles + 2,
+          "every protected-file launch repeats consent and resolution for its one-time rendezvous")
+
+    let regularFilePTY = runCsecInPTY(
+        [
+            "exec-file", "--for", "60",
+            "--file", "PROTECTED_FILE=op://file-delivery/config/content",
+            "--", "/bin/sh", "-c",
+            "test -t 0 && test -t 1 && test -t 2 && stty size && /bin/cat \"$PROTECTED_FILE\"",
+        ],
+        extraEnv: [:]
+    )
+    check(regularFilePTY.status == 0
+          && regularFilePTY.out.contains("37 113")
+          && regularFilePTY.out.contains("[csec:secret-")
+          && !regularFilePTY.out.contains("regular-file-synthetic-secret")
+          && !regularFilePTY.err.contains("regular-file-synthetic-secret"),
+          "exec-file preserves a controlling PTY, terminal size, and guarded output")
+
+    let githubArguments = [
+        "exec-file", "--redact-output=always", "--for", "60",
+        "--gh-config", "op://github/profile/token",
+        "--github-host", "github.example.test",
+        "--github-user", "synthetic-user",
+        "--github-git-protocol", "https",
+        "--", fakeGHURL.path, "api", "user",
+    ]
+    let resolutionsBeforeAmbientGitHub = await resolutionCounter.calls()
+    let ambientGitHub = runCsec(
+        githubArguments,
+        extraEnv: ["GH_TOKEN": "synthetic-ambient-authority"]
+    )
+    let resolutionsAfterAmbientGitHub = await resolutionCounter.calls()
+    check(ambientGitHub.status == 1
+          && ambientGitHub.out.isEmpty
+          && ambientGitHub.err.contains("ambient GitHub authentication remains")
+          && resolutionsAfterAmbientGitHub == resolutionsBeforeAmbientGitHub,
+          "GH_CONFIG_DIR mode refuses ambient token authority before resolving its profile")
+
+    let protectedGitHub = runCsec(githubArguments, extraEnv: [:])
+    check(protectedGitHub.status == 0
+          && protectedGitHub.out == "gh-profile-ok\n"
+          && !protectedGitHub.err.contains("github-regular-file-synthetic-token"),
+          "GH_CONFIG_DIR mode gives only direct gh a protected hosts.yml profile "
+            + "(status=\(protectedGitHub.status), out=\(protectedGitHub.out.debugDescription), "
+            + "err=\(protectedGitHub.err.debugDescription))")
+
+    let sessionsAfterRegularFile = (try? FileManager.default.contentsOfDirectory(
+        atPath: rootFixtureDirectory + "/files"
+    )) ?? []
+    check(sessionsAfterRegularFile.isEmpty,
+          "the root helper removes the protected session after the complete launch tree exits")
+
     do {
         _ = try client.risk(
             .classify,
@@ -1570,6 +1749,11 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
 }
 
 unlink(socketPath)
+if fakeRoot.isRunning {
+    fakeRoot.terminate()
+    fakeRoot.waitUntilExit()
+}
+try? FileManager.default.removeItem(atPath: rootFixtureDirectory)
 
 if failures == 0 {
     print("\nAll end-to-end checks passed.")

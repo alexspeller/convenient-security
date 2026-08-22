@@ -46,6 +46,20 @@ high-numbered descriptors, no value in initial environment/argv/current
 directory, literal argv behavior, output masking, and rejection when an
 unrelated same-UID process tries the same `/dev/fd/N` path.
 
+Secure regular-file checks use only synthetic payloads and an explicitly
+unprivileged fake root daemon. Core checks cover plan canonicalization/tamper,
+outer/nested request binding, path/environment rejection, bounded raw and
+GitHub rendering, descriptor framing, kernel GID/process enumeration, boot-
+scoped allocator inputs, descriptor-relative creation, exact modes/content,
+symlink/traversal rejection, partial cleanup, and restart recovery. End-to-end
+checks cover authenticated health, fresh consent/resolution per launch,
+`stat`/open/reopen/seek/`mmap`, fork/exec reopen, output masking, protected
+`GH_CONFIG_DIR`, ambient GitHub authority rejection before resolution, and
+session cleanup. The release build is also checked to keep the root executable
+free of AppKit, LocalAuthentication, ServiceManagement, Keychain/provider, and
+agent-policy link/symbol dependencies. These checks do not exercise root or a
+real tmpfs; the separate matrix below remains mandatory.
+
 ## Toolchain baseline
 
 The current physical-machine baseline (verified 2026-08-21) is:
@@ -120,4 +134,11 @@ Before treating an artifact as protected, verify on the signed installed app:
 17. installed supported versions of libpq, kubectl, the AWS SDK/CLI, and Google
     authentication tooling each consume their preset once through `/dev/fd/N`,
     while a concurrent same-UID process cannot read that descriptor and no
-    plaintext named file, argv, or initial-environment value is created.
+    plaintext named file, argv, or initial-environment value is created; and
+18. every signed/root row in
+    [`regular-file-security-matrix.md`](regular-file-security-matrix.md) passes
+    with synthetic data, including exact installed identities, verified tmpfs
+    flags/caps and modes, unrelated same-UID denial, GID lifecycle/collision
+    checks, daemonized descendants, launcher death, soft/hard TTL, cancellation,
+    restart recovery, GUI/headless audit-session behavior, and real consumer
+    compatibility.

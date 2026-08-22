@@ -77,6 +77,7 @@ public struct AuditIdentity: Sendable {
 public enum ProductCodeRole: String, Sendable {
     case agent
     case launcher
+    case rootHelper = "root_helper"
     case other
 }
 
@@ -138,6 +139,7 @@ public enum ProductCodeIdentity {
     public static let teamIdentifier = "8RS6GD89Y7"
     public static let agentIdentifier = "com.alexspeller.convenient-security"
     public static let launcherIdentifier = "com.alexspeller.convenient-security.csec"
+    public static let rootHelperIdentifier = "com.alexspeller.convenient-security.rootd"
     public static let forbiddenEntitlements = [
         "com.apple.security.get-task-allow",
         "com.apple.security.cs.disable-library-validation",
@@ -230,6 +232,11 @@ public enum ProductCodeIdentity {
                   teamIdentifier == self.teamIdentifier,
                   satisfiesRequirement(code, identifier: launcherIdentifier) {
             role = .launcher
+        } else if signatureValid, hardenedRuntime, dangerousEntitlements.isEmpty,
+                  identifier == rootHelperIdentifier,
+                  teamIdentifier == self.teamIdentifier,
+                  satisfiesRequirement(code, identifier: rootHelperIdentifier) {
+            role = .rootHelper
         } else {
             role = .other
         }
@@ -264,6 +271,7 @@ public enum ProductCodeIdentity {
         switch identifier {
         case agentIdentifier: return .agent
         case launcherIdentifier: return .launcher
+        case rootHelperIdentifier: return .rootHelper
         default: return .other
         }
     }

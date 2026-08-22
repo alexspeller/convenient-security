@@ -13,6 +13,17 @@ int cs_connect_unix(const char *path);
 /// Accept a connection on `listen_fd`. Returns the connected fd, or -1.
 int cs_accept(int listen_fd);
 
+/// Send/receive the four-byte frame header together with a bounded SCM_RIGHTS
+/// descriptor set. The JSON body is written/read with the ordinary framing
+/// helpers after this header. Send returns 0; receive returns the descriptor
+/// count (possibly zero), or -1 on failure.
+int32_t cs_send_frame_header_with_fds(
+    int32_t fd, uint32_t body_length, const int32_t *fds, int32_t fd_count
+);
+int32_t cs_receive_frame_header_with_fds(
+    int32_t fd, uint32_t *body_length, int32_t *fds, int32_t maximum_fd_count
+);
+
 /// PID of the socket peer via LOCAL_PEERTOKEN (kernel audit token), or -1.
 /// This is trustworthy (kernel-provided); never use the self-reported PID.
 int32_t cs_peer_pid(int fd);
@@ -60,6 +71,33 @@ uint32_t cs_proc_status(int32_t pid);
 /// — shown to the human in the consent prompt, never used as an identity gate.
 int32_t cs_proc_name(int32_t pid, char *buf, int32_t bufsize);
 
+/// Snapshot the live process credential used by the kernel for filesystem
+/// checks. Returns the number of groups, or -1. The effective/real/saved GIDs
+/// are all included exactly once when room permits.
+int32_t cs_proc_groups(int32_t pid, uint32_t *groups, int32_t maximum_groups);
+
+/// Capability-GID allocation/lifecycle helpers. These inspect every live
+/// process credential, including supplementary groups. `cs_pids_with_gid`
+/// returns the total holder count (which may exceed `maximum_pids`) or -1.
+int32_t cs_gid_is_assigned(uint32_t gid);
+int32_t cs_gid_has_live_holder(uint32_t gid);
+int32_t cs_pid_has_gid(int32_t pid, uint32_t gid);
+int32_t cs_pids_with_gid(uint32_t gid, int32_t *pids, int32_t maximum_pids);
+
+/// Boot time in microseconds since the epoch, used to scope the persistent
+/// non-reuse cursor. Returns 0 if unavailable.
+uint64_t cs_boot_time(void);
+
+/// Current process audit session ID, or UINT32_MAX on failure.
+uint32_t cs_self_audit_session_id(void);
+
+/// Verify that `path` is a tmpfs mounted with nodev,nosuid,noexec,nobrowse and
+/// bounded no larger than the supplied byte/node ceilings. Returns 1 when
+/// secure, 0 when it is not a tmpfs/misses a property, and -1 on statfs failure.
+int32_t cs_secure_tmpfs_status(
+    const char *path, uint64_t maximum_bytes, uint64_t maximum_nodes
+);
+
 /// Child output wiring used by the csec process supervisor.
 typedef enum {
     CS_OUTPUT_INHERIT = 0,
@@ -89,6 +127,32 @@ int32_t cs_spawn_supervised(
     int32_t *stderr_read_fd
 );
 
+/// Root-helper launch primitive. The caller has already authenticated and
+/// validated the plan, opened cwd/stdio, created protected files, and selected
+/// an unused capability GID. The child joins the launcher's audit session,
+/// obtains its own process group (and controlling PTY when requested), drops to
+/// `uid` with the capability as real/effective/saved primary GID, disables core
+/// dumps, closes every unintended descriptor, and execs the exact path.
+/// Success is returned only after execve closes the status pipe.
+int32_t cs_spawn_with_capability_gid(
+    const char *executable_path,
+    char *const argv[],
+    char *const envp[],
+    int32_t cwd_fd,
+    int32_t stdin_fd,
+    int32_t stdout_fd,
+    int32_t stderr_fd,
+    uint32_t uid,
+    uint32_t capability_gid,
+    const uint32_t *supplementary_groups,
+    int32_t supplementary_group_count,
+    uint32_t audit_session_id,
+    int32_t uses_pty,
+    int32_t drop_credentials,
+    int32_t *child_pid,
+    uint64_t *child_start_time
+);
+
 /// Set O_NONBLOCK while preserving existing descriptor flags.
 int32_t cs_fd_set_nonblocking(int32_t fd);
 
@@ -106,6 +170,10 @@ void cs_terminal_restore(void);
 
 /// Copy the size of the first available standard terminal onto the child PTY.
 int32_t cs_resize_pty_from_standard_terminal(int32_t pty_master_fd);
+
+/// Allocate a close-on-exec PTY pair using the first available standard
+/// terminal's attributes and size. Returns 0 on success.
+int32_t cs_open_standard_pty(int32_t *master_fd, int32_t *slave_fd);
 
 /// Portable wrappers for wait status macros, which Swift cannot import.
 int32_t cs_wait_status_exited(int32_t status);

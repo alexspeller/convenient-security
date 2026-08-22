@@ -1,9 +1,11 @@
 # Wire protocols
 
-Convenient Security has two local protocols:
+Convenient Security has three local protocols:
 
 1. protocol v2 between the signed `csec` launcher/bridge and `csecd`; and
-2. a one-shot private-pipe protocol between a language client and `csec bridge`.
+2. root-helper protocol v1 between exact signed `csec`/`csecd` roles and
+   `csec-rootd`; and
+3. a one-shot private-pipe protocol between a language client and `csec bridge`.
 
 Neither treats a pathname, PID supplied in JSON, or same-UID ownership as an
 identity boundary.
@@ -71,7 +73,8 @@ The response advertises supported versions and features:
       "native_editor_policy",
       "registered_session_roots",
       "credential_protocols",
-      "inherited_file_descriptors"
+      "inherited_file_descriptors",
+      "protected_regular_files"
     ]
   }
 }
@@ -177,12 +180,15 @@ Success echoes the request nonce:
 {
   "version": 2,
   "requestID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-  "values": {"op://Vault/Item/field":"…"}
+  "values": {"op://Vault/Item/field":"…"},
+  "accessExpiresAt": "2026-08-22T12:34:56Z"
 }
 ```
 
 The client rejects a missing/mismatched nonce or a values map whose keys differ
-from the requested reference set.
+from the requested reference set. `accessExpiresAt` is the absolute,
+policy-capped end of this access decision; protected regular-file approval must
+not outlive it.
 
 ## Registered session roots
 
@@ -241,6 +247,67 @@ and are never encoded in the plan or child environment. The advertised
 `inherited_file_descriptors` capability describes this launcher behavior; it
 does not add another daemon message containing files or descriptor numbers.
 
+## Protected regular-file rendezvous
+
+The capability `protected_regular_files` adds one agent request and a separate
+root-helper protocol. Production root traffic uses `AF_UNIX` at the fixed
+`/private/var/run/convenient-security/rootd.sock`; release builds compile out
+the debug endpoint override. The root-owned socket is mode `0666` so the two
+normal-UID product roles can connect, but its pathname and permissions grant no
+authority. Every connection is authenticated from the complete audit token and
+live Security.framework code before its body is read, then rechecked before the
+response:
+
+- exact signed `csec` may use `prepare`, `start`, `status`, `signal`, `cancel`,
+  and `health`;
+- exact signed `csecd` alone may use `approve`; and
+- both must be non-root peers, while clients require an exact signed helper
+  whose effective UID is root.
+
+Each request uses a fresh connection and one bounded length-prefixed JSON
+frame. The listener admits at most 32 concurrent handlers and applies five-
+second I/O timeouts; the coordinator retains at most 128 launch records. Only
+`prepare` carries descriptors: exactly cwd, stdin, stdout, and stderr in that
+order through `SCM_RIGHTS`. Every other operation must carry zero descriptors.
+
+The launch sequence is:
+
+1. `csec` constructs and validates `ProtectedLaunchPlan`, including its own
+   PID/start time/UID/audit session, exact executable metadata, complete argv,
+   sanitized environment, one to sixteen file bindings, delivery-plan/output-
+   guard binding, TTL/hard-TTL flag, and PTY choice. It sends `prepare` with the
+   canonical SHA-256 plan digest and four descriptors.
+2. `csec-rootd` revalidates the plan, caller identity, executable claim, and
+   descriptors, retains the descriptors, and returns a fresh rendezvous nonce
+   plus the same digest in state `prepared`. An unapproved preparation expires
+   after 60 seconds or launcher death.
+3. `csec` submits `approve_protected_launch` to `csecd`. The outer request UUID
+   must equal the nested approval UUID. The nested request repeats the nonce,
+   complete launch plan/digest, and an ordinary v2 access request derived from
+   exactly that plan.
+4. `csecd` verifies that the authenticated caller is the launcher recorded in
+   the plan, evaluates `capability_gid_file` policy with no grant reuse, obtains
+   fresh consent, resolves the exact reference set, and renders each payload.
+   Raw payloads are non-empty and at most 1 MiB each/4 MiB total. GitHub mode
+   emits a bounded, injection-safe `hosts.yml` selected by the reviewed binding.
+5. `csecd` sends `approve` directly to the authenticated root helper with the
+   nonce, plan digest, payloads, and policy-capped absolute expiry. On success it
+   returns only `{"protectedLaunchApproved":true}` to `csec`; it never returns
+   the values. The helper creates the files and enters state `ready`.
+6. Only the exact original launcher audit token may send `start`. The response
+   supplies the kernel child PID/start time in state `running`. The launcher
+   supervises terminal or pipe I/O, polls `status`, forwards permitted signals,
+   and sends `cancel` if scanning or supervision fails. Final status includes
+   the raw wait status and no plaintext.
+
+All requests carry a UUID and all rendezvous operations carry the nonce plus
+digest; clients reject version, UUID, nonce, digest, state, or response-shape
+mismatches. Root-helper failures use the single value-free `invalid_request`
+code with generic text except the bounded expired-rendezvous distinction.
+Relative paths are fixed by product construction and independently reject
+absolute paths, traversal, prefix collisions, duplicates, environment
+collisions, and loader/product controls.
+
 ## Value-free risk management
 
 Only a verified product launcher may inspect or mutate risk metadata. The
@@ -274,9 +341,10 @@ native-store edit sessions before returning the updated inspection.
 
 ## Active-output redaction sessions
 
-This protocol supports pre-recipient scanning for `csec tool-exec`. It is not a
-general secret-query API. When a v2 access succeeds, `csecd` registers only the
-values it actually released, in memory, until the delivery TTL. It does not
+This protocol supports pre-recipient scanning for `csec tool-exec` and
+`csec exec-file`. It is not a general secret-query API. When a v2 access
+succeeds, `csecd` registers only the values it actually released, in memory,
+until the delivery TTL. It does not
 unlock dormant cache/provider entries to populate the registry. Registry state
 is lost on agent restart, and an entry expires at its delivery TTL even when the
 consumer remains alive.
@@ -289,15 +357,18 @@ The signed launcher opens a session on a persistent authenticated socket:
   "type": "begin_output_redaction",
   "requestID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
   "destination": "ai_tool",
-  "streams": ["stdout", "stderr", "terminal"]
+  "streams": ["stdout", "stderr", "terminal"],
+  "includeShortValues": false
 }
 ```
 
-The current implementation accepts only `ai_tool`, rejects duplicate/unknown
+The current implementation accepts `ai_tool` for the fail-closed AI broker and
+`local_development` for protected launch supervision, rejects duplicate/unknown
 streams, permits at most 32 live sessions, and expires a session after five idle
-minutes. The response contains a fresh opaque session UUID plus counts of
-eligible values and values skipped for being shorter than the eight-byte
-automatic-matching floor. It never contains the registry values.
+minutes. `includeShortValues` opts into matching below the normal eight-byte
+floor and remains bound for subsequent catalog refreshes. The response contains
+a fresh opaque session UUID plus eligible/skipped counts. It never contains the
+registry values.
 
 For each child-output read, `csec` sends at most 64 KiB:
 

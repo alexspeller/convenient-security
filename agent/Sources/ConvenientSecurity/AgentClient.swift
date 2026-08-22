@@ -186,16 +186,41 @@ public struct AgentClient {
         return inspection
     }
 
+    /// Ask csecd to review/resolve a protected-file launch and send the rendered
+    /// bytes directly to csec-rootd. A successful response contains only a
+    /// boolean; file plaintext is never decoded by this client process.
+    public func approveProtectedLaunch(
+        rendezvousNonce: String,
+        launchPlan: ProtectedLaunchPlan,
+        launchPlanDigest: String
+    ) throws {
+        let request = try ProtectedLaunchApprovalRequest(
+            rendezvousNonce: rendezvousNonce,
+            launchPlan: launchPlan,
+            launchPlanDigest: launchPlanDigest
+        )
+        let response = try send(.approveProtectedLaunch(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard response.protectedLaunchApproved == true, response.values == nil else {
+            throw ClientError.transportFailed
+        }
+    }
+
     /// Open one authenticated, persistent connection whose output chunks are
     /// scanned against the agent's active-value registry. Raw registry values
     /// never leave `csecd`; only already-redacted bytes and value-free matches
     /// return to the launcher.
     public func beginOutputRedaction(
         destination: DestinationClass,
-        streams: [OutputRedactionStream]
+        streams: [OutputRedactionStream],
+        includeShortValues: Bool = false
     ) throws -> AgentOutputRedactionSession {
         let connection = try AgentConnection(path: path, serverTrustPolicy: serverTrustPolicy)
-        let request = BeginOutputRedactionRequest(destination: destination, streams: streams)
+        let request = BeginOutputRedactionRequest(
+            destination: destination,
+            streams: streams,
+            includeShortValues: includeShortValues
+        )
         let response = try connection.send(.beginOutputRedaction(request))
         try Self.check(response: response, requestID: request.requestID)
         guard let sessionID = response.outputRedactionSessionID,

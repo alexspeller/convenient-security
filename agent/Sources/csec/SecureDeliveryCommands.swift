@@ -443,7 +443,7 @@ private func credentialConsumer() throws -> CredentialConsumer {
 /// A protected interpreter image does not make a mutable script, module graph,
 /// or shell program independently protected. Keep those consumer contexts at
 /// unverified assurance while retaining code-signing metadata for review.
-private func conservativeExecutable(command: String) throws -> PlannedExecutable {
+func conservativeExecutable(command: String) throws -> PlannedExecutable {
     let inspected = try ExecutableInspection.plannedExecutable(command: command)
     let interpreterNames: Set<String> = [
         "bash", "dash", "node", "perl", "python", "python3", "ruby", "sh", "zsh",

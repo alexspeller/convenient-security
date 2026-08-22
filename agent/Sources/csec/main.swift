@@ -26,6 +26,13 @@ import Darwin
 //   csec exec-fd (--fd ENV=<reference>|--preset NAME=<reference>)… -- <cmd>
 //       Stream file-shaped secrets into inherited anonymous descriptors.
 //
+//   csec exec-file (--file ENV=<reference>|--gh-config <reference>)… -- <cmd>
+//       Ask the root helper to launch a process tree with regular files protected
+//       by a fresh primary-GID capability on bounded tmpfs.
+
+//   csec root-status
+//       Verify that the authenticated root helper is reachable.
+//
 //   csec tool-exec --destination ai -- <cmd> [args…]
 //       Run a command whose output is scanned against every active value in the
 //       resident agent before any bytes are returned to an AI command runner.
@@ -61,6 +68,13 @@ func usage() -> Never {
                    [--redact-output=tty|always|never]
                    [--redact-output-label=opaque|reference] [--redact-short-values]
                    -- <cmd> [args…]
+      csec exec-file [--reason <text>] [--for <seconds>] [--hard-ttl]
+                     (--file ENV_NAME=<reference> | --gh-config <reference>)…
+                     [--github-host <host>] [--github-user <login>]
+                     [--github-git-protocol https|ssh]
+                     [--redact-output=tty|always|never]
+                     [--redact-output-label=opaque|reference] [--redact-short-values]
+                     -- <cmd> [args…]
       csec bridge
       csec tool-exec --destination ai -- <cmd> [args…]
       csec hook claude|codex
@@ -71,6 +85,7 @@ func usage() -> Never {
       csec risk raise low|standard|high|critical <reference>
       csec risk forget <reference>
       csec install | uninstall | status
+      csec root-status
 
     get        Fetch a secret from the running agent (csecd) and print it to stdout.
     exec       Run <cmd> with secret references resolved into its environment. Any env
@@ -82,6 +97,10 @@ func usage() -> Never {
     exec-fd    Give a child anonymous single-open secret files at /dev/fd/N. Presets set
                PGPASSFILE, KUBECONFIG, AWS_SHARED_CREDENTIALS_FILE, or
                GOOGLE_APPLICATION_CREDENTIALS to the non-secret descriptor path.
+    exec-file  Give a launched process tree seekable/reopenable root-owned regular files
+               on bounded tmpfs. A fresh primary GID is the per-launch capability;
+               csec never receives file bytes. --gh-config creates protected hosts.yml
+               only after ambient GitHub authentication has been removed.
     bridge     Private framed stdin/stdout protocol for language clients; not for terminals.
     tool-exec  Fail-closed AI command broker using csecd's active-value scanner.
     hook       PreToolUse stdin/stdout adapter for Claude Code or Codex.
@@ -94,6 +113,7 @@ func usage() -> Never {
     install    Register csecd as a login-item LaunchAgent so it runs in the background.
     uninstall  Unregister the csecd LaunchAgent.
     status     Show whether the csecd LaunchAgent is registered/enabled.
+    root-status  Verify that the authenticated regular-file root helper is reachable.
 
     """.utf8))
     exit(2)
@@ -113,6 +133,8 @@ case "creds":
     runCredentials(Array(arguments.dropFirst()))
 case "exec-fd":
     runExecFD(Array(arguments.dropFirst()))
+case "exec-file":
+    runExecFile(Array(arguments.dropFirst()))
 case "bridge":
     guard arguments.count == 1 else { usage() }
     runBridge()
@@ -132,6 +154,9 @@ case "uninstall":
     runUninstall()
 case "status":
     runStatus()
+case "root-status":
+    guard arguments.count == 1 else { usage() }
+    runRootStatus()
 default:
     usage()
 }
@@ -921,6 +946,24 @@ func runUninstall() -> Never {
 func runStatus() -> Never {
     print("csec: LaunchAgent \(LaunchAgentService.status().description)")
     exit(0)
+}
+
+func runRootStatus() -> Never {
+    #if DEBUG
+    let trustPolicy: RootHelperServerTrustPolicy = .allowUnverifiedForTesting
+    #else
+    let trustPolicy: RootHelperServerTrustPolicy = .requireProductRootHelper
+    #endif
+    do {
+        try RootHelperClient(trustPolicy: trustPolicy).health()
+        print("csec: authenticated root helper reachable")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data(
+            "csec root-status: authenticated root helper unavailable\n".utf8
+        ))
+        exit(1)
+    }
 }
 
 /// Release clients always authenticate the product agent. Debug integration

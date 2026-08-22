@@ -63,6 +63,12 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
     case let .risk(risk):
         return await agent.handleRiskOperation(request: risk, caller: caller)
+    case let .approveProtectedLaunch(approval):
+        return .failed(
+            .deliveryNotSupported,
+            message: "the standalone fake agent has no root-helper rendezvous",
+            requestID: approval.requestID
+        )
     }
 }
 

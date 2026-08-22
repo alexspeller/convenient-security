@@ -2,6 +2,9 @@ import Foundation
 import ConvenientSecurity
 import OnePasswordAdapter
 import LocalAuthentication
+import CSecuritySupport
+import CSECRootServer
+import Darwin
 
 // Framework-free self-checks for the provider-agnostic core, runnable anywhere
 // (`swift run cs-selftest`) without XCTest or full Xcode. Exits non-zero on any
@@ -27,6 +30,41 @@ func checkThrows(_ label: String, _ body: () throws -> Void) {
     } catch {
         print("ok   - \(label) (threw \(error))")
     }
+}
+
+func syntheticProtectedLaunchPlan(
+    files: [ProtectedFileBinding],
+    environment: [String: String] = ["PATH": "/usr/bin:/bin"],
+    commandLine: [String] = ["/bin/sh", "-c", "exit 0"],
+    hardTTL: Bool = false
+) throws -> ProtectedLaunchPlan {
+    let executable = PlannedExecutable(
+        canonicalPath: "/bin/sh",
+        assurance: .independentlyProtected
+    )
+    let delivery = DeliveryPlan(
+        mechanism: .capabilityGIDFile,
+        executable: executable,
+        root: .caller,
+        descendantScope: .subtree,
+        destination: .localDevelopment,
+        requestedTTLSeconds: 300,
+        operationContext: "synthetic protected-file self-test",
+        commandDigest: try ExecutableInspection.commandDigest(commandLine),
+        outputGuard: OutputGuardPlan(mode: .always)
+    )
+    return ProtectedLaunchPlan(
+        launcherPID: getpid(),
+        launcherStartTime: ProcessAncestry.startTime(of: getpid()) ?? 0,
+        uid: getuid(),
+        auditSessionID: cs_self_audit_session_id(),
+        executable: executable,
+        commandLine: commandLine,
+        environment: environment,
+        files: files,
+        deliveryPlan: delivery,
+        hardTTL: hardTTL
+    )
 }
 
 /// In-memory stand-in for the data-protection keychain. Shared between two
@@ -550,6 +588,18 @@ if let originalProviderOverride {
 } else {
     unsetenv("OP_CLI_PATH")
 }
+
+let releaseRootSocketOverride = "/tmp/csec-root-release-must-ignore.sock"
+let originalRootSocketOverride = ProcessInfo.processInfo.environment["CSEC_ROOT_SOCKET"]
+setenv("CSEC_ROOT_SOCKET", releaseRootSocketOverride, 1)
+check(!RootHelperSocket.isUsingDebugOverride
+      && RootHelperSocket.defaultPath() == RootHelperSocket.canonicalPath,
+      "release build ignores CSEC_ROOT_SOCKET")
+if let originalRootSocketOverride {
+    setenv("CSEC_ROOT_SOCKET", originalRootSocketOverride, 1)
+} else {
+    unsetenv("CSEC_ROOT_SOCKET")
+}
 #endif
 
 print("\n# ProductCodeIdentity (pure trust classification)")
@@ -564,6 +614,17 @@ check(ProductCodeIdentity.metadataRole(
     teamIdentifier: ProductCodeIdentity.teamIdentifier,
     signatureValid: true
 ) == .launcher, "exact valid launcher identity is classified as launcher")
+check(ProductCodeIdentity.metadataRole(
+    identifier: ProductCodeIdentity.rootHelperIdentifier,
+    teamIdentifier: ProductCodeIdentity.teamIdentifier,
+    signatureValid: true
+) == .rootHelper, "exact valid root-helper identity is classified as root helper")
+check(ProductCodeIdentity.metadataRole(
+    identifier: ProductCodeIdentity.rootHelperIdentifier,
+    teamIdentifier: ProductCodeIdentity.teamIdentifier,
+    signatureValid: true,
+    hardenedRuntime: false
+) == .other, "root-helper identity without hardened runtime is rejected")
 check(ProductCodeIdentity.metadataRole(
     identifier: ProductCodeIdentity.launcherIdentifier,
     teamIdentifier: "ATTACKERTEAM",
@@ -597,6 +658,370 @@ check(selfStartupReport.sipStatus != .unknown,
       "startup self-audit obtains a definite SIP status")
 check(!selfStartupReport.productionReady,
       "an ad-hoc self-test binary cannot pass the production agent startup gate")
+
+print("\n# Secure regular-file delivery")
+
+do {
+    let rawBinding = ProtectedFileBinding.raw(
+        environmentName: "PROTECTED_FILE",
+        reference: "op://regular-file/config/content",
+        index: 0
+    )
+    let plan = try syntheticProtectedLaunchPlan(files: [rawBinding])
+    try plan.validate()
+    check(try plan.digest() == plan.digest(),
+          "protected launch-plan digest is deterministic")
+
+    let changedCommand = try syntheticProtectedLaunchPlan(
+        files: [rawBinding],
+        commandLine: ["/bin/sh", "-c", "exit 7"]
+    )
+    try changedCommand.validate()
+    check(try changedCommand.digest() != plan.digest(),
+          "command argv changes the two-party launch digest")
+    let hardTTLPlan = try syntheticProtectedLaunchPlan(files: [rawBinding], hardTTL: true)
+    try hardTTLPlan.validate()
+    check(try hardTTLPlan.digest() != plan.digest(),
+          "hard-TTL process-tree semantics are digest-bound")
+
+    let duplicateEnvironment = try syntheticProtectedLaunchPlan(files: [
+        rawBinding,
+        ProtectedFileBinding.raw(
+            environmentName: "PROTECTED_FILE",
+            reference: "op://regular-file/other/content",
+            index: 1
+        ),
+    ])
+    checkThrows("duplicate protected-file environment names are rejected") {
+        try duplicateEnvironment.validate()
+    }
+    let traversal = try syntheticProtectedLaunchPlan(files: [ProtectedFileBinding(
+        relativePath: "../escape",
+        environmentName: "PROTECTED_FILE",
+        reference: "op://regular-file/config/content"
+    )])
+    checkThrows("protected-file traversal paths are rejected") {
+        try traversal.validate()
+    }
+    let oversizedReference = try syntheticProtectedLaunchPlan(files: [ProtectedFileBinding(
+        relativePath: "files/credential-0",
+        environmentName: "PROTECTED_FILE",
+        reference: "op://regular-file/" + String(repeating: "x", count: 4_096)
+    )])
+    checkThrows("protected-file references retain the agent protocol byte bound") {
+        try oversizedReference.validate()
+    }
+    let prefixCollision = try syntheticProtectedLaunchPlan(files: [
+        ProtectedFileBinding(
+            relativePath: "files/item",
+            environmentName: "PROTECTED_FILE_A",
+            reference: "op://regular-file/a/content"
+        ),
+        ProtectedFileBinding(
+            relativePath: "files/item/nested",
+            environmentName: "PROTECTED_FILE_B",
+            reference: "op://regular-file/b/content"
+        ),
+    ])
+    checkThrows("file/directory prefix collisions are rejected") {
+        try prefixCollision.validate()
+    }
+    let loaderEnvironment = try syntheticProtectedLaunchPlan(
+        files: [rawBinding],
+        environment: ["DYLD_INSERT_LIBRARIES": "/tmp/not-loaded"]
+    )
+    checkThrows("dynamic-loader controls cannot cross the root launch boundary") {
+        try loaderEnvironment.validate()
+    }
+    let sanitized = ProtectedLaunchPlan.sanitizedEnvironment([
+        "PATH": "/usr/bin:/bin",
+        "CSEC_SOCKET": "/tmp/not-forwarded",
+        "DYLD_LIBRARY_PATH": "/tmp/not-forwarded",
+        "VALID_NAME": "kept",
+    ])
+    check(sanitized == ["PATH": "/usr/bin:/bin", "VALID_NAME": "kept"],
+          "protected launches strip product and loader control variables")
+
+    let rawPayloads = try ProtectedFilePayloadRenderer.render(
+        bindings: [rawBinding],
+        values: [rawBinding.reference: "regular-file-synthetic-value"]
+    )
+    check(rawPayloads.count == 1
+          && rawPayloads[0].relativePath == "files/credential-0"
+          && rawPayloads[0].data == Data("regular-file-synthetic-value".utf8),
+          "raw regular-file rendering preserves exact UTF-8 bytes")
+    checkThrows("regular-file rendering rejects an empty payload") {
+        _ = try ProtectedFilePayloadRenderer.render(
+            bindings: [rawBinding],
+            values: [rawBinding.reference: ""]
+        )
+    }
+    checkThrows("regular-file rendering rejects unbound extra values") {
+        _ = try ProtectedFilePayloadRenderer.render(
+            bindings: [rawBinding],
+            values: [
+                rawBinding.reference: "synthetic",
+                "op://regular-file/unbound/content": "synthetic-extra",
+            ]
+        )
+    }
+
+    let githubBinding = ProtectedFileBinding.github(
+        reference: "op://github/profile/token",
+        host: "github.example.test",
+        user: "synthetic-user",
+        gitProtocol: "ssh"
+    )
+    let githubPlan = try syntheticProtectedLaunchPlan(files: [githubBinding])
+    try githubPlan.validate()
+    let githubPayload = try ProtectedFilePayloadRenderer.render(
+        bindings: [githubBinding],
+        values: [githubBinding.reference: "synthetic-'github-token"]
+    )
+    let githubText = String(data: githubPayload[0].data, encoding: .utf8) ?? ""
+    check(githubPayload[0].relativePath == "github/hosts.yml"
+          && githubText.contains("github.example.test:")
+          && githubText.contains("oauth_token: 'synthetic-''github-token'")
+          && githubText.contains("git_protocol: ssh")
+          && githubText.contains("user: 'synthetic-user'"),
+          "GH_CONFIG_DIR rendering quotes a bounded hosts.yml profile")
+    checkThrows("GH_CONFIG_DIR rendering rejects line injection in a token") {
+        _ = try ProtectedFilePayloadRenderer.render(
+            bindings: [githubBinding],
+            values: [githubBinding.reference: "synthetic\nforged: true"]
+        )
+    }
+
+    let rootRequestID = UUID().uuidString.lowercased()
+    let rootRequest = RootHelperRequest.prepare(
+        requestID: rootRequestID,
+        plan: plan,
+        planDigest: try plan.digest()
+    )
+    let rootRequestData = try JSONEncoder().encode(rootRequest)
+    let decodedRootRequest = try JSONDecoder().decode(
+        RootHelperRequest.self,
+        from: rootRequestData
+    )
+    if case let .prepare(decodedID, decodedPlan, decodedDigest) = decodedRootRequest {
+        check(decodedID == rootRequestID
+              && decodedPlan == plan
+              && decodedDigest == (try? plan.digest()),
+              "root-helper prepare wire data round-trips its nonce and full plan binding")
+    } else {
+        check(false, "root-helper prepare wire data decodes as prepare")
+    }
+    var invalidRootWire = try JSONSerialization.jsonObject(
+        with: rootRequestData
+    ) as! [String: Any]
+    invalidRootWire["version"] = RootHelperWireProtocol.version + 1
+    checkThrows("root-helper wire rejects an unsupported protocol version") {
+        _ = try JSONDecoder().decode(
+            RootHelperRequest.self,
+            from: try JSONSerialization.data(withJSONObject: invalidRootWire)
+        )
+    }
+
+    var sockets: [Int32] = [-1, -1]
+    let socketResult = sockets.withUnsafeMutableBufferPointer {
+        socketpair(AF_UNIX, SOCK_STREAM, 0, $0.baseAddress)
+    }
+    if socketResult == 0, let peer = PeerIdentity.socketPeer(fd: sockets[0]) {
+        defer { close(sockets[0]); close(sockets[1]) }
+        let caller = CallerInfo(
+            pid: peer.audit.pid,
+            startTime: peer.audit.startTime,
+            description: "protected launch self-test",
+            peerIdentity: peer
+        )
+        let approval = try ProtectedLaunchApprovalRequest(
+            rendezvousNonce: UUID().uuidString.lowercased(),
+            launchPlan: plan,
+            launchPlanDigest: try plan.digest()
+        )
+        check(approval.validate(caller: caller),
+              "agent approval binds the launcher audit token, plan digest, and rendezvous nonce")
+        let approvalWire = try JSONEncoder().encode(Request.approveProtectedLaunch(approval))
+        var mismatchedOuterID = try JSONSerialization.jsonObject(
+            with: approvalWire
+        ) as! [String: Any]
+        mismatchedOuterID["requestID"] = UUID().uuidString.lowercased()
+        checkThrows("agent wire rejects a protected approval with mismatched outer request ID") {
+            _ = try JSONDecoder().decode(
+                Request.self,
+                from: try JSONSerialization.data(withJSONObject: mismatchedOuterID)
+            )
+        }
+        var tamperedApprovalWire = try JSONSerialization.jsonObject(
+            with: approvalWire
+        ) as! [String: Any]
+        var nestedApproval = tamperedApprovalWire["protectedLaunchApproval"] as! [String: Any]
+        var nestedPlan = nestedApproval["launchPlan"] as! [String: Any]
+        nestedPlan["hardTTL"] = true
+        nestedApproval["launchPlan"] = nestedPlan
+        tamperedApprovalWire["protectedLaunchApproval"] = nestedApproval
+        let tamperedRequest = try JSONDecoder().decode(
+            Request.self,
+            from: try JSONSerialization.data(withJSONObject: tamperedApprovalWire)
+        )
+        if case let .approveProtectedLaunch(tamperedApproval) = tamperedRequest {
+            check(!tamperedApproval.validate(caller: caller),
+                  "agent rejects a plan changed after the launcher supplied its digest")
+        } else {
+            check(false, "tampered protected approval remains type-decodable for validation")
+        }
+    } else {
+        for fd in sockets where fd >= 0 { close(fd) }
+        check(false, "local audit-token fixture can create a socket pair")
+    }
+
+    var groups = [UInt32](repeating: 0, count: 32)
+    let groupCount = groups.withUnsafeMutableBufferPointer {
+        cs_proc_groups(getpid(), $0.baseAddress, Int32($0.count))
+    }
+    check(groupCount > 0
+          && groups.prefix(Int(max(0, groupCount))).contains(UInt32(getgid())),
+          "kernel process credentials enumerate the launcher's current GID")
+    check(cs_gid_is_assigned(getgid()) == 1,
+          "the allocator detects a directory-service-assigned GID")
+    check(cs_gid_has_live_holder(getgid()) == 1,
+          "the process-tree tracker detects a live primary-GID holder")
+    check(cs_pid_has_gid(getpid(), getgid()) == 1,
+          "tree termination can recheck one stopped PID's capability credential")
+    check(cs_boot_time() > 0 && cs_self_audit_session_id() != UInt32.max,
+          "boot scope and audit-session identifiers are available")
+} catch {
+    check(false, "protected-file plan and protocol checks succeed (\(error))")
+}
+
+do {
+    let baseURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "csec-protected-store-\(UUID().uuidString)",
+        isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: baseURL) }
+    let mountURL = baseURL.appendingPathComponent("files", isDirectory: true)
+    let mount = ProtectedTmpFS(
+        mode: .syntheticTesting,
+        basePath: baseURL.path,
+        mountPath: mountURL.path
+    )
+    try mount.prepare()
+    let store = try ProtectedFileStore(
+        mountPath: mountURL.path,
+        mode: .syntheticTesting
+    )
+    let binding = ProtectedFileBinding.raw(
+        environmentName: "PROTECTED_FILE",
+        reference: "op://regular-file/store/content",
+        index: 0
+    )
+    let payload = ProtectedFilePayload(
+        relativePath: binding.relativePath,
+        data: Data("synthetic-store-value".utf8)
+    )
+    let nonce = UUID().uuidString.lowercased()
+    let session = try store.create(
+        nonce: nonce,
+        gid: getgid(),
+        bindings: [binding],
+        payloads: [payload]
+    )
+    let filePath = session.environment["PROTECTED_FILE"] ?? ""
+    let sessionPath = mountURL.appendingPathComponent(nonce).path
+    let fileAttributes = try FileManager.default.attributesOfItem(atPath: filePath)
+    let directoryAttributes = try FileManager.default.attributesOfItem(atPath: sessionPath)
+    let storedData = try Data(contentsOf: URL(fileURLWithPath: filePath))
+    check((fileAttributes[.type] as? FileAttributeType) == .typeRegular
+          && (fileAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o400
+          && (directoryAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o700
+          && storedData == payload.data,
+          "synthetic file store creates an exact regular file beneath a private session")
+    try store.cleanup(nonce: nonce)
+    check(!FileManager.default.fileExists(atPath: sessionPath),
+          "protected file-store cleanup removes the complete session")
+
+    let traversalNonce = UUID().uuidString.lowercased()
+    let traversalBinding = ProtectedFileBinding(
+        relativePath: "../outside",
+        environmentName: "PROTECTED_FILE",
+        reference: binding.reference
+    )
+    checkThrows("file store independently rejects traversal even without plan validation") {
+        _ = try store.create(
+            nonce: traversalNonce,
+            gid: getgid(),
+            bindings: [traversalBinding],
+            payloads: [ProtectedFilePayload(
+                relativePath: traversalBinding.relativePath,
+                data: Data("synthetic".utf8)
+            )]
+        )
+    }
+    check(!FileManager.default.fileExists(
+        atPath: baseURL.appendingPathComponent("outside").path
+    ), "rejected traversal creates nothing outside the mount")
+
+    let duplicateEnvironmentNonce = UUID().uuidString.lowercased()
+    let secondBinding = ProtectedFileBinding.raw(
+        environmentName: binding.environmentName,
+        reference: "op://regular-file/store/other",
+        index: 1
+    )
+    checkThrows("file store independently rejects duplicate environment mappings") {
+        _ = try store.create(
+            nonce: duplicateEnvironmentNonce,
+            gid: getgid(),
+            bindings: [binding, secondBinding],
+            payloads: [
+                payload,
+                ProtectedFilePayload(
+                    relativePath: secondBinding.relativePath,
+                    data: Data("synthetic-other".utf8)
+                ),
+            ]
+        )
+    }
+    check(!FileManager.default.fileExists(
+        atPath: mountURL.appendingPathComponent(duplicateEnvironmentNonce).path
+    ), "rejected environment mappings create no session")
+
+    let symlinkNonce = UUID().uuidString.lowercased()
+    let symlinkPath = mountURL.appendingPathComponent(symlinkNonce).path
+    try FileManager.default.createSymbolicLink(
+        atPath: symlinkPath,
+        withDestinationPath: baseURL.path
+    )
+    checkThrows("file store refuses a pre-existing symlink session") {
+        _ = try store.create(
+            nonce: symlinkNonce,
+            gid: getgid(),
+            bindings: [binding],
+            payloads: [payload]
+        )
+    }
+    try FileManager.default.removeItem(atPath: symlinkPath)
+
+    let restartNonce = UUID().uuidString.lowercased()
+    _ = try store.create(
+        nonce: restartNonce,
+        gid: getgid(),
+        bindings: [binding],
+        payloads: [payload]
+    )
+    try store.recoverAfterDaemonRestart()
+    check((try FileManager.default.contentsOfDirectory(atPath: mountURL.path)).isEmpty,
+          "daemon-restart recovery unlinks every stale UUID session")
+
+    let unexpectedPath = mountURL.appendingPathComponent("not-a-session").path
+    FileManager.default.createFile(atPath: unexpectedPath, contents: Data("x".utf8))
+    checkThrows("daemon-restart recovery fails closed on an unexpected mount entry") {
+        try store.recoverAfterDaemonRestart()
+    }
+    try FileManager.default.removeItem(atPath: unexpectedPath)
+} catch {
+    check(false, "protected file-store checks succeed (\(error))")
+}
 
 print("\n# DeliveryPlan + protocol v2")
 

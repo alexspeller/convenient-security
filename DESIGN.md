@@ -11,10 +11,10 @@ Convenient Security protects secret values from unrelated, non-root processes
 running as the same login user. It provides per-reference Touch ID consent,
 process-scoped grants, a code-identity-gated at-rest cache, heap delivery for an
 integrated Ruby client, tool-native AWS/Git credential adapters, anonymous
-inherited-fd files, an environment compatibility launcher, and exact-value output
-redaction. A value-free risk policy gates each delivery before provider or cache
-resolution. It can resolve from the official 1Password CLI and from device-bound
-native encrypted files.
+inherited-fd files, capability-GID regular files, an environment compatibility
+launcher, and exact-value output redaction. A value-free risk policy gates each
+delivery before provider or cache resolution. It can resolve from the official
+1Password CLI and from device-bound native encrypted files.
 
 It does not protect a value from root, from code already executing inside an
 authorized consumer, from a consumer the user deliberately launches, or from a
@@ -28,6 +28,10 @@ user who approves a misleading request.
   for output redaction.
 - **`csec`** is the signed CLI, bridge, launcher, output supervisor, and AI
   command broker. Its commands are listed by `csec help`.
+- **`csec-rootd`** is a separately signed, root-owned LaunchDaemon used only to
+  create bounded tmpfs files and launch/supervise a normal-UID process with a
+  one-time capability GID. Its Swift targets do not link the provider, Keychain,
+  Touch ID, AppKit, ServiceManagement, or agent implementation.
 - **`OnePasswordAdapter`** invokes a verified installation of the official
   1Password CLI with an allowlisted environment.
 - **`NativeEncryptedFileProvider`** owns `csec://` parsing, strict JSON,
@@ -172,7 +176,45 @@ This tier is intentionally limited to single-open streaming consumers. Pipes are
 not seekable, duplicated `/dev/fd/N` opens share an offset, and child descendants
 can inherit the descriptor until the consumer closes it or explicitly marks it
 close-on-exec. A tool that needs independent reopen, seek, or regular-file
-metadata belongs to a future root-backed capability-file tier.
+metadata uses the capability-GID tier below.
+
+### Capability-GID regular files
+
+`csec exec-file` serves tools that require regular-file metadata, independent
+opens, seek, `mmap`, or descendant reopen. It builds a complete protected-
+payload-free launch plan containing the original launcher's audit identity,
+exact executable metadata, argv, sanitized environment, reference-to-relative-
+path bindings, output guard, TTL, and command digest. The root helper accepts production
+connections only on the fixed root-owned socket and authenticates the complete
+audit token plus live product code identity before reading a body.
+
+Authorization is a two-party rendezvous. The exact original `csec` prepares the
+plan and passes only cwd/stdin/stdout/stderr descriptors with `SCM_RIGHTS`.
+`csecd` separately receives a digest-bound approval request, evaluates current
+risk policy, obtains fresh Touch ID, resolves the exact reference set, renders
+bounded payloads, and sends those bytes directly to the root helper. It returns
+only a boolean approval to `csec`; neither values nor rendered files travel back
+through the launcher. Only the original launcher's audit token can consume the
+nonce and start, supervise, signal, or cancel that plan.
+
+Production uses a 32 MiB, 2,048-node `nodev,nosuid,noexec,nobrowse` tmpfs below
+`/private/var/run/convenient-security/files`. The helper allocates a boot-scoped
+GID from a persisted monotonic cursor, rejects any GID assigned to an account or
+held by a live process, and never recycles one. It creates each launch directory
+and file descriptor-relatively with no-follow/exclusive operations, root:GID
+ownership, directory mode `0050`, file mode `0040`, and regular/single-link
+verification. It then joins the launcher's audit session and drops to the login
+UID with the capability as primary GID, the user's ordinary supplementary
+groups, core dumps disabled, only intended stdio, and exact-path `execve`.
+
+The GID marks the complete descendant tree even if it daemonizes. Names are
+removed when no live process retains the GID, when authorization expires, on
+launcher death, or on cancellation. A soft expiry cannot invalidate an already-
+open descriptor; `--hard-ttl`, launcher death, explicit cancellation, and
+scanner failure also enumerate and kill all GID holders until none remain. The
+allocator's persisted cursor and restart cleanup prevent stale plaintext from
+making a prior GID useful after daemon restart. See the remaining signed-device
+gate in [`docs/regular-file-security-matrix.md`](docs/regular-file-security-matrix.md).
 
 ### Environment compatibility
 
@@ -357,6 +399,9 @@ The shipped agent and launcher require all of the following:
 - no `get-task-allow` and no Hardened Runtime exception entitlements for library
   validation, DYLD environment variables, JIT or unsigned executable memory,
   executable-page protection, or debugging; and
+- the exact root-helper identity installed root-owned/non-writable at
+  `/Library/PrivilegedHelperTools/com.alexspeller.convenient-security.rootd`,
+  loaded only from its root-owned system LaunchDaemon plist; and
 - SIP enabled on the host.
 
 The startup self-audit fails production startup when the required daemon posture
@@ -368,13 +413,15 @@ available. The signed-package verification procedure is in
 ## Current security boundary
 
 The strongest implemented paths deliver through private credential pipes into a
-clean consumer heap or through a process-local inherited descriptor. The
-environment launcher is a compatibility feature with an acknowledged same-UID
-disclosure channel. Output redaction is an egress safeguard, not a repair for
-that channel. Risk policy prevents high/critical credentials from using weak,
-broad, or unverified paths; it does not strengthen an allowed path or make an
-authorized consumer safe. Native ciphertext and its rollback record protect
-durable data, while decrypted editor buffers and values released to consumers
-remain subject to the authorized-consumer boundary. The precise attacker
-capabilities and limits are recorded in
+clean consumer heap, through a process-local inherited descriptor, or to a
+root-owned regular file traversable only by one capability-GID process tree.
+The environment launcher is a compatibility feature with an acknowledged
+same-UID disclosure channel. Output redaction is an egress safeguard, not a
+repair for any authorized consumer's ability to disclose a value. Risk policy
+prevents high/critical credentials from using weak, broad, or unverified paths;
+it does not strengthen an allowed path or make an authorized consumer safe.
+Native ciphertext and its rollback record protect durable data, while decrypted
+editor buffers and values released to consumers remain subject to the
+authorized-consumer boundary. The precise attacker capabilities and limits are
+recorded in
 [`docs/threat-model.md`](docs/threat-model.md).

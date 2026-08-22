@@ -17,12 +17,20 @@ bash -n \
 plutil -lint \
   "$repo_root/packaging/agent/Info.plist" \
   "$repo_root/packaging/agent/csecd.entitlements" \
-  "$repo_root/packaging/agent/LaunchAgents/com.alexspeller.convenient-security.plist"
+  "$repo_root/packaging/agent/LaunchAgents/com.alexspeller.convenient-security.plist" \
+  "$repo_root/packaging/root/LaunchDaemons/com.alexspeller.convenient-security.rootd.plist"
 ruby -c "$repo_root/packaging/fastlane/Fastfile"
 swiftc "$repo_root/packaging/spike/main.swift" \
   -o "$swift_scratch/keychain-spike-compile-check"
 swiftc "$repo_root/packaging/spike/unentitled-keychain-probe.swift" \
   -o "$swift_scratch/unentitled-keychain-probe-compile-check"
+clang -fsyntax-only -Wall -Wextra -Werror \
+  -I "$repo_root/agent/Sources/CSecuritySupport/include" \
+  "$repo_root/agent/Sources/CSecuritySupport/CSecuritySupport.c"
+clang -fsyntax-only -Wall -Wextra -Werror \
+  "$repo_root/agent/Sources/cs-file-probe/main.c"
+clang -fsyntax-only -Wall -Wextra -Werror \
+  "$repo_root/agent/Sources/cs-gh-fixture/main.c"
 
 # Every distributed surface must carry the same FSL terms. RubyGems represents
 # licences outside its SPDX allow-list as "Nonstandard"; LICENSE.md is the
@@ -56,7 +64,24 @@ swift build --package-path "$repo_root/agent"
 swift build --package-path "$repo_root/agent" -c release
 CSEC_SOCKET="/tmp/csec-release-must-ignore.sock" \
 OP_CLI_PATH="/bin/false" \
+CSEC_ROOT_SOCKET="/tmp/csec-root-release-must-ignore.sock" \
   "$repo_root/agent/.build/release/cs-selftest"
+
+# The privileged daemon is intentionally built from dedicated minimal modules.
+# A target dependency on the full user agent would silently pull UI, biometric,
+# Keychain, provider, and ServiceManagement implementations into root.
+rootd="$repo_root/agent/.build/release/csec-rootd"
+rootd_links="$(otool -L "$rootd")"
+if printf '%s\n' "$rootd_links" | rg -q \
+  'AppKit|LocalAuthentication|ServiceManagement'; then
+  echo "release csec-rootd links a forbidden user-agent framework" >&2
+  exit 1
+fi
+if nm -gU "$rootd" | rg -q \
+  'SecItem|LAContext|NSApplication|SMAppService|OnePassword|NativeEncrypted|Biometric'; then
+  echo "release csec-rootd contains forbidden user-agent implementation symbols" >&2
+  exit 1
+fi
 
 ruby -I"$repo_root/clients/ruby/lib" \
   "$repo_root/clients/ruby/test/convenient_security_test.rb"

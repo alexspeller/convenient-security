@@ -20,6 +20,7 @@ public enum WireCapability: String, Codable, Sendable, CaseIterable {
     case registeredSessionRoots = "registered_session_roots"
     case credentialProtocols = "credential_protocols"
     case inheritedFileDescriptors = "inherited_file_descriptors"
+    case protectedRegularFiles = "protected_regular_files"
 }
 
 public struct ProtocolCapabilities: Codable, Sendable, Equatable {
@@ -146,21 +147,24 @@ public enum OutputRedactionStream: String, Codable, Sendable, Hashable, CaseIter
 }
 
 /// Open a short-lived, caller-bound scanner in the trusted agent. The scanner
-/// is intentionally destination-specific; the first implementation permits
-/// only output that is about to be returned to an AI tool.
+/// is intentionally destination-specific: it permits AI-tool output and the
+/// explicit local-development supervision used by protected-file launches.
 public struct BeginOutputRedactionRequest: Codable, Sendable {
     public let requestID: String
     public let destination: DestinationClass
     public let streams: [OutputRedactionStream]
+    public let includeShortValues: Bool
 
     public init(
         destination: DestinationClass,
         streams: [OutputRedactionStream],
+        includeShortValues: Bool = false,
         requestID: UUID = UUID()
     ) {
         self.requestID = requestID.uuidString.lowercased()
         self.destination = destination
         self.streams = streams
+        self.includeShortValues = includeShortValues
     }
 }
 
@@ -337,15 +341,17 @@ public enum Request: Sendable {
     case commitNativeStoreEdit(CommitNativeStoreEditRequest)
     case cancelNativeStoreEdit(CancelNativeStoreEditRequest)
     case risk(RiskOperationRequest)
+    case approveProtectedLaunch(ProtectedLaunchApprovalRequest)
 }
 
 extension Request: Codable {
     private enum CodingKeys: String, CodingKey {
         case version, type, requestID, references, reason, ttlSeconds
         case deliveryPlan, deliveryPlanDigest
-        case destination, streams, sessionID, stream, data, finish
+        case destination, streams, includeShortValues, sessionID, stream, data, finish
         case store, editSessionID, document, mode, externalEditorPath
         case operation, reference, level
+        case protectedLaunchApproval
     }
 
     public init(from decoder: Decoder) throws {
@@ -382,6 +388,10 @@ extension Request: Codable {
             self = .beginOutputRedaction(BeginOutputRedactionRequest(
                 destination: try container.decode(DestinationClass.self, forKey: .destination),
                 streams: try container.decode([OutputRedactionStream].self, forKey: .streams),
+                includeShortValues: try container.decodeIfPresent(
+                    Bool.self,
+                    forKey: .includeShortValues
+                ) ?? false,
                 requestID: try Self.decodeUUID(container, forKey: .requestID)
             ))
         case "redact_output_chunk":
@@ -428,6 +438,20 @@ extension Request: Codable {
                 level: try container.decodeIfPresent(RiskLevel.self, forKey: .level),
                 requestID: try Self.decodeUUID(container, forKey: .requestID)
             ))
+        case "approve_protected_launch":
+            let approval = try container.decode(
+                ProtectedLaunchApprovalRequest.self,
+                forKey: .protectedLaunchApproval
+            )
+            guard try Self.decodeUUID(container, forKey: .requestID).uuidString.lowercased()
+                    == approval.requestID else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .requestID,
+                    in: container,
+                    debugDescription: "protected launch request UUID mismatch"
+                )
+            }
+            self = .approveProtectedLaunch(approval)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: container, debugDescription: "unknown request type"
@@ -463,6 +487,7 @@ extension Request: Codable {
             try container.encode(request.requestID, forKey: .requestID)
             try container.encode(request.destination, forKey: .destination)
             try container.encode(request.streams, forKey: .streams)
+            try container.encode(request.includeShortValues, forKey: .includeShortValues)
         case let .redactOutputChunk(request):
             try container.encode("redact_output_chunk", forKey: .type)
             try container.encode(WireProtocol.version, forKey: .version)
@@ -501,6 +526,11 @@ extension Request: Codable {
             try container.encode(request.operation, forKey: .operation)
             try container.encode(request.reference, forKey: .reference)
             try container.encodeIfPresent(request.level, forKey: .level)
+        case let .approveProtectedLaunch(request):
+            try container.encode("approve_protected_launch", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request, forKey: .protectedLaunchApproval)
         }
     }
 
@@ -537,6 +567,8 @@ public struct Response: Codable, Sendable {
     public let generation: UInt64?
     public let secretCount: Int?
     public let riskInspection: RiskInspection?
+    public let protectedLaunchApproved: Bool?
+    public let accessExpiresAt: Date?
     public let failure: ProtocolFailure?
     public let error: String?
 
@@ -557,6 +589,8 @@ public struct Response: Codable, Sendable {
         generation: UInt64? = nil,
         secretCount: Int? = nil,
         riskInspection: RiskInspection? = nil,
+        protectedLaunchApproved: Bool? = nil,
+        accessExpiresAt: Date? = nil,
         failure: ProtocolFailure? = nil,
         error: String? = nil
     ) {
@@ -576,6 +610,8 @@ public struct Response: Codable, Sendable {
         self.generation = generation
         self.secretCount = secretCount
         self.riskInspection = riskInspection
+        self.protectedLaunchApproved = protectedLaunchApproved
+        self.accessExpiresAt = accessExpiresAt
         self.failure = failure
         self.error = error
     }

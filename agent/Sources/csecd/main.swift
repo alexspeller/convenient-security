@@ -150,6 +150,53 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: clientTrustPolicy
         return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
     case let .risk(risk):
         return await agent.handleRiskOperation(request: risk, caller: caller)
+    case let .approveProtectedLaunch(approval):
+        guard approval.validate(caller: caller) else {
+            return .failed(
+                .invalidRequest,
+                message: "invalid protected-file launch binding",
+                requestID: approval.requestID
+            )
+        }
+        let access = await agent.handle(request: approval.accessRequest, caller: caller)
+        if let failure = access.failure {
+            return Response(requestID: approval.requestID, failure: failure)
+        }
+        guard let values = access.values,
+              let expiresAt = access.accessExpiresAt else {
+            return .failed(
+                .internalError,
+                message: "protected-file approval did not produce a bounded release",
+                requestID: approval.requestID
+            )
+        }
+        do {
+            let payloads = try ProtectedFilePayloadRenderer.render(
+                bindings: approval.launchPlan.files,
+                values: values
+            )
+            #if DEBUG
+            let rootTrust: RootHelperServerTrustPolicy = .allowUnverifiedForTesting
+            #else
+            let rootTrust: RootHelperServerTrustPolicy = .requireProductRootHelper
+            #endif
+            try RootHelperClient(trustPolicy: rootTrust).approve(
+                nonce: approval.rendezvousNonce,
+                planDigest: approval.launchPlanDigest,
+                payloads: payloads,
+                expiresAt: expiresAt
+            )
+            return Response(
+                requestID: approval.requestID,
+                protectedLaunchApproved: true
+            )
+        } catch {
+            return .failed(
+                .deliveryNotSupported,
+                message: "the authenticated root helper could not accept this launch",
+                requestID: approval.requestID
+            )
+        }
     }
 }
 

@@ -6,6 +6,9 @@ set -eu
 # the path Ruby executes before csecd gets a chance to authenticate it.
 bridge_root="/Library/Application Support/ConvenientSecurity"
 app="/Applications/ConvenientSecurity.app"
+root_label="com.alexspeller.convenient-security.rootd"
+root_helper="/Library/PrivilegedHelperTools/$root_label"
+root_plist="/Library/LaunchDaemons/$root_label.plist"
 [ ! -L "$bridge_root" ] && [ -d "$bridge_root/bin" ] \
   && [ ! -L "$bridge_root/bin" ] && [ -f "$bridge_root/bin/csec" ] \
   && [ ! -L "$bridge_root/bin/csec" ] || {
@@ -16,8 +19,16 @@ app="/Applications/ConvenientSecurity.app"
   echo "Convenient Security app payload has an unsafe path shape" >&2
   exit 1
 }
+[ ! -L "$root_helper" ] && [ -f "$root_helper" ] \
+  && [ ! -L "$root_plist" ] && [ -f "$root_plist" ] || {
+    echo "Convenient Security root-helper payload has an unsafe path shape" >&2
+    exit 1
+  }
 /usr/sbin/chown -R root:wheel "$bridge_root"
 /bin/chmod 0755 "$bridge_root" "$bridge_root/bin" "$bridge_root/bin/csec"
+/usr/sbin/chown root:wheel "$root_helper" "$root_plist"
+/bin/chmod 0755 "$root_helper"
+/bin/chmod 0644 "$root_plist"
 
 for protected_path in \
   / \
@@ -25,7 +36,11 @@ for protected_path in \
   "/Library/Application Support" \
   "$bridge_root" \
   "$bridge_root/bin" \
-  "$bridge_root/bin/csec"; do
+  "$bridge_root/bin/csec" \
+  /Library/PrivilegedHelperTools \
+  "$root_helper" \
+  /Library/LaunchDaemons \
+  "$root_plist"; do
   owner="$(/usr/bin/stat -f %u "$protected_path")"
   mode="$(/usr/bin/stat -f %Lp "$protected_path")"
   if [ "$owner" != "0" ] || [ $((8#$mode & 022)) -ne 0 ]; then
@@ -40,5 +55,26 @@ done
 
 /usr/bin/codesign --verify --strict "$bridge_root/bin/csec"
 /usr/bin/codesign --verify --deep --strict "$app"
+/usr/bin/codesign --verify --strict "$root_helper"
+/usr/bin/plutil -lint "$root_plist" >/dev/null
+
+product_requirement='anchor apple generic and certificate leaf[subject.OU] = "8RS6GD89Y7"'
+/usr/bin/codesign --verify --strict -R \
+  "$product_requirement and identifier \"com.alexspeller.convenient-security.csec\"" \
+  "$bridge_root/bin/csec"
+/usr/bin/codesign --verify --deep --strict -R \
+  "$product_requirement and identifier \"com.alexspeller.convenient-security\"" \
+  "$app"
+/usr/bin/codesign --verify --strict -R \
+  "$product_requirement and identifier \"$root_label\"" \
+  "$root_helper"
+
+# Upgrade atomically from the service manager's perspective: stop any prior
+# instance only after all new paths and signatures pass, then bootstrap the
+# fixed root-owned plist. RunAtLoad and KeepAlive keep the narrow service live.
+/bin/launchctl bootout "system/$root_label" >/dev/null 2>&1 || true
+/bin/launchctl bootstrap system "$root_plist"
+/bin/launchctl kickstart -k "system/$root_label"
+/bin/launchctl print "system/$root_label" >/dev/null
 
 exit 0

@@ -132,6 +132,54 @@ reopens its configuration is incompatible. The authorized target can always
 read, copy, log, or transmit the bytes, and root can inspect the processes;
 output masking only reduces accidental writes on supervised stdout/stderr.
 
+### Capability-GID regular-file delivery
+
+`csec exec-file` addresses consumers that require a regular file, independent
+opens, seek, `mmap`, or descendant reopen. Plain mode-`0600` files would not
+protect against the file owner's other processes, so the privileged helper
+instead creates root-owned `0050` directories and `0040` files whose group is a
+new per-launch capability. It launches the authorized tree as the normal login
+UID with that GID as its primary group. An unrelated same-UID process does not
+gain the group merely by learning the tmpfs pathname.
+
+The root helper's production endpoint is fixed and its socket pathname is not
+trusted as identity. It validates complete audit tokens and live code identity:
+only exact signed `csec` may prepare/start/supervise a launch, and only exact
+signed `csecd` may submit approval and file bytes. The prepared launch binds the
+original launcher PID/start time/UID/audit session, exact executable metadata,
+argv, sanitized environment, path mappings, output policy, TTL, and command
+digest. Four stdio/cwd descriptors arrive only with prepare. A random nonce and
+canonical plan digest bind the two independent requests; only the original
+launcher audit token can consume them.
+
+`csecd` does not return values to `csec` for this mechanism. It applies current
+risk policy, requires fresh consent, resolves the exact set, renders bounded
+payloads, and transmits them directly to the authenticated helper. The helper
+revalidates plan/path/size constraints, uses descriptor-relative no-follow and
+exclusive creation on verified bounded `nodev,nosuid,noexec` tmpfs, and closes
+all unintended descriptors before exact-path `execve`. Its minimal binary does
+not link providers, Keychain access, Touch ID, AppKit, or agent policy code.
+
+A boot-scoped monotonic allocator persists and fsyncs its cursor before use,
+skips GIDs assigned to accounts or held by any live process, and fails closed on
+corruption or exhaustion. The GID remains attached across fork, exec, and normal
+daemonization, so it identifies descendants after the direct child exits. The
+helper unlinks names only after the complete GID tree is gone or at expiry, and
+it removes stale UUID sessions on restart before serving. Launcher death,
+cancellation, scanner failure, and hard-TTL expiry unlink and repeatedly kill
+all GID holders; a soft TTL only unlinks names and cannot revoke an already-open
+descriptor.
+
+This boundary excludes an unrelated non-root same-UID process; it does not
+protect against root, an administrator able to mutate installed privileged
+paths, or code inside the authorized tree. That tree can read and disclose the
+bytes, keep an open descriptor after unlink, alter its own primary/supplementary
+groups subject to normal kernel rules, or deliberately pass descriptors/data to
+another process. Executable identity also does not make user-writable scripts,
+plugins, configuration, or inputs trustworthy. The signed installed behavior
+must pass [`regular-file-security-matrix.md`](regular-file-security-matrix.md)
+before real secrets are used.
+
 ### Keychain cache
 
 The persistent cache uses the data-protection keychain and the daemon's
@@ -231,6 +279,9 @@ signed launcher.
   credential consumer's private stdout pipe.
 - `csec exec-fd` authorizes the launched process and any descendants retaining
   its descriptor to read the complete file payload.
+- `csec exec-file` authorizes the complete capability-GID process tree to open,
+  reopen, map, and copy its root-owned regular-file payloads until unlink; open
+  descriptors can remain readable afterwards.
 - Claude Code and Codex hook fragments are opt-in user configuration and cover
   Bash command tool calls only.
 
@@ -239,7 +290,10 @@ signed launcher.
 All security claims require a Developer-ID-signed, hardened, notarized,
 provisioned build with the exact product identities, the restricted keychain
 access group, no `get-task-allow`, no dangerous Hardened Runtime exception
-entitlements, and SIP enabled. The production startup self-audit refuses to run
+entitlements, and SIP enabled. Protected-file claims additionally require the
+exact signed helper under `/Library/PrivilegedHelperTools`, its root-owned and
+non-writable system LaunchDaemon plist, the verified bounded tmpfs mount, and a
+passing signed-device matrix. The production startup self-audit refuses to run
 when its required posture is absent or when neither the native store nor a
 verified official 1Password CLI is available.
 

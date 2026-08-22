@@ -12,6 +12,8 @@ set -euo pipefail
 #     Contents/MacOS/csec                         (secondary CLI + `csec install`)
 #     Contents/Library/LaunchAgents/<label>.plist
 #
+#   packaging/build/csec-rootd                    (standalone privileged helper)
+#
 # csecd MUST be the main executable: the embedded profile only authorizes the
 # restricted keychain-access-groups entitlement for the main executable, and AMFI
 # SIGKILLs a secondary binary that claims it. csec is a plain signed CLI (no
@@ -31,11 +33,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # packaging/
 root="$(cd "$here/.." && pwd)"                            # repo root
 app="$here/build/ConvenientSecurity.app"
 label="com.alexspeller.convenient-security"
+root_helper="$here/build/csec-rootd"
 
 : "${SIGN_IDENTITY:?set SIGN_IDENTITY to your Developer ID Application identity}"
 : "${PROFILE_PATH:?set PROFILE_PATH to the fetched .provisionprofile/.mobileprovision}"
 
-echo "--- building release binaries (csec, csecd) ---"
+echo "--- building release binaries (csec, csecd, csec-rootd) ---"
 swift build --package-path "$root/agent" -c release
 bin="$root/agent/.build/release"
 
@@ -47,6 +50,7 @@ mkdir -p \
   "$app/Contents/Library/LaunchAgents"
 cp "$bin/csec"  "$app/Contents/MacOS/csec"
 cp "$bin/csecd" "$app/Contents/MacOS/csecd"
+cp "$bin/csec-rootd" "$root_helper"
 cp "$here/agent/Info.plist" "$app/Contents/Info.plist"
 cp "$root/LICENSE.md" "$app/Contents/Resources/LICENSE.md"
 cp "$here/agent/LaunchAgents/$label.plist" "$app/Contents/Library/LaunchAgents/$label.plist"
@@ -58,6 +62,12 @@ codesign --force --options runtime --timestamp \
   --sign "$SIGN_IDENTITY" \
   "$app/Contents/MacOS/csec"
 
+echo "--- signing csec-rootd (standalone, no entitlements) ---"
+codesign --force --options runtime --timestamp \
+  --identifier "com.alexspeller.convenient-security.rootd" \
+  --sign "$SIGN_IDENTITY" \
+  "$root_helper"
+
 echo "--- then the bundle: signs csecd (main executable) WITH the keychain entitlements ---"
 codesign --force --options runtime --timestamp \
   --entitlements "$here/agent/csecd.entitlements" \
@@ -68,10 +78,13 @@ echo "--- signature (bundle / csecd main, must show keychain-access-groups) ---"
 codesign --display --verbose=2 --entitlements - "$app" 2>&1 || true
 echo "--- verify ---"
 codesign --verify --deep --strict --verbose=2 "$app" 2>&1
+codesign --verify --strict --verbose=2 "$root_helper" 2>&1
 
 cat <<EOF
 
-Built + signed: $app
+Built + signed:
+  $app
+  $root_helper
 
 Next (needs you, at the keyboard):
   1. Install it where SMAppService trusts it:
@@ -81,4 +94,7 @@ Next (needs you, at the keyboard):
      Approve "ConvenientSecurity" in System Settings › General › Login Items if asked.
   3. Check it:
        /Applications/ConvenientSecurity.app/Contents/MacOS/csec status
+
+The standalone root helper is installed only by build-pkg.sh; copying the app
+alone intentionally does not enable protected regular-file delivery.
 EOF

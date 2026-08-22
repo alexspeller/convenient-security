@@ -46,6 +46,7 @@ public actor Agent {
         var redactors: [OutputRedactionStream: StreamingOutputRedactor]
         var finishedStreams: Set<OutputRedactionStream>
         var registryGeneration: UInt64
+        let includeShortValues: Bool
         var lastUsedAt: Date
     }
 
@@ -299,12 +300,21 @@ public actor Agent {
         }
 
         let currentBindings = policyBindingsByReference(states)
-        let accessible = await grants.accessibleReferences(
-            for: caller.pid,
-            now: now,
-            deliveryPlanDigest: planDigest,
-            policyBindingsByReference: currentBindings
-        )
+        // Every protected regular-file launch is a fresh two-party rendezvous.
+        // Reusing a csec-side grant would let a new root launch outlive the
+        // authorization that originally created it, so this mechanism always
+        // repeats trusted review and biometric consent before resolving bytes.
+        let accessible: Set<String>
+        if plan.mechanism == .capabilityGIDFile {
+            accessible = []
+        } else {
+            accessible = await grants.accessibleReferences(
+                for: caller.pid,
+                now: now,
+                deliveryPlanDigest: planDigest,
+                policyBindingsByReference: currentBindings
+            )
+        }
         let newReferenceURIs = Set(refs.map(\.uri)).subtracting(accessible)
 
         if !newReferenceURIs.isEmpty {
@@ -578,7 +588,11 @@ public actor Agent {
         if let activeUntil {
             activeSecrets.register(values: Array(values.values), expiresAt: activeUntil)
         }
-        return Response(requestID: requestID, values: values)
+        return Response(
+            requestID: requestID,
+            values: values,
+            accessExpiresAt: activeUntil
+        )
     }
 
     private func policyBindingsByReference(
@@ -868,7 +882,7 @@ public actor Agent {
         let now = Date()
         pruneRedactionSessions(now: now)
         guard UUID(uuidString: request.requestID) != nil,
-              request.destination == .aiTool,
+              request.destination == .aiTool || request.destination == .localDevelopment,
               !request.streams.isEmpty,
               request.streams.count <= OutputRedactionStream.allCases.count,
               Set(request.streams).count == request.streams.count,
@@ -881,7 +895,10 @@ public actor Agent {
         }
 
         let snapshot = activeSecrets.snapshot(now: now)
-        let catalog = OutputRedactionCatalog(valuesByReference: snapshot.valuesByOpaqueID)
+        let catalog = OutputRedactionCatalog(
+            valuesByReference: snapshot.valuesByOpaqueID,
+            includeShortValues: request.includeShortValues
+        )
         let sessionID = UUID().uuidString.lowercased()
         redactionSessions[sessionID] = RedactionSession(
             caller: RedactionCaller(pid: caller.pid, startTime: caller.startTime),
@@ -891,6 +908,7 @@ public actor Agent {
             }),
             finishedStreams: [],
             registryGeneration: snapshot.generation,
+            includeShortValues: request.includeShortValues,
             lastUsedAt: now
         )
         return Response(
@@ -911,7 +929,7 @@ public actor Agent {
               UUID(uuidString: request.sessionID) != nil,
               request.data.count <= Self.maximumOutputChunkBytes,
               var session = redactionSessions[request.sessionID],
-              session.destination == .aiTool,
+              session.destination == .aiTool || session.destination == .localDevelopment,
               session.caller.matches(caller),
               !session.finishedStreams.contains(request.stream),
               var redactor = session.redactors[request.stream] else {
@@ -927,7 +945,10 @@ public actor Agent {
         // preserving any prefix already withheld by this session.
         let snapshot = activeSecrets.snapshot(now: now)
         if snapshot.generation != session.registryGeneration {
-            let catalog = OutputRedactionCatalog(valuesByReference: snapshot.valuesByOpaqueID)
+            let catalog = OutputRedactionCatalog(
+                valuesByReference: snapshot.valuesByOpaqueID,
+                includeShortValues: session.includeShortValues
+            )
             for stream in Array(session.redactors.keys) {
                 session.redactors[stream]?.add(patterns: catalog.patterns)
             }

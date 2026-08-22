@@ -1,13 +1,15 @@
 # Packaging, signing & install
 
 How the resident agent is turned into a Developer-ID-signed, hardened, notarized,
-provisioned `.app` + `.pkg`, and how it installs itself as a login-item
-LaunchAgent. The signed `.app`, provisioning profile, LaunchAgent, Touch ID, and
-keychain path have been proven on real hardware. The native-store access-group
-exclusion, biometric ACL, and authenticated record update passed the signed
-hardware spike on 21 August 2026. The `.pkg` root-owned bridge copy and inherited-fd
-App Store Connect key handoff are covered in source/CI and retain explicit signed
-physical-machine release gates below.
+provisioned `.app` + `.pkg`, how `csecd` registers as a login-item LaunchAgent,
+and how the package installs the separate minimal `csec-rootd` system
+LaunchDaemon. The signed `.app`, provisioning profile, LaunchAgent, Touch ID,
+and keychain path have been proven on real hardware. The native-store access-
+group exclusion, biometric ACL, and authenticated record update passed the
+signed hardware spike on 21 August 2026. The `.pkg` root-owned bridge, root
+helper, and inherited-fd App Store Connect key handoff are covered in source/CI;
+the root helper still has the explicit signed physical-machine gate in
+[`../docs/regular-file-security-matrix.md`](../docs/regular-file-security-matrix.md).
 
 ## What ships
 
@@ -22,17 +24,25 @@ ConvenientSecurity.app/
 
 /Library/Application Support/ConvenientSecurity/bin/
   csec                                      root-owned language-client bridge copy
+
+/Library/PrivilegedHelperTools/
+  com.alexspeller.convenient-security.rootd signed minimal root helper
+
+/Library/LaunchDaemons/
+  com.alexspeller.convenient-security.rootd.plist
 ```
 
 Delivered by a signed `ConvenientSecurity.pkg` that installs the app into
 `/Applications` and a second byte-identical, signed `csec` bridge at
-`/Library/Application Support/ConvenientSecurity/bin/csec`. The package makes
-the bridge and every controlling directory root-owned/non-user-writable. This
+`/Library/Application Support/ConvenientSecurity/bin/csec`, and the standalone
+root helper plus system LaunchDaemon plist. The package makes the bridge/helper
+and their controlling paths root-owned/non-user-writable, verifies exact code
+requirements, and loads the root helper only after those checks pass. This
 matters because `/Applications` is normally group-writable by `admin`, so its
 pathname alone is not a same-UID integrity boundary. The user then registers
-the background agent with `csec install` from inside the app bundle.
+the credential agent with `csec install` from inside the app bundle.
 
-Three structural rules, each load-bearing:
+Four structural rules, each load-bearing:
 
 - **It must be a `.app` bundle, not a bare `csecd` binary.** The restricted
   `keychain-access-groups` entitlement is only authorized by an *embedded
@@ -42,8 +52,11 @@ Three structural rules, each load-bearing:
   executable; a *secondary* binary that claims `keychain-access-groups` is
   **SIGKILLed by AMFI at launch**. `csec` (no restricted entitlements) is the
   secondary binary and runs fine.
-- **It runs as a per-user LaunchAgent, never a LaunchDaemon.** The Secure Enclave,
-  the data-protection keychain, and Touch ID are all login-session-only.
+- **The credential daemon remains a per-user LaunchAgent, never root.** The
+  Secure Enclave, data-protection keychain, provider adapters, policy UI, and
+  Touch ID are login-session-only. The separate LaunchDaemon has no provider,
+  Keychain, UI, or policy capability; it only verifies two signed roles, creates
+  bounded files, drops credentials, and supervises the launched tree.
 - **Language clients use the root-owned bridge copy.** Ruby cannot verify a
   replacement executable itself. The protected path prevents pre-launch
   replacement; the daemon then verifies the bridge's live audit token, exact
@@ -98,14 +111,16 @@ packaging/bin/provision.sh
 #    → packaging/build/convenient-security.mobileprovision
 export PROFILE_PATH=packaging/build/convenient-security.mobileprovision
 
-# 1. build + assemble + sign the .app (inside-out: csec, then the csecd bundle).
+# 1. build + assemble + sign the app and standalone root helper.
+#    Signing is inside-out: csec, rootd, then the csecd bundle.
 packaging/bin/build-agent.sh
 #    → packaging/build/ConvenientSecurity.app
+#    → packaging/build/csec-rootd
 
 # 2. notarize + staple the .app (so first launch works offline / on other Macs).
 packaging/bin/notarize.sh packaging/build/ConvenientSecurity.app
 
-# 3. build + sign the .pkg (app + root-owned bridge; needs Installer cert).
+# 3. build + sign the .pkg (app + root-owned bridge/helper/plist; Installer cert).
 packaging/bin/build-pkg.sh
 #    → packaging/build/ConvenientSecurity.pkg
 
@@ -135,8 +150,11 @@ never print a success message after a failed release check.
 ## Install & register
 
 From the signed `.pkg` (double-click, or `installer -pkg … -target /`), the app
-lands in `/Applications`. Then, **run the CLI from inside the bundle** so
-`SMAppService` can find the LaunchAgent plist:
+lands in `/Applications`. Its postinstall script checks root ownership/modes,
+the exact Team/identifier requirements of app, bridge, and helper, and the root
+plist before bootstrapping and kickstarting the system LaunchDaemon. Then,
+**run the CLI from inside the bundle** so `SMAppService` can find the per-user
+LaunchAgent plist:
 
 ```sh
 /Applications/ConvenientSecurity.app/Contents/MacOS/csec install
@@ -145,8 +163,17 @@ lands in `/Applications`. Then, **run the CLI from inside the bundle** so
 #    System Settings › General › Login Items)
 
 /Applications/ConvenientSecurity.app/Contents/MacOS/csec status     # check
+/Applications/ConvenientSecurity.app/Contents/MacOS/csec root-status # root helper protocol check
 /Applications/ConvenientSecurity.app/Contents/MacOS/csec uninstall  # unregister
 ```
+
+`csec uninstall` unregisters the per-user credential LaunchAgent; it does not
+remove package-owned files or unload the system root helper. Removing those
+components requires a separate administrative package-removal procedure.
+Copying only the `.app` deliberately leaves `root-status` unavailable and
+cannot enable `exec-file`.
+Until the signed/root matrix passes, exercise `exec-file` with synthetic data
+only.
 
 Once the agent is running, create a native encrypted store with:
 
@@ -187,10 +214,12 @@ the bundle context.
   biometric ACLs are verified by `packaging/spike`. Hardened runtime is enabled
   via `codesign --options runtime`. Never change the team prefix or group after
   native stores exist—it makes their ciphertext unrecoverable.
-- **Signing order** (`build-agent.sh`): sign `csec` (secondary, no entitlements)
-  first, then sign the bundle — which signs `csecd` (the main executable) *with*
-  the keychain entitlements the embedded profile authorizes. Verified with
-  `codesign --verify --deep --strict`.
+- **Signing order** (`build-agent.sh`): sign `csec` (secondary, no entitlements),
+  sign standalone `csec-rootd` with identifier
+  `com.alexspeller.convenient-security.rootd` and no entitlements, then sign the
+  bundle — which signs `csecd` (the main executable) *with* the keychain
+  entitlements the embedded profile authorizes. All are hardened and verified
+  with strict `codesign` checks.
 - **LaunchAgent plist** (`packaging/agent/LaunchAgents/…plist`): `BundleProgram`
   is bundle-relative (survives relocation), `RunAtLoad` + `KeepAlive`, and
   `ProcessType=Interactive` (it presents Touch ID). It supplies no provider or
@@ -199,6 +228,13 @@ the bundle context.
   verifies the official Team/identifier requirement, hardened runtime, and
   absence of dangerous entitlements, then spawns `op` with a small allowlist.
   Production requires at least one of those providers, not necessarily both.
+- **LaunchDaemon plist** (`packaging/root/LaunchDaemons/…plist`): a fixed
+  `/Library/PrivilegedHelperTools` program, root:wheel execution,
+  `RunAtLoad`/`KeepAlive`, umask `077`, and no credential environment. The
+  postinstall script loads it into the system domain only after path, mode,
+  signature, requirement, and plist checks. The helper serves the fixed
+  `/private/var/run/convenient-security/rootd.sock`, verifies product audit
+  tokens on every short connection, and mounts only the fixed bounded tmpfs.
 - **Socket path**: derived from `confstr(_CS_DARWIN_USER_TEMP_DIR)` (keyed on the
   uid), *not* `$TMPDIR` — so the launchd-spawned `csecd` and a shell-spawned `csec`
   always agree on `…/convenient-security-<uid>/agent.sock` regardless of the
@@ -214,6 +250,7 @@ the bundle context.
 |---------|-------------|
 | `csecd` dies instantly at launch, no output, `launchctl` shows exit `-9` | AMFI SIGKILL: an entitled binary that isn't the bundle's main executable, or a missing/invalid profile, or the missing **G2 intermediate**. Ensure `CFBundleExecutable = csecd` and the profile authorizes the access group (`security cms -D -i …/embedded.provisionprofile`). |
 | `csec status` says *not installed* / `.notFound` | Normal **before the first** `csec install`. Otherwise: `csec` isn't being run from inside the installed `.app`. |
+| `csec root-status` says the helper is unavailable | The `.app` was copied without installing the `.pkg`, the system job failed, or the live server does not satisfy the exact root-helper identity. Check `launchctl print system/com.alexspeller.convenient-security.rootd`, the root-owned helper/plist paths, and the Installer log; do not bypass the identity check. |
 | `csec edit` says the native store is unavailable | The daemon could not use its provisioned Keychain group. Check the embedded profile, signed entitlements, startup log, and the native-store `build-spike` gate. An unsigned SwiftPM daemon intentionally has no native provider. |
 | Agent runs but `op` fetches fail | Install the official signed CLI at `/opt/homebrew/bin/op`, `/usr/local/bin/op`, or `/usr/bin/op`; arbitrary provider paths are intentionally rejected in release builds. |
 | `codesign` shows `0 valid identities` for a cert that's installed | Missing **G2 intermediate CA** — see prerequisites. |

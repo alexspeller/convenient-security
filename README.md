@@ -57,6 +57,10 @@ rest and in use — as small as macOS allows.
   adapters use private pipes, while `exec-fd` gives file-oriented tools an
   anonymous inherited descriptor. Plaintext need not touch `ENV`, `argv`, or a
   named file.
+- **Seekable files without same-UID ambient access.** The packaged `csec-rootd`
+  can create root-owned regular files on bounded `nodev,nosuid,noexec` tmpfs and
+  launch one approved process tree with a fresh, non-reused capability GID.
+  Unrelated processes running as the login user do not receive that group.
 - **Two backends, one interface.** References resolve from the official 1Password
   CLI (`op://…`) or from device-bound, AES-256-GCM encrypted files (`csec://…`).
   You can mix both in a single launch.
@@ -72,6 +76,7 @@ switched on.
 | Threat | What stops it |
 |--------|---------------|
 | Malware reads secrets from your environment / `argv` | Ruby and credential-helper values cross private pipes; `exec-fd` puts only non-secret `/dev/fd/N` paths in the child environment. The explicit `csec exec` compatibility mode remains an exception. |
+| Malware reads an ordinary same-user configuration file | `csec exec-file` creates root-owned `0050` directories and `0040` regular files on bounded tmpfs. Only the freshly launched capability-GID tree can traverse and read them; paths, not values, enter its environment. |
 | Malware asks a broker for your whole vault | The agent releases only references a human just approved with Touch ID, scoped to the approving process subtree. |
 | An old client or stale grant asks for a now-forbidden delivery | Protocol v1 fails closed; protocol v2 is evaluated against current risk metadata before resolution, and grants are reusable only with the same plan and policy digest. |
 | Malware reads your encrypted files off disk | Files are AES-256-GCM envelopes; the keys live in a Keychain group only the signed, provisioned agent can access, gated by the Secure Enclave. |
@@ -93,6 +98,9 @@ Security **cannot** protect a secret from:
   redaction reduces stdout leaks but does not repair this);
 - **an inherited-fd consumer you authorize** — it can read, copy, log, or send
   the bytes, pass the descriptor to descendants, and deliberately expose them;
+- **a regular-file consumer you authorize** — it can reopen, map, copy, log, or
+  send the file, retain an open descriptor after unlink, or deliberately pass
+  the capability or bytes to its descendants;
 - **the external-editor mode** of the native store, which necessarily writes
   decrypted JSON to a temp file your editor and its plugins can read;
 - **you approving a request that turns out to be misleading.**
@@ -197,6 +205,50 @@ it only after a live kernel ancestry walk reaches the registered PID and process
 start time; copying the value outside that tree fails closed. If broad session
 scope is rejected for a high-impact credential, the helper automatically falls
 back to its normal per-command root.
+
+### Secure regular-file delivery
+
+Some tools require real regular-file semantics: independent opens, seeking,
+`mmap`, metadata checks, or reopening from a fork/exec descendant. The installed
+package supplies a deliberately narrow root helper for those consumers:
+
+```sh
+csec exec-file \
+  --file TOOL_CONFIG='op://Engineering/Tool/config' \
+  -- tool
+
+csec exec-file \
+  --gh-config 'op://Engineering/GitHub/token' \
+  -- gh api user
+```
+
+Every launch is a fresh, digest-bound rendezvous between the original signed
+`csec`, signed `csecd`, and signed root helper. `csec` supplies the exact launch
+plan and stdio descriptors; `csecd` independently repeats policy review, Touch
+ID, and resolution, then sends the final bytes directly to the helper. The
+launcher receives only approval and non-secret paths. The helper creates a
+one-time root-owned directory and files on a 32 MiB/2,048-node tmpfs, drops the
+child to the login UID with a newly allocated primary capability GID, and
+preserves its ordinary supplementary groups.
+
+Files are unlinked when the complete capability-GID process tree exits or the
+authorization expires. `--hard-ttl` also terminates the complete tree at expiry;
+without it, expiry cannot revoke a descriptor the authorized consumer already
+opened. Launcher death, explicit cancellation, and output-scanner failure
+terminate the capability tree. Terminal output is supervised and masked by
+default; use `--redact-output=always` for captured stdout/stderr. An authorized
+consumer can always disclose what it reads.
+
+The GitHub mode creates only a protected `GH_CONFIG_DIR/hosts.yml`, refuses
+ambient GitHub token variables or existing config/keyring authority before
+resolution, and is restricted to a direct `gh` executable outside its
+authentication and extension-management commands. Run `csec root-status` to
+verify that the authenticated helper endpoint is reachable.
+
+The source and synthetic compatibility matrix are implemented. Do not use this
+path for real credentials until the signed, installed root-helper matrix in
+[`docs/regular-file-security-matrix.md`](docs/regular-file-security-matrix.md)
+has passed on the target macOS release.
 
 ### Classify delivery risk
 
@@ -317,16 +369,20 @@ and Bash tool calls, not file writes, network sends, or non-Bash tool paths. See
 ## Installing the real agent
 
 The at-rest cache and native store require the signed, notarized, provisioned
-`.app`, which registers as a background LaunchAgent:
+`.app`, which registers as a background LaunchAgent. Protected regular files
+also require the signed `.pkg`; copying the app alone does not install or load
+the root helper:
 
 ```sh
-packaging/bin/build-agent.sh                                        # build + sign the .app
+packaging/bin/build-agent.sh                                        # build + sign app and root helper
+packaging/bin/build-pkg.sh                                          # package root-owned components
 /Applications/ConvenientSecurity.app/Contents/MacOS/csec install    # register the LaunchAgent
 ```
 
 A signed agent prints `at-rest cache on` and persists resolved values in the
 Secure-Enclave-gated Keychain. Signing, notarization, and the root-owned bridge
-install pipeline are documented in [`packaging/README.md`](packaging/README.md).
+and helper install pipeline are documented in
+[`packaging/README.md`](packaging/README.md).
 
 ## Security requirements
 
@@ -336,8 +392,10 @@ team-prefixed Keychain access group, **no** `get-task-allow`, **no** Hardened
 Runtime exception entitlements (library validation, DYLD variables, JIT/unsigned
 executable memory, executable-page protection, or debugging), and **only** on a
 host with **SIP enabled**. A startup self-audit refuses to run in production if
-this posture is absent. Unsigned development builds deliberately drop the
-persistent cache and compile in test-only trust seams rather than fake the
+this posture is absent. Regular-file guarantees additionally require the exact
+signed root helper and system LaunchDaemon installed at root-owned, non-writable
+paths by the verified package. Unsigned development builds deliberately drop
+the persistent cache and compile in test-only trust seams rather than fake the
 entitlements. Details in [`DESIGN.md`](DESIGN.md#security-requirements).
 
 ## Learn more
@@ -348,6 +406,7 @@ entitlements. Details in [`DESIGN.md`](DESIGN.md#security-requirements).
 | [`docs/threat-model.md`](docs/threat-model.md) | What same-user malware can and can't do, and why each control holds. |
 | [`docs/protocol.md`](docs/protocol.md) | The authenticated Unix-socket wire protocol (protocol v2). |
 | [`docs/development.md`](docs/development.md) | Toolchain baseline, CI entry point, and signed release gates. |
+| [`docs/regular-file-security-matrix.md`](docs/regular-file-security-matrix.md) | Synthetic evidence and the signed-device gate for regular-file delivery. |
 | [`clients/ruby/`](clients/ruby/) | The heap-delivery Ruby client gem. |
 | [`packaging/`](packaging/README.md) | Signing, notarization, `.pkg` build, and install pipeline. |
 
@@ -355,9 +414,11 @@ entitlements. Details in [`DESIGN.md`](DESIGN.md#security-requirements).
 
 - `agent/Sources/ConvenientSecurity/` — provider-agnostic core: references,
   grants, cache, resolver, protocol, and the native encrypted store.
+- `agent/Sources/CSECRootProtocol/`, `agent/Sources/CSECRootServer/` — the
+  protected-payload-free launch protocol and minimal privileged runtime/server.
 - `agent/Sources/OnePasswordAdapter/` — all 1Password-specific code.
-- `agent/Sources/csecd/`, `agent/Sources/csec/` — the resident daemon and the
-  signed CLI / launcher / output supervisor.
+- `agent/Sources/csecd/`, `agent/Sources/csec/`, `agent/Sources/csec-rootd/` —
+  the credential daemon, signed CLI/supervisor, and narrow root helper.
 - `clients/ruby/` — the Ruby heap-fetch client.
 - `packaging/` — the signing, notarization, and install pipeline.
 
