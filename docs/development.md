@@ -35,6 +35,17 @@ editor checks cover bounded shell-free `$EDITOR` parsing, quoted paths, a real
 edit/commit, an editor failure, the pre-edit warning, value-free output, and
 temporary-workspace cleanup.
 
+Secure no-root delivery checks exercise session registration over the real
+socket, one-prompt descendant reuse, copied/forged/stale ID rejection, and
+high-risk fallback to an exact per-command root. AWS checks cover separate
+fields and a strict JSON bundle with byte-exact version-1 output. Git checks
+cover exact host/repository matching, mismatch-before-resolution, bounded
+parsing, response injection rejection, and read-only `store` behavior. The fd
+suite covers generic `--fd` plus all four presets, exact bytes, multiple distinct
+high-numbered descriptors, no value in initial environment/argv/current
+directory, literal argv behavior, output masking, and rejection when an
+unrelated same-UID process tries the same `/dev/fd/N` path.
+
 ## Toolchain baseline
 
 The current physical-machine baseline (verified 2026-08-21) is:
@@ -98,4 +109,15 @@ Before treating an artifact as protected, verify on the signed installed app:
     Codex versions preserve normal allow/ask/deny and OS-sandbox behavior, run
     representative multiline Rails/Node/test shell programs correctly, block
     when the adapter exits 2, and return no raw synthetic value for the
-    RuboCop/`pgrep` regression.
+    RuboCop/`pgrep` regression; and
+15. a signed `csec session` gives compatible low/standard descendant helpers one
+    bounded grant, a copied session ID outside the registered subtree fails, and
+    high-impact access uses a fresh per-command root; and
+16. real AWS `credential_process` and Git helper invocations receive their exact
+    synthetic protocol response through a private pipe, reject a mismatched
+    Git host/path without resolution, and create no credential cache or file;
+    and
+17. installed supported versions of libpq, kubectl, the AWS SDK/CLI, and Google
+    authentication tooling each consume their preset once through `/dev/fd/N`,
+    while a concurrent same-UID process cannot read that descriptor and no
+    plaintext named file, argv, or initial-environment value is created.

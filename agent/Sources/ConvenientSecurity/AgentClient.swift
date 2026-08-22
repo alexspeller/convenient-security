@@ -105,6 +105,20 @@ public struct AgentClient {
         return capabilities
     }
 
+    /// Register this launcher's current process incarnation as an explicit
+    /// session root. The returned UUID is safe to inherit but is never treated
+    /// as authority without a matching daemon record and kernel ancestry.
+    public func beginSession() throws -> String {
+        let request = BeginSessionRequest()
+        let response = try send(.beginSession(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let sessionID = response.registeredSessionID,
+              UUID(uuidString: sessionID) != nil else {
+            throw ClientError.transportFailed
+        }
+        return sessionID.lowercased()
+    }
+
     /// Begin an exact-caller native-store edit session. The agent performs a
     /// fresh Touch ID check before returning the complete decrypted JSON
     /// document to the authenticated product launcher.

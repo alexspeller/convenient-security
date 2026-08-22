@@ -281,6 +281,10 @@ public enum RiskPolicyV1 {
             // Merely naming an AI tool as the destination must not turn every
             // command it may later launch into an implicit standard-risk grant.
             denial = .descendantScopeTooBroad
+        } else if effective == .high && input.plan.descendantScope == .broadSession {
+            // High-impact credentials keep a per-command root. A convenience
+            // session deliberately expands trust to sibling descendants.
+            denial = .descendantScopeTooBroad
         } else if effective == .critical && input.plan.descendantScope != .exactProcess {
             denial = .descendantScopeTooBroad
         }

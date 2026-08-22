@@ -277,12 +277,21 @@ public struct TrustedPolicyReview: PolicyReviewProvider {
         Requester: \(safe(review.caller.description))
         Consumer: \(safe(executable)) (\(review.plan.executable.assurance.rawValue))
         Delivery: \(review.plan.mechanism.rawValue), \(review.plan.descendantScope.rawValue)
+        Grant root: \(rootDescription(review.plan.root))
         Destination: \(review.plan.destination.rawValue)
         Requested duration: \(BiometricConsent.formatDuration(TimeInterval(review.plan.requestedTTLSeconds)))
         Purpose: \(safe(review.reason))
 
         Classification describes the credential itself. Compatibility delivery is accepted separately. No secret values are shown in this window.
         """
+    }
+
+    private static func rootDescription(_ root: DeliveryRoot) -> String {
+        switch root {
+        case .caller: return "requesting launcher"
+        case .directParent: return "verified direct parent"
+        case .registeredSession: return "registered kernel-verified session"
+        }
     }
 
     @MainActor

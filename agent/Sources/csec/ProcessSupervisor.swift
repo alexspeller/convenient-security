@@ -21,6 +21,7 @@ enum ProcessSupervisorError: Error, CustomStringConvertible {
     case allocationFailed
     case spawnFailed(String)
     case setupFailed(String)
+    case deliveryFailed
     case redactionFailed(String)
 
     var description: String {
@@ -31,9 +32,96 @@ enum ProcessSupervisorError: Error, CustomStringConvertible {
             return "could not launch the child: \(message)"
         case let .setupFailed(message):
             return "could not secure the child output channels: \(message)"
+        case .deliveryFailed:
+            return "the target closed an inherited secret channel before delivery completed"
         case let .redactionFailed(message):
             return "the trusted output scanner became unavailable: \(message)"
         }
+    }
+}
+
+/// One anonymous file-shaped secret channel. The descriptor number/path is
+/// non-secret; bytes are retained only until the supervised child consumes the
+/// pipe, then overwritten best-effort and released.
+final class InheritedSecretFile {
+    private(set) var readFD: Int32
+    private(set) var writeFD: Int32
+    private var bytes: [UInt8]
+    private var offset = 0
+
+    var path: String { "/dev/fd/\(readFD)" }
+    var isWriting: Bool { writeFD >= 0 }
+
+    init(data: Data) throws {
+        var descriptors: [Int32] = [-1, -1]
+        guard pipe(&descriptors) == 0 else {
+            throw ProcessSupervisorError.setupFailed("could not create an inherited secret pipe")
+        }
+        for descriptor in descriptors {
+            let flags = fcntl(descriptor, F_GETFD)
+            guard flags >= 0, fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) == 0 else {
+                close(descriptors[0])
+                close(descriptors[1])
+                throw ProcessSupervisorError.setupFailed("could not protect an inherited secret pipe")
+            }
+        }
+        // Keep advertised descriptor paths away from the low numbers commonly
+        // occupied by unrelated launch plumbing. F_DUPFD_CLOEXEC also ensures
+        // only our child-side clear operation can carry this copy through exec.
+        let elevatedRead = fcntl(descriptors[0], F_DUPFD_CLOEXEC, 64)
+        guard elevatedRead >= 64 else {
+            close(descriptors[0])
+            close(descriptors[1])
+            throw ProcessSupervisorError.setupFailed("could not reserve an inherited secret descriptor")
+        }
+        close(descriptors[0])
+        readFD = elevatedRead
+        writeFD = descriptors[1]
+        bytes = Array(data)
+    }
+
+    deinit { closeAndWipe() }
+
+    func childDidExec() throws {
+        if readFD >= 0 {
+            close(readFD)
+            readFD = -1
+        }
+        guard writeFD >= 0, cs_fd_set_nonblocking(writeFD) == 0 else {
+            throw ProcessSupervisorError.setupFailed("could not prepare an inherited secret pipe")
+        }
+        if bytes.isEmpty { closeWriterAndWipe() }
+    }
+
+    func writeAvailable() throws {
+        guard writeFD >= 0 else { return }
+        let written = bytes.withUnsafeBytes { rawBuffer -> Int in
+            guard let base = rawBuffer.baseAddress else { return 0 }
+            return write(writeFD, base.advanced(by: offset), bytes.count - offset)
+        }
+        if written > 0 {
+            offset += written
+            if offset == bytes.count { closeWriterAndWipe() }
+        } else if written < 0, errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK {
+            return
+        } else {
+            closeWriterAndWipe()
+            throw ProcessSupervisorError.deliveryFailed
+        }
+    }
+
+    func closeAndWipe() {
+        if readFD >= 0 { close(readFD); readFD = -1 }
+        closeWriterAndWipe()
+    }
+
+    private func closeWriterAndWipe() {
+        if writeFD >= 0 { close(writeFD); writeFD = -1 }
+        _ = bytes.withUnsafeMutableBytes { buffer in
+            buffer.initializeMemory(as: UInt8.self, repeating: 0)
+        }
+        bytes.removeAll(keepingCapacity: false)
+        offset = 0
     }
 }
 
@@ -172,10 +260,11 @@ enum ProcessSupervisor {
         environment: [String: String],
         catalog: OutputRedactionCatalog? = nil,
         agentSession: AgentOutputRedactionSession? = nil,
-        mode: OutputGuardMode
+        mode: OutputGuardMode,
+        inheritedFiles: [InheritedSecretFile] = []
     ) throws -> Int32 {
-        precondition(catalog != nil || agentSession != nil)
-        let patterns = catalog?.patterns ?? []
+        precondition(inheritedFiles.count <= 32)
+        let patterns = mode == .never ? [] : (catalog?.patterns ?? [])
         let stdinIsTTY = isatty(STDIN_FILENO) == 1
         let stdoutIsTTY = isatty(STDOUT_FILENO) == 1
         let stderrIsTTY = isatty(STDERR_FILENO) == 1
@@ -190,10 +279,12 @@ enum ProcessSupervisor {
             captureStdout = true
             captureStderr = true
         case .never:
-            preconditionFailure("never mode must use direct exec")
+            // FD delivery still needs a parent to feed and close the anonymous
+            // pipes. Preserve terminal behavior through the existing PTY relay,
+            // but use an empty matcher for the explicit byte-exact bypass.
+            captureStdout = stdoutIsTTY
+            captureStderr = stderrIsTTY
         }
-
-        precondition(captureStdout || captureStderr)
 
         let stdinUsesPTY = stdinIsTTY
         let stdoutMode: cs_output_mode = captureStdout
@@ -214,26 +305,46 @@ enum ProcessSupervisor {
         var ptyMaster: Int32 = -1
         var stdoutRead: Int32 = -1
         var stderrRead: Int32 = -1
+        let inheritedFDs = inheritedFiles.map(\.readFD)
         let spawnResult = argv.pointers.withUnsafeMutableBufferPointer { argvBuffer in
             envp.pointers.withUnsafeMutableBufferPointer { envBuffer in
-                executablePath.withCString { path in
-                    cs_spawn_supervised(
-                        path,
-                        argvBuffer.baseAddress,
-                        envBuffer.baseAddress,
-                        stdinUsesPTY ? 1 : 0,
-                        stdoutMode,
-                        stderrMode,
-                        &childPID,
-                        &ptyMaster,
-                        &stdoutRead,
-                        &stderrRead
-                    )
+                inheritedFDs.withUnsafeBufferPointer { inheritedBuffer in
+                    executablePath.withCString { path in
+                        cs_spawn_supervised(
+                            path,
+                            argvBuffer.baseAddress,
+                            envBuffer.baseAddress,
+                            stdinUsesPTY ? 1 : 0,
+                            stdoutMode,
+                            stderrMode,
+                            inheritedBuffer.baseAddress,
+                            Int32(inheritedBuffer.count),
+                            &childPID,
+                            &ptyMaster,
+                            &stdoutRead,
+                            &stderrRead
+                        )
+                    }
                 }
             }
         }
         guard spawnResult == 0, childPID > 0 else {
+            inheritedFiles.forEach { $0.closeAndWipe() }
             throw ProcessSupervisorError.spawnFailed(errnoMessage())
+        }
+
+        do {
+            for file in inheritedFiles { try file.childDidExec() }
+        } catch {
+            inheritedFiles.forEach { $0.closeAndWipe() }
+            _ = kill(-childPID, SIGKILL)
+            _ = kill(childPID, SIGKILL)
+            var status: Int32 = 0
+            while waitpid(childPID, &status, 0) < 0, errno == EINTR {}
+            if ptyMaster >= 0 { close(ptyMaster) }
+            if stdoutRead >= 0 { close(stdoutRead) }
+            if stderrRead >= 0 { close(stderrRead) }
+            throw error
         }
 
         var signalPipe: [Int32] = [-1, -1]
@@ -259,6 +370,7 @@ enum ProcessSupervisor {
             if signalPipe[0] >= 0 { close(signalPipe[0]) }
             if signalPipe[1] >= 0 { close(signalPipe[1]) }
             if openedTerminalOutput >= 0 { close(openedTerminalOutput) }
+            inheritedFiles.forEach { $0.closeAndWipe() }
         }
 
         guard cs_supervisor_signal_pipe(&signalPipe) == 0 else {
@@ -406,6 +518,7 @@ enum ProcessSupervisor {
                     case signal
                     case input
                     case capture(Capture)
+                    case inheritedFile(InheritedSecretFile)
                 }
                 var sources: [PollSource] = [.signal]
                 var descriptors = [pollfd(
@@ -426,6 +539,14 @@ enum ProcessSupervisor {
                     descriptors.append(pollfd(
                         fd: capture.fd,
                         events: Int16(POLLIN | POLLHUP | POLLERR),
+                        revents: 0
+                    ))
+                }
+                for file in inheritedFiles where file.isWriting {
+                    sources.append(.inheritedFile(file))
+                    descriptors.append(pollfd(
+                        fd: file.writeFD,
+                        events: Int16(POLLOUT | POLLHUP | POLLERR),
                         revents: 0
                     ))
                 }
@@ -480,6 +601,8 @@ enum ProcessSupervisor {
                             } else if count == 0 || (errno != EINTR && errno != EAGAIN) {
                                 try closeCapture(capture)
                             }
+                        case let .inheritedFile(file):
+                            try file.writeAvailable()
                         }
                     }
                 }
@@ -501,6 +624,8 @@ enum ProcessSupervisor {
                                     || cs_wait_status_signaled(status) == 1 {
                             terminalStatus = status
                             relayInput = false
+                            let incompleteDelivery = inheritedFiles.contains(where: \.isWriting)
+                            inheritedFiles.forEach { $0.closeAndWipe() }
 
                             // The root's writes are complete before waitpid reports
                             // exit. Drain everything already queued, then close the
@@ -527,6 +652,9 @@ enum ProcessSupervisor {
                                         try closeCapture(capture)
                                     }
                                 }
+                            }
+                            if incompleteDelivery {
+                                throw ProcessSupervisorError.deliveryFailed
                             }
                             break
                         }

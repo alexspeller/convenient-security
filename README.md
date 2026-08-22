@@ -53,10 +53,10 @@ rest and in use — as small as macOS allows.
   the logical credential as low, standard, high, or critical and reviews the
   proposed delivery. The agent applies that policy before reading a cache or
   provider, and binds every live grant to the resulting policy snapshot.
-- **Delivery straight to the heap, not the environment.** The integrated Ruby
-  client receives values over a private pipe into its own process memory, which
-  another same-user process can't read on a hardened Mac. Plaintext never touches
-  `ENV` or `argv`.
+- **Narrow delivery without root.** The Ruby client and AWS/Git credential
+  adapters use private pipes, while `exec-fd` gives file-oriented tools an
+  anonymous inherited descriptor. Plaintext need not touch `ENV`, `argv`, or a
+  named file.
 - **Two backends, one interface.** References resolve from the official 1Password
   CLI (`op://…`) or from device-bound, AES-256-GCM encrypted files (`csec://…`).
   You can mix both in a single launch.
@@ -71,7 +71,7 @@ switched on.
 
 | Threat | What stops it |
 |--------|---------------|
-| Malware reads secrets from your environment / `argv` | Values are delivered to the consumer's heap over a private pipe, not injected into the environment (for the integrated Ruby client). |
+| Malware reads secrets from your environment / `argv` | Ruby and credential-helper values cross private pipes; `exec-fd` puts only non-secret `/dev/fd/N` paths in the child environment. The explicit `csec exec` compatibility mode remains an exception. |
 | Malware asks a broker for your whole vault | The agent releases only references a human just approved with Touch ID, scoped to the approving process subtree. |
 | An old client or stale grant asks for a now-forbidden delivery | Protocol v1 fails closed; protocol v2 is evaluated against current risk metadata before resolution, and grants are reusable only with the same plan and policy digest. |
 | Malware reads your encrypted files off disk | Files are AES-256-GCM envelopes; the keys live in a Keychain group only the signed, provisioned agent can access, gated by the Secure Enclave. |
@@ -91,6 +91,8 @@ Security **cannot** protect a secret from:
   *compatibility* path for unmodified tools that injects plaintext into the
   child's environment, where same-user process inspection can read it (output
   redaction reduces stdout leaks but does not repair this);
+- **an inherited-fd consumer you authorize** — it can read, copy, log, or send
+  the bytes, pass the descriptor to descendants, and deliberately expose them;
 - **the external-editor mode** of the native store, which necessarily writes
   decrypted JSON to a temp file your editor and its plugins can read;
 - **you approving a request that turns out to be misleading.**
@@ -131,6 +133,70 @@ lifetime. Because this delivery is readable by unrelated same-UID processes, it
 is allowed for low-risk credentials and requires a separate, time-bounded
 compatibility acceptance for standard-risk credentials. It is forbidden for
 high and critical credentials.
+
+### Secure no-root delivery
+
+Prefer a tool's credential protocol when it has one. AWS
+[`credential_process`](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sourcing-external.html)
+expects version-1 JSON from a command. A single referenced value may contain a
+strict JSON object with `AccessKeyId`, `SecretAccessKey`, and optional
+`SessionToken`/`Expiration` fields:
+
+```ini
+[profile engineering]
+credential_process = /Applications/ConvenientSecurity.app/Contents/MacOS/csec creds aws --item op://Engineering/AWS/credential-process
+```
+
+Alternatively, use `--access-key-id-ref`, `--secret-access-key-ref`, and the
+optional `--session-token-ref`/`--expiration-ref` flags for separate fields.
+`csec` emits the credential only when stdout is a pipe or socket, and verifies
+the live AWS parent immediately before release.
+
+Git's
+[`credential.helper`](https://git-scm.com/docs/gitcredentials#_custom_helpers)
+can use a read-only, host-constrained adapter:
+
+```sh
+git config --global credential.https://github.com.helper \
+  '/Applications/ConvenientSecurity.app/Contents/MacOS/csec creds git --host github.com --username-ref op://Engineering/GitHub/username --password-ref op://Engineering/GitHub/token'
+```
+
+Add `--path owner/repository.git` and enable `useHttpPath` when a credential must
+be repository-specific. Non-matching requests return no credential; Git
+`store` and `erase` operations are consumed but deliberately ignored.
+
+For tools that accept a file path, `exec-fd` streams the complete referenced
+file through a fresh anonymous descriptor and places only `/dev/fd/N` in the
+tool's path variable:
+
+```sh
+csec exec-fd --preset pgpass=op://Engineering/Postgres/pgpass -- psql app
+csec exec-fd --preset kubeconfig=op://Engineering/Kubernetes/config -- kubectl get pods
+csec exec-fd --preset aws-shared-credentials=op://Engineering/AWS/credentials -- aws sts get-caller-identity
+csec exec-fd --preset google-service-account=op://Engineering/GCP/service-account -- gcloud auth application-default print-access-token
+csec exec-fd --fd TOOL_CONFIG=op://Engineering/Tool/config -- tool
+```
+
+Each reference is the complete intended file contents. This first no-root tier
+supports single-open streaming consumers only: the descriptor is not seekable,
+reopening shares a consumed offset, and a tool that closes inherited descriptors
+at startup is incompatible. `csec` writes only after the target has successfully
+executed, closes and wipes its buffer after delivery, forwards signals and exit
+status, and creates no plaintext filesystem object.
+
+Credential helpers normally start as fresh processes, so their default grant is
+per invocation. Wrap a deliberate shell or command tree to reuse low/standard
+grants across its descendants:
+
+```sh
+csec session -- zsh
+```
+
+The inherited `CSEC_SESSION_ID` is a non-secret lookup hint. `csecd` authorizes
+it only after a live kernel ancestry walk reaches the registered PID and process
+start time; copying the value outside that tree fails closed. If broad session
+scope is rejected for a high-impact credential, the helper automatically falls
+back to its normal per-command root.
 
 ### Classify delivery risk
 

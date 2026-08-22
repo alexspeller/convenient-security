@@ -51,6 +51,16 @@ This limits which values the agent releases; it does not make every descendant
 trustworthy. A process deliberately launched inside an approved subtree is part
 of the authorized consumer boundary.
 
+`csec session` makes that wider boundary explicit. The daemon records the
+signed launcher's kernel PID, process start time, and audit session before the
+launcher becomes the requested shell or command. Its inherited random ID is
+non-secret and does not authorize anything by possession: each use must come
+from the authenticated signed helper and pass a fresh ancestry walk to that
+exact live process incarnation. Copying the ID to a sibling, racing PID reuse,
+or inventing an ID fails closed. Low/standard grants may span descendants;
+policy rejection retries only with the helper's ordinary per-command root, so a
+high-impact credential does not inherit broad session scope.
+
 ### Risk policy and stale authorization
 
 Before it consults a plaintext cache or provider, the daemon groups each
@@ -85,6 +95,42 @@ arrives in the Ruby heap without appearing in the initial environment or argv.
 This protection ends if the application assigns the returned value to `ENV`,
 passes it in argv, writes or logs it, sends it over an unintended connection, or
 loads hostile code into the same Ruby process.
+
+### Tool-native credential protocols
+
+AWS and Git launch a helper with private stdin/stdout pipes. The signed helper
+binds the expected host/repository or AWS field references and the live direct
+parent executable into the reviewed plan; the daemon and helper independently
+recheck the parent before release. Output is refused when the credential stream
+is a terminal or ordinary file. Git requests are bounded and exact-matched
+before resolution, and its mutation operations do not resolve or persist data.
+
+This keeps credentials out of initial environment, argv, and named files. It
+does not make AWS, Git, their plugins, or anything executing inside those
+authorized processes trustworthy. Those consumers receive plaintext and can
+retain or disclose it. A malicious protected executable can also be invoked by
+same-UID malware, but it cannot obtain a grant rooted outside the approved
+process tree merely by naming that executable.
+
+### Inherited descriptor delivery
+
+`csec exec-fd` creates anonymous pipes with close-on-exec parent ends and gives
+only selected elevated read descriptors to the target. The environment exposes
+non-secret `/dev/fd/N` paths, not values. File descriptors belong to a process's
+descriptor table, so the same numeric path in an unrelated same-UID process
+does not name the target's channel. An exec-status handshake prevents the
+launcher from writing until the kernel has replaced the child image; partial or
+abandoned delivery fails, the child group is reaped, unused ends close, and the
+launcher's retained bytes are overwritten best-effort. No named plaintext file
+is created.
+
+The descriptor is intentionally a single-open stream, not a regular file. It
+cannot seek, independent opens do not reset its offset, and the target can pass
+the descriptor to descendants until it closes it or marks it close-on-exec. A
+tool that closes inherited descriptors, insists on regular-file metadata, or
+reopens its configuration is incompatible. The authorized target can always
+read, copy, log, or transmit the bytes, and root can inspect the processes;
+output masking only reduces accidental writes on supervised stdout/stderr.
 
 ### Keychain cache
 
@@ -181,6 +227,10 @@ signed launcher.
   risk and by separate acceptance for standard risk; high/critical are rejected.
 - `csec get` prints plaintext to standard output.
 - The Ruby client returns an ordinary mutable `String` to application code.
+- `csec creds aws` and `csec creds git` intentionally return plaintext over the
+  credential consumer's private stdout pipe.
+- `csec exec-fd` authorizes the launched process and any descendants retaining
+  its descriptor to read the complete file payload.
 - Claude Code and Codex hook fragments are opt-in user configuration and cover
   Bash command tool calls only.
 

@@ -6,7 +6,8 @@ public enum OutputGuardMode: String, Codable, Sendable, CaseIterable {
     case tty
     /// Guard stdout and stderr even when they feed a pipe or capture file.
     case always
-    /// Preserve byte-exact output and use direct exec replacement.
+    /// Preserve byte-exact output. Environment delivery can use direct exec
+    /// replacement; inherited-fd delivery retains its pipe-feeding supervisor.
     case never
 }
 

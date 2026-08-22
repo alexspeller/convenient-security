@@ -10,10 +10,11 @@ persistent keychain cache and with test-only trust seams compiled in.
 Convenient Security protects secret values from unrelated, non-root processes
 running as the same login user. It provides per-reference Touch ID consent,
 process-scoped grants, a code-identity-gated at-rest cache, heap delivery for an
-integrated Ruby client, an environment compatibility launcher, and exact-value
-output redaction. A value-free risk policy gates each delivery before provider or
-cache resolution. It can resolve from the official 1Password CLI and from
-device-bound native encrypted files.
+integrated Ruby client, tool-native AWS/Git credential adapters, anonymous
+inherited-fd files, an environment compatibility launcher, and exact-value output
+redaction. A value-free risk policy gates each delivery before provider or cache
+resolution. It can resolve from the official 1Password CLI and from device-bound
+native encrypted files.
 
 It does not protect a value from root, from code already executing inside an
 authorized consumer, from a consumer the user deliberately launches, or from a
@@ -115,6 +116,63 @@ initial environment or argv.
 
 Assigning that string to `ENV`, interpolating it into a command, logging it, or
 loading hostile code into the Ruby process is outside this protection.
+
+### Registered session roots
+
+`csec session -- <command>` registers the signed launcher's current PID and
+kernel process start time with `csecd`, installs a random non-secret
+`CSEC_SESSION_ID`, and replaces itself with the requested command. The daemon
+keeps at most 64 live registrations and removes one when that exact process
+incarnation exits. A descendant helper may name the ID, but every access still
+requires the caller's audit session to match and a fresh kernel ancestry walk to
+reach the registered PID/start-time pair. The ID is therefore a lookup hint,
+not a bearer capability; copying or forging it outside the subtree fails.
+
+The delivery plan and consent UI distinguish a registered `broad_session` root
+from an ordinary per-command root. Low and standard credentials can reuse a
+compatible grant across sibling descendants. If policy rejects the broad plan,
+the launcher retries with its ordinary narrow root; high-impact credentials do
+not gain wider session authority. Grant TTLs, plan/policy digests, risk changes,
+and live ancestry checks still apply independently of registration lifetime.
+
+### Credential protocols
+
+`csec creds aws` implements AWS `credential_process` version 1. It accepts either
+separate field references or one strict flat JSON bundle, validates required and
+optional fields, and writes sorted JSON only to a pipe or socket. `csec creds
+git` implements the bounded line-oriented Git helper protocol for `get`, matches
+an exact configured protocol/host and optional repository path before resolving,
+and emits only safe username/password attributes. It advertises no optional Git
+capabilities and deliberately consumes but ignores `store`, `erase`, and unknown
+operations, so it never becomes another plaintext credential store.
+
+Both adapters bind the configured references, constraints, and actual direct
+consumer executable into the delivery plan. The daemon verifies that executable
+against the helper's live parent; the helper repeats PID, start-time, and path
+checks immediately before writing. Their stdout is classified as an intentional
+credential channel and is not corrupted by the general output masker.
+
+### Inherited file descriptors
+
+`csec exec-fd` resolves one to sixteen complete file payloads, creates one
+close-on-exec anonymous pipe per payload, and passes only elevated read
+descriptors to the target. The child environment contains non-secret
+`/dev/fd/N` paths under caller-selected variables, or under the bounded presets
+`PGPASSFILE`, `KUBECONFIG`, `AWS_SHARED_CREDENTIALS_FILE`, and
+`GOOGLE_APPLICATION_CREDENTIALS`. No pathname names the bytes in the filesystem.
+
+The supervisor waits for an exec-status close-on-exec handshake before it closes
+its read copies and begins nonblocking writes. It multiplexes secret writes with
+PTY/output and signal handling, closes unused ends, fails if the consumer exits
+or closes a channel before delivery completes, forwards the real wait status,
+and overwrites retained byte buffers best-effort. The generic and per-file limit
+is 1 MiB, the aggregate limit is 4 MiB, and NUL-bearing or empty payloads fail.
+
+This tier is intentionally limited to single-open streaming consumers. Pipes are
+not seekable, duplicated `/dev/fd/N` opens share an offset, and child descendants
+can inherit the descriptor until the consumer closes it or explicitly marks it
+close-on-exec. A tool that needs independent reopen, seek, or regular-file
+metadata belongs to a future root-backed capability-file tier.
 
 ### Environment compatibility
 
@@ -309,13 +367,14 @@ available. The signed-package verification procedure is in
 
 ## Current security boundary
 
-The strongest implemented delivery is the Ruby private-pipe path into a clean,
-hardened consumer heap. The environment launcher is a compatibility feature
-with an acknowledged same-UID disclosure channel. Output redaction is an egress
-safeguard, not a repair for that channel. Risk policy prevents high/critical
-credentials from using currently weak or unverified paths; it does not strengthen
-an allowed low/standard path or make an authorized consumer safe. Native
-ciphertext and its rollback record protect durable data, while the decrypted editor buffer and values
-released to consumers remain subject to the authorized-consumer boundary. The
-precise attacker capabilities and limits are recorded in
+The strongest implemented paths deliver through private credential pipes into a
+clean consumer heap or through a process-local inherited descriptor. The
+environment launcher is a compatibility feature with an acknowledged same-UID
+disclosure channel. Output redaction is an egress safeguard, not a repair for
+that channel. Risk policy prevents high/critical credentials from using weak,
+broad, or unverified paths; it does not strengthen an allowed path or make an
+authorized consumer safe. Native ciphertext and its rollback record protect
+durable data, while decrypted editor buffers and values released to consumers
+remain subject to the authorized-consumer boundary. The precise attacker
+capabilities and limits are recorded in
 [`docs/threat-model.md`](docs/threat-model.md).

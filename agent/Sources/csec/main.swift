@@ -16,6 +16,16 @@ import Darwin
 //       values that are themselves references (e.g. DATABASE_URL=csec://…) are
 //       resolved in place, so unmodified tools like `rails`/`psql` just work.
 //
+//   csec session -- <cmd> [args…]
+//       Register this PID/start-time as an explicit broad session root, then
+//       replace csec with the requested command.
+//
+//   csec creds aws|git ...
+//       Serve a tool-native credential protocol over a private stdout pipe.
+//
+//   csec exec-fd (--fd ENV=<reference>|--preset NAME=<reference>)… -- <cmd>
+//       Stream file-shaped secrets into inherited anonymous descriptors.
+//
 //   csec tool-exec --destination ai -- <cmd> [args…]
 //       Run a command whose output is scanned against every active value in the
 //       resident agent before any bytes are returned to an AI command runner.
@@ -37,6 +47,20 @@ func usage() -> Never {
                 [--redact-output=tty|always|never]
                 [--redact-output-label=opaque|reference] [--redact-short-values]
                 -- <cmd> [args…]
+      csec session -- <cmd> [args…]
+      csec creds aws (--item <reference> |
+                     --access-key-id-ref <reference> --secret-access-key-ref <reference>
+                     [--session-token-ref <reference>] [--expiration-ref <reference>])
+                     [--reason <text>] [--for <seconds>]
+      csec creds git --host <host> [--protocol <scheme>] [--path <repository>]
+                     [--username-ref <reference>] --password-ref <reference>
+                     [--reason <text>] [--for <seconds>] get|store|erase
+      csec exec-fd [--reason <text>] [--for <seconds>]
+                   (--fd ENV_NAME=<reference> |
+                    --preset {pgpass|kubeconfig|aws-shared-credentials|google-service-account}=<reference>)…
+                   [--redact-output=tty|always|never]
+                   [--redact-output-label=opaque|reference] [--redact-short-values]
+                   -- <cmd> [args…]
       csec bridge
       csec tool-exec --destination ai -- <cmd> [args…]
       csec hook claude|codex
@@ -53,6 +77,11 @@ func usage() -> Never {
                value that is a secret reference (DATABASE_URL=csec://…) is resolved in
                place; --set NAME=<ref> injects additional ones. Terminal output is
                masked by default; use 'always' for captured logs and pipes.
+    session    Register a kernel-verified broad grant root, then run <cmd> at the same PID.
+    creds      Serve AWS credential_process or Git credential-helper output via a private pipe.
+    exec-fd    Give a child anonymous single-open secret files at /dev/fd/N. Presets set
+               PGPASSFILE, KUBECONFIG, AWS_SHARED_CREDENTIALS_FILE, or
+               GOOGLE_APPLICATION_CREDENTIALS to the non-secret descriptor path.
     bridge     Private framed stdin/stdout protocol for language clients; not for terminals.
     tool-exec  Fail-closed AI command broker using csecd's active-value scanner.
     hook       PreToolUse stdin/stdout adapter for Claude Code or Codex.
@@ -78,6 +107,12 @@ case "get":
     runGet(Array(arguments.dropFirst()))
 case "exec":
     runExec(Array(arguments.dropFirst()))
+case "session":
+    runSession(Array(arguments.dropFirst()))
+case "creds":
+    runCredentials(Array(arguments.dropFirst()))
+case "exec-fd":
+    runExecFD(Array(arguments.dropFirst()))
 case "bridge":
     guard arguments.count == 1 else { usage() }
     runBridge()

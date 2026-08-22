@@ -61,9 +61,17 @@ public enum DestinationClass: String, Codable, Sendable, CaseIterable {
 public enum DeliveryRoot: Codable, Sendable, Equatable {
     case caller
     case directParent(pid: pid_t, startTime: UInt64)
+    /// An opaque daemon registration created by `csec session`. The identifier
+    /// is only a lookup hint: csecd still proves that the access caller descends
+    /// from the registered PID with the registered process start time.
+    case registeredSession(id: String)
 
-    private enum CodingKeys: String, CodingKey { case kind, pid, startTime }
-    private enum Kind: String, Codable { case caller, directParent = "direct_parent" }
+    private enum CodingKeys: String, CodingKey { case kind, pid, startTime, id }
+    private enum Kind: String, Codable {
+        case caller
+        case directParent = "direct_parent"
+        case registeredSession = "registered_session"
+    }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -75,6 +83,8 @@ public enum DeliveryRoot: Codable, Sendable, Equatable {
                 pid: try container.decode(pid_t.self, forKey: .pid),
                 startTime: try container.decode(UInt64.self, forKey: .startTime)
             )
+        case .registeredSession:
+            self = .registeredSession(id: try container.decode(String.self, forKey: .id))
         }
     }
 
@@ -87,6 +97,9 @@ public enum DeliveryRoot: Codable, Sendable, Equatable {
             try container.encode(Kind.directParent, forKey: .kind)
             try container.encode(pid, forKey: .pid)
             try container.encode(startTime, forKey: .startTime)
+        case let .registeredSession(id):
+            try container.encode(Kind.registeredSession, forKey: .kind)
+            try container.encode(id, forKey: .id)
         }
     }
 }

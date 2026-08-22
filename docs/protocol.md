@@ -68,7 +68,10 @@ The response advertises supported versions and features:
       "native_encrypted_store",
       "risk_policy_v1",
       "risk_management",
-      "native_editor_policy"
+      "native_editor_policy",
+      "registered_session_roots",
+      "credential_protocols",
+      "inherited_file_descriptors"
     ]
   }
 }
@@ -149,8 +152,12 @@ Before resolution, the agent verifies:
   supported output-matcher version, and plan/TTL agreement;
 - a recomputed canonical plan digest;
 - that the socket peer is the verified launcher;
-- a caller root, or—only for `csec bridge`—that a requested direct parent is the
-  launcher's real PPID with the same process start time; and
+- a caller root; only for `csec bridge`, a requested direct parent that is the
+  launcher's real PPID with the same process start time; or a registered-session
+  ID whose live PID/start-time root is an ancestor of the caller in the same
+  audit session;
+- for `credential_protocol`, that the plan's consumer executable is the
+  helper's current direct parent's canonical executable path; and
 - the current logical-credential risk judgment, delivery acceptance, mechanism,
   consumer assurance, destination, descendant scope, and policy-capped TTL; and
 - that any existing grant has the same delivery-plan and policy-decision digests
@@ -176,6 +183,63 @@ Success echoes the request nonce:
 
 The client rejects a missing/mismatched nonce or a values map whose keys differ
 from the requested reference set.
+
+## Registered session roots
+
+The signed launcher registers its current process incarnation before replacing
+itself with `csec session`'s target:
+
+```json
+{
+  "version": 2,
+  "type": "begin_session",
+  "requestID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+}
+```
+
+Success echoes the nonce and returns a fresh random identifier:
+
+```json
+{
+  "version": 2,
+  "requestID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "registeredSessionID": "ffffffff-1111-2222-3333-444444444444"
+}
+```
+
+The daemon accepts registration only from a live mutually authenticated
+launcher and records its kernel PID, process start time, and audit-session ID.
+At most 64 registrations are retained; dead process incarnations are pruned and
+re-registering the same incarnation replaces its older ID.
+
+A descendant access encodes the root as
+`{"kind":"registered_session","id":"<uuid>"}` and must declare
+`broad_session` scope. The identifier has no independent authority: every
+access performs a fresh ancestry walk from the authenticated caller to the
+recorded PID/start-time pair. A malformed, stale, forged, copied-across-tree, or
+cross-audit-session ID is rejected as `invalid_request`, with no fallback.
+
+Risk policy may reject broad scope before resolution. In that case only, the
+product launcher may issue a new access request and plan using its ordinary
+caller root. This preserves per-command treatment for high-impact credentials;
+the broad and narrow plans have different digests and cannot share a grant.
+
+## Secure no-root delivery plans
+
+Credential helpers declare `credential_protocol` with destination
+`credential_consumer` and normally use `exact_process` scope. AWS and Git wire
+formats exist only between the helper and its direct tool parent; they are not
+messages on the authenticated agent socket. Helper stdout must be a pipe or
+socket, and the helper rechecks its parent's PID, start time, and executable
+immediately before writing the resolved response.
+
+`csec exec-fd` declares `inherited_fd` and binds the executable, command digest,
+output-guard configuration, reference-to-variable mapping, and any preset name
+into the plan. Secret file bytes cross the authenticated socket as ordinary
+access values, remain in the launcher only long enough to feed anonymous pipes,
+and are never encoded in the plan or child environment. The advertised
+`inherited_file_descriptors` capability describes this launcher behavior; it
+does not add another daemon message containing files or descriptor numbers.
 
 ## Value-free risk management
 

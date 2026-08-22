@@ -134,6 +134,8 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: clientTrustPolicy
         return await agent.schemes()
     case .capabilities:
         return await agent.capabilities()
+    case let .beginSession(begin):
+        return await agent.beginSession(request: begin, caller: caller)
     case let .beginOutputRedaction(begin):
         return await agent.beginOutputRedaction(request: begin, caller: caller)
     case let .redactOutputChunk(chunk):

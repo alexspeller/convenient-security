@@ -17,6 +17,9 @@ public enum WireCapability: String, Codable, Sendable, CaseIterable {
     case riskPolicyV1 = "risk_policy_v1"
     case riskManagement = "risk_management"
     case nativeEditorPolicy = "native_editor_policy"
+    case registeredSessionRoots = "registered_session_roots"
+    case credentialProtocols = "credential_protocols"
+    case inheritedFileDescriptors = "inherited_file_descriptors"
 }
 
 public struct ProtocolCapabilities: Codable, Sendable, Equatable {
@@ -119,6 +122,17 @@ public struct AccessRequest: Codable, Sendable {
         self.ttlSeconds = ttlSeconds
         self.deliveryPlan = deliveryPlan
         self.deliveryPlanDigest = deliveryPlanDigest
+    }
+}
+
+/// Register the authenticated launcher's current PID/start-time as a deliberate
+/// broad session root. The response identifier contains no authority by itself;
+/// every later access is checked against live kernel ancestry.
+public struct BeginSessionRequest: Codable, Sendable {
+    public let requestID: String
+
+    public init(requestID: UUID = UUID()) {
+        self.requestID = requestID.uuidString.lowercased()
     }
 }
 
@@ -315,6 +329,7 @@ public enum Request: Sendable {
     case access(AccessRequest)
     case schemes
     case capabilities
+    case beginSession(BeginSessionRequest)
     case beginOutputRedaction(BeginOutputRedactionRequest)
     case redactOutputChunk(RedactOutputChunkRequest)
     case endOutputRedaction(EndOutputRedactionRequest)
@@ -359,6 +374,10 @@ extension Request: Codable {
             self = .schemes
         case "capabilities":
             self = .capabilities
+        case "begin_session":
+            self = .beginSession(BeginSessionRequest(
+                requestID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
         case "begin_output_redaction":
             self = .beginOutputRedaction(BeginOutputRedactionRequest(
                 destination: try container.decode(DestinationClass.self, forKey: .destination),
@@ -434,6 +453,10 @@ extension Request: Codable {
         case .capabilities:
             try container.encode("capabilities", forKey: .type)
             try container.encode(WireProtocol.version, forKey: .version)
+        case let .beginSession(request):
+            try container.encode("begin_session", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
         case let .beginOutputRedaction(request):
             try container.encode("begin_output_redaction", forKey: .type)
             try container.encode(WireProtocol.version, forKey: .version)
@@ -503,6 +526,7 @@ public struct Response: Codable, Sendable {
     public let values: [String: String]?
     public let schemes: [String]?
     public let capabilities: ProtocolCapabilities?
+    public let registeredSessionID: String?
     public let outputRedactionSessionID: String?
     public let redactedData: Data?
     public let redactionMatches: [OutputRedactionMatch]?
@@ -522,6 +546,7 @@ public struct Response: Codable, Sendable {
         values: [String: String]? = nil,
         schemes: [String]? = nil,
         capabilities: ProtocolCapabilities? = nil,
+        registeredSessionID: String? = nil,
         outputRedactionSessionID: String? = nil,
         redactedData: Data? = nil,
         redactionMatches: [OutputRedactionMatch]? = nil,
@@ -540,6 +565,7 @@ public struct Response: Codable, Sendable {
         self.values = values
         self.schemes = schemes
         self.capabilities = capabilities
+        self.registeredSessionID = registeredSessionID
         self.outputRedactionSessionID = outputRedactionSessionID
         self.redactedData = redactedData
         self.redactionMatches = redactionMatches

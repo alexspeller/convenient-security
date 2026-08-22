@@ -693,6 +693,36 @@ do {
 }
 
 do {
+    let begin = BeginSessionRequest(
+        requestID: UUID(uuidString: "12345678-1234-5678-9abc-def012345678")!
+    )
+    let encoded = try JSONEncoder().encode(Request.beginSession(begin))
+    let decoded = try JSONDecoder().decode(Request.self, from: encoded)
+    if case let .beginSession(roundTrip) = decoded {
+        check(roundTrip.requestID == begin.requestID,
+              "registered-session request round-trips with its nonce")
+    } else {
+        check(false, "registered-session request decodes as the correct request")
+    }
+
+    let sessionPlan = DeliveryPlan(
+        mechanism: .inheritedFileDescriptor,
+        executable: baseExecutable,
+        root: .registeredSession(id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+        descendantScope: .broadSession,
+        destination: .localDevelopment,
+        requestedTTLSeconds: 300,
+        operationContext: "registered session round trip"
+    )
+    let sessionData = try JSONEncoder().encode(sessionPlan)
+    let sessionRoundTrip = try JSONDecoder().decode(DeliveryPlan.self, from: sessionData)
+    check(sessionRoundTrip == sessionPlan,
+          "registered session IDs are digest-bound delivery roots")
+} catch {
+    check(false, "registered-session protocol round trips succeed (\(error))")
+}
+
+do {
     let begin = BeginNativeStoreEditRequest(
         store: "development",
         mode: .externalTemporaryFile,
@@ -760,6 +790,94 @@ check(ExecutableInspection.independentlyProtected(path: "/bin/sh"),
 check(!ExecutableInspection.independentlyProtected(
     path: Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
 ), "a user-owned development binary is not mislabeled independently protected")
+
+print("\n# Secure no-root delivery formats")
+
+let sessionHint = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+check((try? RegisteredSessionHint.sessionID(environment: [
+    RegisteredSessionHint.environmentKey: sessionHint,
+])) == sessionHint, "an opaque registered-session hint parses without carrying authority")
+check((try? RegisteredSessionHint.sessionID(environment: [:])) == nil,
+      "absence of a session hint keeps per-command delivery")
+checkThrows("malformed inherited session hints fail closed") {
+    _ = try RegisteredSessionHint.sessionID(environment: [
+        RegisteredSessionHint.environmentKey: "not-a-session",
+    ])
+}
+
+do {
+    let aws = try AWSCredentialProcess.render(fields: [
+        AWSCredentialProcess.accessKeyID: "AKIA-SYNTHETIC",
+        AWSCredentialProcess.secretAccessKey: "aws-synthetic-secret",
+        AWSCredentialProcess.sessionToken: "aws-synthetic-session",
+        AWSCredentialProcess.expiration: "2033-05-18T03:33:20Z",
+    ])
+    let object = try JSONSerialization.jsonObject(with: aws) as? [String: Any]
+    check(object?["Version"] as? Int == 1
+          && object?["AccessKeyId"] as? String == "AKIA-SYNTHETIC"
+          && object?["SecretAccessKey"] as? String == "aws-synthetic-secret"
+          && object?["SessionToken"] as? String == "aws-synthetic-session",
+          "AWS credential_process rendering emits the required versioned JSON fields")
+
+    let bundle = #"{"AccessKeyId":"AKIA-BUNDLE","SecretAccessKey":"bundle-secret"}"#
+    let bundleFields = try AWSCredentialProcess.fields(fromBundle: bundle)
+    check(bundleFields[AWSCredentialProcess.accessKeyID] == "AKIA-BUNDLE",
+          "AWS credentials can be read from one strict JSON bundle reference")
+    checkThrows("AWS bundles reject duplicate fields before rendering") {
+        _ = try AWSCredentialProcess.fields(
+            fromBundle: #"{"AccessKeyId":"first","AccessKeyId":"second","SecretAccessKey":"secret"}"#
+        )
+    }
+    checkThrows("AWS credential_process rejects malformed expiration metadata") {
+        _ = try AWSCredentialProcess.render(fields: [
+            AWSCredentialProcess.accessKeyID: "AKIA-SYNTHETIC",
+            AWSCredentialProcess.secretAccessKey: "aws-synthetic-secret",
+            AWSCredentialProcess.expiration: "not-a-time",
+        ])
+    }
+} catch {
+    check(false, "AWS credential_process format checks succeed (\(error))")
+}
+
+do {
+    let gitInput = Data("protocol=https\nhost=example.test\npath=org/repo.git\nusername=hint\n\n".utf8)
+    let request = try GitCredentialRequest(data: gitInput)
+    check(request.matches(protocol: "HTTPS", host: "EXAMPLE.TEST", path: "org/repo.git"),
+          "Git credential constraints bind protocol, host, and repository path")
+    check(!request.matches(protocol: "https", host: "other.test", path: "org/repo.git"),
+          "a Git credential request for another host does not match")
+    let output = try GitCredentialRequest.render(
+        username: "synthetic-user",
+        password: "synthetic-password"
+    )
+    check(String(data: output, encoding: .utf8)
+          == "username=synthetic-user\npassword=synthetic-password\n\n",
+          "Git helper output uses the exact line-oriented get response")
+    checkThrows("Git helper values cannot inject protocol attributes") {
+        _ = try GitCredentialRequest.render(username: nil, password: "secret\nquit=1")
+    }
+    checkThrows("ambiguous duplicate Git constraints are rejected") {
+        _ = try GitCredentialRequest(data: Data(
+            "protocol=https\nhost=one.test\nhost=two.test\n\n".utf8
+        ))
+    }
+} catch {
+    check(false, "Git credential-helper format checks succeed (\(error))")
+}
+
+check(InheritedFilePreset.pgpass.environmentName == "PGPASSFILE"
+      && InheritedFilePreset.kubeconfig.environmentName == "KUBECONFIG"
+      && InheritedFilePreset.awsSharedCredentials.environmentName
+        == "AWS_SHARED_CREDENTIALS_FILE"
+      && InheritedFilePreset.googleServiceAccount.environmentName
+        == "GOOGLE_APPLICATION_CREDENTIALS",
+      "inherited-fd presets map to the four tool-native path variables")
+check((try? InheritedFilePreset.kubeconfig.render("synthetic-kubeconfig"))
+      == Data("synthetic-kubeconfig".utf8),
+      "fd presets preserve the secret file bytes exactly")
+checkThrows("fd presets reject NUL-bearing file content") {
+    _ = try InheritedFilePreset.googleServiceAccount.render("{\"key\":\"bad\0value\"}")
+}
 
 print("\n# RiskPolicyV1 (preview, pure decisions)")
 
@@ -886,6 +1004,29 @@ check(highDecision.policyDigest == RiskPolicyV1.evaluate(RiskPolicyInput(
     plan: protectedHighPlan,
     now: policyNow
 )).policyDigest, "identical policy inputs yield a stable policy digest")
+
+let highSessionPlan = DeliveryPlan(
+    mechanism: .inheritedFileDescriptor,
+    executable: PlannedExecutable(
+        canonicalPath: "/usr/bin/security",
+        assurance: .independentlyProtected
+    ),
+    root: .registeredSession(id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+    descendantScope: .broadSession,
+    destination: .localDevelopment,
+    requestedTTLSeconds: 300,
+    operationContext: "broad high-risk session"
+)
+let highSessionDecision = RiskPolicyV1.evaluate(RiskPolicyInput(
+    credentialKey: "opaque-high-session",
+    storedLevel: .high,
+    evidence: [],
+    plan: highSessionPlan,
+    now: policyNow
+))
+check(!highSessionDecision.allowed
+      && highSessionDecision.denialReason == .descendantScopeTooBroad,
+      "high-risk credentials retain per-command roots instead of broad sessions")
 
 print("\n# RiskJudgmentStore (opaque metadata, in-memory backend)")
 

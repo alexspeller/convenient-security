@@ -94,6 +94,18 @@ await resolver.register(StaticProvider(values: [
     "op://demo/db/url-extended": "postgres://s3cr3t/extended",
     "op://demo/api/key": "sk-demo-123",
     "op://grant-policy/credential/token": "grant-policy-synthetic-token",
+    "op://session-tests/credential/token": "session-root-synthetic-token",
+    "op://secure-delivery/aws/access-key-id": "AKIA-CSEC-SYNTHETIC",
+    "op://secure-delivery/aws/secret-access-key": "aws-csec-synthetic-secret",
+    "op://secure-delivery/aws/session-token": "aws-csec-synthetic-session",
+    "op://secure-delivery/aws/bundle": "{\"AccessKeyId\":\"AKIA-CSEC-BUNDLE\",\"SecretAccessKey\":\"aws-csec-bundle-secret\"}",
+    "op://secure-delivery/git/username": "csec-synthetic-user",
+    "op://secure-delivery/git/password": "git-csec-synthetic-password",
+    "op://fd-presets/pgpass/content": "db.test:5432:*:csec:pgpass-synthetic-secret",
+    "op://fd-presets/kubeconfig/content": "apiVersion: v1\nkind: Config\nsynthetic: kube-secret",
+    "op://fd-presets/aws/content": "[default]\naws_access_key_id=AKIAFD\naws_secret_access_key=aws-fd-secret",
+    "op://fd-presets/google/content": "{\"type\":\"service_account\",\"private_key\":\"google-fd-secret\"}",
+    "op://fd-high/pgpass/content": "high-fd-synthetic-secret",
 ], counter: resolutionCounter))
 let nativeKeyBackend = InMemoryNativeStoreKeyBackend()
 let nativeFileBackend = InMemoryNativeStoreFileBackend()
@@ -132,6 +144,8 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.schemes()
     case .capabilities:
         return await agent.capabilities()
+    case let .beginSession(begin):
+        return await agent.beginSession(request: begin, caller: caller)
     case let .beginOutputRedaction(begin):
         return await agent.beginOutputRedaction(request: begin, caller: caller)
     case let .redactOutputChunk(chunk):
@@ -183,8 +197,11 @@ do {
           && capabilities.features.contains(.nativeEncryptedStore)
           && capabilities.features.contains(.riskPolicyV1)
           && capabilities.features.contains(.riskManagement)
-          && capabilities.features.contains(.nativeEditorPolicy),
-          "agent advertises delivery, redaction, native-store, and enforced risk-policy capabilities")
+          && capabilities.features.contains(.nativeEditorPolicy)
+          && capabilities.features.contains(.registeredSessionRoots)
+          && capabilities.features.contains(.credentialProtocols)
+          && capabilities.features.contains(.inheritedFileDescriptors),
+          "agent advertises delivery, redaction, native-store, risk-policy, and no-root capabilities")
 } catch {
     check(false, "protocol capability negotiation succeeds (\(error))")
 }
@@ -426,6 +443,77 @@ do {
           "unsigned/ad-hoc test code is explicitly unverified, not product code")
 } catch {
     check(false, "client access failed: \(error)")
+}
+
+do {
+    let sessionID = try client.beginSession()
+    let sessionPlan = DeliveryPlan(
+        mechanism: .directHeap,
+        executable: PlannedExecutable(
+            canonicalPath: URL(fileURLWithPath: CommandLine.arguments[0])
+                .standardizedFileURL.resolvingSymlinksInPath().path,
+            assurance: .userWritable
+        ),
+        root: .registeredSession(id: sessionID),
+        descendantScope: .broadSession,
+        destination: .localDevelopment,
+        requestedTTLSeconds: 300,
+        operationContext: "registered session ancestry test"
+    )
+    let values = try client.access(
+        references: ["op://session-tests/credential/token"],
+        reason: "registered session ancestry test",
+        ttlSeconds: 300,
+        deliveryPlan: sessionPlan
+    )
+    check(values["op://session-tests/credential/token"] == "session-root-synthetic-token",
+          "a live registered session roots access at its exact process incarnation")
+
+    let outsiderRequest = try AccessRequest(
+        references: ["op://session-tests/credential/token"],
+        reason: "copied session hint",
+        ttlSeconds: 300,
+        deliveryPlan: sessionPlan
+    )
+    let parentPID = getppid()
+    let outsiderResponse = await agent.handle(
+        request: outsiderRequest,
+        caller: CallerInfo(
+            pid: parentPID,
+            startTime: ProcessAncestry.startTime(of: parentPID) ?? 0,
+            description: "process outside registered subtree"
+        )
+    )
+    check(outsiderResponse.failure?.code == .invalidRequest,
+          "copying a session ID outside its kernel ancestry grants no authority")
+
+    let forgedPlan = DeliveryPlan(
+        mechanism: .directHeap,
+        executable: sessionPlan.executable,
+        root: .registeredSession(id: UUID().uuidString.lowercased()),
+        descendantScope: .broadSession,
+        destination: .localDevelopment,
+        requestedTTLSeconds: 300,
+        operationContext: "forged registered session"
+    )
+    let forgedRequest = try AccessRequest(
+        references: ["op://session-tests/credential/token"],
+        reason: "forged registered session",
+        ttlSeconds: 300,
+        deliveryPlan: forgedPlan
+    )
+    let forgedResponse = await agent.handle(
+        request: forgedRequest,
+        caller: CallerInfo(
+            pid: getpid(),
+            startTime: ProcessAncestry.startTime(of: getpid()) ?? 0,
+            description: "forged session caller"
+        )
+    )
+    check(forgedResponse.failure?.code == .invalidRequest,
+          "an unregistered opaque session ID is rejected before policy or resolution")
+} catch {
+    check(false, "registered-session ancestry checks succeed (\(error))")
 }
 
 // Reciprocal gate: a production server rejects this unsigned client before its
@@ -671,6 +759,40 @@ func runCsec(
     return (
         process.terminationStatus,
         process.terminationReason,
+        String(data: outData, encoding: .utf8) ?? "",
+        String(data: errData, encoding: .utf8) ?? ""
+    )
+}
+
+func runCsecWithInput(
+    _ arguments: [String],
+    input: Data,
+    extraEnv: [String: String] = [:]
+) -> (status: Int32, out: String, err: String) {
+    let process = Process()
+    process.executableURL = csecURL
+    process.arguments = arguments
+    var environment = ProcessInfo.processInfo.environment
+    environment["CSEC_SOCKET"] = socketPath
+    for (key, value) in extraEnv { environment[key] = value }
+    process.environment = environment
+    let inputPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
+    process.standardInput = inputPipe
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+    do {
+        try process.run()
+    } catch {
+        return (-1, "", "spawn failed: \(error)")
+    }
+    inputPipe.fileHandleForReading.closeFile()
+    inputPipe.fileHandleForWriting.write(input)
+    inputPipe.fileHandleForWriting.closeFile()
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return (
+        process.terminationStatus,
         String(data: outData, encoding: .utf8) ?? "",
         String(data: errData, encoding: .utf8) ?? ""
     )
@@ -925,6 +1047,249 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
               "--editor cancels and removes its plaintext workspace when the editor fails")
     } catch {
         check(false, "external-editor end-to-end checks run (\(error))")
+    }
+
+    let awsArguments = [
+        "creds", "aws",
+        "--access-key-id-ref", "op://secure-delivery/aws/access-key-id",
+        "--secret-access-key-ref", "op://secure-delivery/aws/secret-access-key",
+        "--session-token-ref", "op://secure-delivery/aws/session-token",
+        "--for", "60",
+    ]
+    let awsCredentials = runCsec(awsArguments, extraEnv: [:])
+    let awsObject = awsCredentials.out.data(using: .utf8).flatMap {
+        try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+    }
+    check(awsCredentials.status == 0
+          && awsObject?["Version"] as? Int == 1
+          && awsObject?["AccessKeyId"] as? String == "AKIA-CSEC-SYNTHETIC"
+          && awsObject?["SecretAccessKey"] as? String == "aws-csec-synthetic-secret"
+          && awsObject?["SessionToken"] as? String == "aws-csec-synthetic-session"
+          && !awsCredentials.err.contains("aws-csec-synthetic-secret"),
+          "csec creds aws emits only valid credential_process JSON over its private pipe")
+
+    let awsBundle = runCsec(
+        ["creds", "aws", "--item", "op://secure-delivery/aws/bundle", "--for", "60"],
+        extraEnv: [:]
+    )
+    let awsBundleObject = awsBundle.out.data(using: .utf8).flatMap {
+        try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+    }
+    check(awsBundle.status == 0
+          && awsBundleObject?["AccessKeyId"] as? String == "AKIA-CSEC-BUNDLE"
+          && awsBundleObject?["SecretAccessKey"] as? String == "aws-csec-bundle-secret",
+          "csec creds aws accepts one strict JSON bundle reference")
+
+    let consentBeforePerInvocationHelpers = await consent.calls()
+    let independentAWSA = runCsec(awsArguments, extraEnv: [:])
+    let independentAWSB = runCsec(awsArguments, extraEnv: [:])
+    let consentAfterPerInvocationHelpers = await consent.calls()
+    check(independentAWSA.status == 0 && independentAWSB.status == 0
+          && consentAfterPerInvocationHelpers == consentBeforePerInvocationHelpers + 2,
+          "credential helpers use exact per-invocation roots when no session is registered")
+
+    let innerAWSCommand = "\"$1\" creds aws "
+        + "--access-key-id-ref op://secure-delivery/aws/access-key-id "
+        + "--secret-access-key-ref op://secure-delivery/aws/secret-access-key "
+        + "--session-token-ref op://secure-delivery/aws/session-token --for 60; "
+        + "\"$1\" creds aws "
+        + "--access-key-id-ref op://secure-delivery/aws/access-key-id "
+        + "--secret-access-key-ref op://secure-delivery/aws/secret-access-key "
+        + "--session-token-ref op://secure-delivery/aws/session-token --for 60"
+    let consentBeforeSessionHelpers = await consent.calls()
+    let sessionAWS = runCsec(
+        ["session", "--", "/bin/sh", "-c", innerAWSCommand, "csec-session-e2e", csecURL.path],
+        extraEnv: [:]
+    )
+    let consentAfterSessionHelpers = await consent.calls()
+    let sessionDocuments = sessionAWS.out.split(separator: "\n").compactMap {
+        try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
+    }
+    check(sessionAWS.status == 0
+          && sessionDocuments.count == 2
+          && consentAfterSessionHelpers == consentBeforeSessionHelpers + 1,
+          "csec session prompts once while repeated descendant helpers reuse its kernel-verified root")
+
+    let staleSession = runCsec(
+        awsArguments,
+        extraEnv: [RegisteredSessionHint.environmentKey: UUID().uuidString.lowercased()]
+    )
+    check(staleSession.status == 1
+          && staleSession.out.isEmpty
+          && staleSession.err.contains("requested grant root does not match process ancestry"),
+          "a stale or copied session hint fails closed instead of falling back to a wider grant")
+
+    let gitArguments = [
+        "creds", "git", "--protocol", "https", "--host", "git.example.test",
+        "--path", "team/repository.git",
+        "--username-ref", "op://secure-delivery/git/username",
+        "--password-ref", "op://secure-delivery/git/password",
+        "--for", "60", "get",
+    ]
+    let gitInput = Data(
+        "protocol=https\nhost=git.example.test\npath=team/repository.git\n\n".utf8
+    )
+    let gitCredentials = runCsecWithInput(gitArguments, input: gitInput)
+    check(gitCredentials.status == 0
+          && gitCredentials.out
+            == "username=csec-synthetic-user\npassword=git-csec-synthetic-password\n\n"
+          && !gitCredentials.err.contains("git-csec-synthetic-password"),
+          "csec creds git implements the bounded get response for an exact host/repository")
+
+    let resolutionsBeforeGitMismatch = await resolutionCounter.calls()
+    let mismatchedGit = runCsecWithInput(
+        gitArguments,
+        input: Data("protocol=https\nhost=other.example.test\npath=team/repository.git\n\n".utf8)
+    )
+    let resolutionsAfterGitMismatch = await resolutionCounter.calls()
+    check(mismatchedGit.status == 0 && mismatchedGit.out.isEmpty
+          && resolutionsAfterGitMismatch == resolutionsBeforeGitMismatch,
+          "Git host mismatch returns no credential and performs no secret resolution")
+
+    let resolutionsBeforeGitStore = await resolutionCounter.calls()
+    let ignoredGitStore = runCsecWithInput(
+        Array(gitArguments.dropLast()) + ["store"],
+        input: Data(
+            "protocol=https\nhost=git.example.test\nusername=synthetic\npassword=do-not-store\n\n".utf8
+        )
+    )
+    let resolutionsAfterGitStore = await resolutionCounter.calls()
+    check(ignoredGitStore.status == 0 && ignoredGitStore.out.isEmpty
+          && resolutionsAfterGitStore == resolutionsBeforeGitStore,
+          "the read-only Git helper ignores store without persisting or resolving a value")
+
+    let presetArguments = [
+        "exec-fd", "--redact-output=never",
+        "--preset", "pgpass=op://fd-presets/pgpass/content",
+        "--preset", "kubeconfig=op://fd-presets/kubeconfig/content",
+        "--preset", "aws-shared-credentials=op://fd-presets/aws/content",
+        "--preset", "google-service-account=op://fd-presets/google/content",
+        "--", "/bin/sh", "-c",
+        "case \"$PGPASSFILE:$KUBECONFIG:$AWS_SHARED_CREDENTIALS_FILE:$GOOGLE_APPLICATION_CREDENTIALS\" in "
+            + "*:/dev/fd/6[4-9]:/dev/fd/6[4-9]:/dev/fd/6[4-9]) ;; *) exit 81;; esac; "
+            + "test \"$PGPASSFILE\" != \"$KUBECONFIG\" && "
+            + "test \"$KUBECONFIG\" != \"$AWS_SHARED_CREDENTIALS_FILE\" && "
+            + "test \"$AWS_SHARED_CREDENTIALS_FILE\" != \"$GOOGLE_APPLICATION_CREDENTIALS\" || exit 82; "
+            + "p=$(cat \"$PGPASSFILE\") && k=$(cat \"$KUBECONFIG\") && "
+            + "a=$(cat \"$AWS_SHARED_CREDENTIALS_FILE\") && g=$(cat \"$GOOGLE_APPLICATION_CREDENTIALS\") || exit 83; "
+            + "metadata=$(/bin/ps eww -p $$; /usr/bin/env); "
+            + "case \"$metadata\" in *\"$p\"*|*\"$k\"*|*\"$a\"*|*\"$g\"*) exit 84;; esac; "
+            + "printf '%s\\n--\\n%s\\n--\\n%s\\n--\\n%s' \"$p\" \"$k\" \"$a\" \"$g\"",
+    ]
+    let directoryBeforeFD = Set(
+        (try? FileManager.default.contentsOfDirectory(atPath: FileManager.default.currentDirectoryPath)) ?? []
+    )
+    let presetDelivery = runCsec(presetArguments, extraEnv: [:])
+    let directoryAfterFD = Set(
+        (try? FileManager.default.contentsOfDirectory(atPath: FileManager.default.currentDirectoryPath)) ?? []
+    )
+    check(presetDelivery.status == 0
+          && presetDelivery.out.contains("pgpass-synthetic-secret")
+          && presetDelivery.out.contains("synthetic: kube-secret")
+          && presetDelivery.out.contains("aws_secret_access_key=aws-fd-secret")
+          && presetDelivery.out.contains("google-fd-secret")
+          && !presetDelivery.err.contains("pgpass-synthetic-secret")
+          && directoryAfterFD == directoryBeforeFD,
+          "all fd presets deliver exact bytes through distinct /dev/fd paths without argv, env, or files")
+
+    let genericFD = runCsec(
+        [
+            "exec-fd", "--redact-output=never",
+            "--fd", "TOOL_CONFIG=op://fd-presets/google/content",
+            "--", "/bin/sh", "-c", "/bin/cat \"$TOOL_CONFIG\"",
+        ],
+        extraEnv: [:]
+    )
+    check(genericFD.status == 0
+          && genericFD.out == "{\"type\":\"service_account\",\"private_key\":\"google-fd-secret\"}"
+          && !genericFD.err.contains("google-fd-secret"),
+          "generic --fd maps an exact reference payload to a caller-selected path variable")
+
+    do {
+        _ = try client.risk(
+            .classify,
+            reference: "op://fd-high/pgpass/content",
+            level: .high
+        )
+        let consentBeforeHighFD = await consent.calls()
+        let highSessionFD = runCsec(
+            [
+                "session", "--", csecURL.path,
+                "exec-fd", "--redact-output=never",
+                "--preset", "pgpass=op://fd-high/pgpass/content",
+                "--", "/bin/cat", "/dev/fd/64",
+            ],
+            extraEnv: [:]
+        )
+        let consentAfterHighFD = await consent.calls()
+        check(highSessionFD.status == 0
+              && highSessionFD.out == "high-fd-synthetic-secret"
+              && consentAfterHighFD == consentBeforeHighFD + 1,
+              "high-risk delivery inside a session falls back to an exact per-command root")
+    } catch {
+        check(false, "high-risk session fallback can be prepared (\(error))")
+    }
+
+    let redactedFD = runCsec(
+        [
+            "exec-fd", "--redact-output=always",
+            "--preset", "pgpass=op://fd-presets/pgpass/content",
+            "--", "/bin/cat", "$PGPASSFILE",
+        ],
+        extraEnv: [:]
+    )
+    // There is intentionally no shell expansion in exec-fd. Use a shell only
+    // in the positive check so the target reads the non-secret environment path.
+    let redactedFDViaShell = runCsec(
+        [
+            "exec-fd", "--redact-output=always",
+            "--preset", "pgpass=op://fd-presets/pgpass/content",
+            "--", "/bin/sh", "-c", "/bin/cat \"$PGPASSFILE\"",
+        ],
+        extraEnv: [:]
+    )
+    check(redactedFD.status != 0
+          && redactedFDViaShell.status == 0
+          && redactedFDViaShell.out == "[csec:secret-1]"
+          && !redactedFDViaShell.out.contains("pgpass-synthetic-secret")
+          && !redactedFDViaShell.err.contains("pgpass-synthetic-secret"),
+          "exec-fd keeps argv literal and masks a child that deliberately prints the delivered file")
+
+    let fdProbe = Process()
+    fdProbe.executableURL = csecURL
+    fdProbe.arguments = [
+        "exec-fd", "--redact-output=never",
+        "--preset", "pgpass=op://fd-presets/pgpass/content",
+        "--", "/bin/sh", "-c",
+        "printf '%s\\n' \"$PGPASSFILE\"; /bin/sleep 1; /bin/cat \"$PGPASSFILE\" >/dev/null",
+    ]
+    var fdProbeEnvironment = ProcessInfo.processInfo.environment
+    fdProbeEnvironment["CSEC_SOCKET"] = socketPath
+    fdProbe.environment = fdProbeEnvironment
+    let fdProbeOut = Pipe(), fdProbeErr = Pipe()
+    fdProbe.standardOutput = fdProbeOut
+    fdProbe.standardError = fdProbeErr
+    do {
+        try fdProbe.run()
+        var pathData = Data()
+        while pathData.count < 128 {
+            let byte = fdProbeOut.fileHandleForReading.readData(ofLength: 1)
+            if byte.isEmpty || byte.first == 0x0a { break }
+            pathData.append(byte)
+        }
+        let inheritedPath = String(data: pathData, encoding: .utf8) ?? ""
+        let unrelated = runProgram(executable: "/usr/bin/stat", arguments: [inheritedPath])
+        _ = fdProbeOut.fileHandleForReading.readDataToEndOfFile()
+        let fdProbeError = fdProbeErr.fileHandleForReading.readDataToEndOfFile()
+        fdProbe.waitUntilExit()
+        check(inheritedPath.hasPrefix("/dev/fd/6")
+              && unrelated.status != 0
+              && unrelated.out.isEmpty
+              && fdProbe.terminationStatus == 0
+              && !String(data: fdProbeError, encoding: .utf8)!.contains("pgpass-synthetic-secret"),
+              "an unrelated same-UID process cannot address or inspect the child's inherited fd")
+    } catch {
+        check(false, "unrelated-process inherited-fd probe runs (\(error))")
     }
 
     let resolutionsBeforePipedGet = await resolutionCounter.calls()

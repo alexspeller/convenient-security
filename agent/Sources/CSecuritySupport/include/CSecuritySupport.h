@@ -69,8 +69,11 @@ typedef enum {
 
 /// Spawn an executable in a new process group with an exact caller-supplied
 /// environment. Captured streams are returned as parent-side read fds; PTY
-/// streams share `pty_master_fd`. No secret is installed into the supervisor's
-/// own environment.
+/// streams share `pty_master_fd`. `inherited_fds` names already-open descriptors
+/// whose close-on-exec flag is cleared in the child only. The function returns
+/// success only after the kernel has replaced the child image with `execve`, so
+/// the parent can begin writing inherited secret pipes after the target exists.
+/// No secret is installed into the supervisor's own environment.
 int32_t cs_spawn_supervised(
     const char *executable_path,
     char *const argv[],
@@ -78,6 +81,8 @@ int32_t cs_spawn_supervised(
     int32_t stdin_uses_pty,
     cs_output_mode stdout_mode,
     cs_output_mode stderr_mode,
+    const int32_t *inherited_fds,
+    int32_t inherited_fd_count,
     int32_t *child_pid,
     int32_t *pty_master_fd,
     int32_t *stdout_read_fd,

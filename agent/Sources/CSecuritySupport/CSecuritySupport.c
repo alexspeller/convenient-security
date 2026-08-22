@@ -19,6 +19,12 @@
 
 static int cs_set_cloexec(int fd);
 
+static int cs_clear_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
+}
+
 static int cs_disable_sigpipe(int fd) {
     int enabled = 1;
     return setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
@@ -261,6 +267,8 @@ int32_t cs_spawn_supervised(
     int32_t stdin_uses_pty,
     cs_output_mode stdout_mode,
     cs_output_mode stderr_mode,
+    const int32_t *inherited_fds,
+    int32_t inherited_fd_count,
     int32_t *child_pid,
     int32_t *pty_master_fd,
     int32_t *stdout_read_fd,
@@ -269,6 +277,8 @@ int32_t cs_spawn_supervised(
     if (executable_path == NULL || argv == NULL || envp == NULL
             || child_pid == NULL || pty_master_fd == NULL
             || stdout_read_fd == NULL || stderr_read_fd == NULL
+            || inherited_fd_count < 0 || inherited_fd_count > 32
+            || (inherited_fd_count > 0 && inherited_fds == NULL)
             || (stdout_mode != CS_OUTPUT_INHERIT && stdout_mode != CS_OUTPUT_PIPE
                 && stdout_mode != CS_OUTPUT_PTY)
             || (stderr_mode != CS_OUTPUT_INHERIT && stderr_mode != CS_OUTPUT_PIPE
@@ -277,6 +287,18 @@ int32_t cs_spawn_supervised(
         return -1;
     }
     if (cs_ensure_standard_fds() != 0) return -1;
+    for (int32_t i = 0; i < inherited_fd_count; i++) {
+        if (inherited_fds[i] <= STDERR_FILENO || fcntl(inherited_fds[i], F_GETFD) < 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        for (int32_t j = 0; j < i; j++) {
+            if (inherited_fds[i] == inherited_fds[j]) {
+                errno = EINVAL;
+                return -1;
+            }
+        }
+    }
 
     *child_pid = -1;
     *pty_master_fd = -1;
@@ -286,6 +308,7 @@ int32_t cs_spawn_supervised(
     int pty_master = -1, pty_slave = -1;
     int stdout_pipe[2] = {-1, -1};
     int stderr_pipe[2] = {-1, -1};
+    int exec_status_pipe[2] = {-1, -1};
     int needs_pty = stdin_uses_pty || stdout_mode == CS_OUTPUT_PTY
         || stderr_mode == CS_OUTPUT_PTY;
 
@@ -308,22 +331,23 @@ int32_t cs_spawn_supervised(
     }
     if (stdout_mode == CS_OUTPUT_PIPE && cs_make_pipe(stdout_pipe, 0) != 0) goto fail;
     if (stderr_mode == CS_OUTPUT_PIPE && cs_make_pipe(stderr_pipe, 0) != 0) goto fail;
+    if (cs_make_pipe(exec_status_pipe, 0) != 0) goto fail;
 
     pid_t pid = fork();
     if (pid < 0) goto fail;
     if (pid == 0) {
         if (needs_pty) {
             if (setsid() < 0 || ioctl(pty_slave, TIOCSCTTY, 0) < 0
-                    || tcsetpgrp(pty_slave, getpgrp()) < 0) _exit(126);
+                    || tcsetpgrp(pty_slave, getpgrp()) < 0) goto child_fail;
         } else if (setpgid(0, 0) != 0) {
-            _exit(126);
+            goto child_fail;
         }
 
-        if (stdin_uses_pty && dup2(pty_slave, STDIN_FILENO) < 0) _exit(126);
-        if (stdout_mode == CS_OUTPUT_PTY && dup2(pty_slave, STDOUT_FILENO) < 0) _exit(126);
-        if (stdout_mode == CS_OUTPUT_PIPE && dup2(stdout_pipe[1], STDOUT_FILENO) < 0) _exit(126);
-        if (stderr_mode == CS_OUTPUT_PTY && dup2(pty_slave, STDERR_FILENO) < 0) _exit(126);
-        if (stderr_mode == CS_OUTPUT_PIPE && dup2(stderr_pipe[1], STDERR_FILENO) < 0) _exit(126);
+        if (stdin_uses_pty && dup2(pty_slave, STDIN_FILENO) < 0) goto child_fail;
+        if (stdout_mode == CS_OUTPUT_PTY && dup2(pty_slave, STDOUT_FILENO) < 0) goto child_fail;
+        if (stdout_mode == CS_OUTPUT_PIPE && dup2(stdout_pipe[1], STDOUT_FILENO) < 0) goto child_fail;
+        if (stderr_mode == CS_OUTPUT_PTY && dup2(pty_slave, STDERR_FILENO) < 0) goto child_fail;
+        if (stderr_mode == CS_OUTPUT_PIPE && dup2(stderr_pipe[1], STDERR_FILENO) < 0) goto child_fail;
 
         cs_close_if_open(pty_master);
         cs_close_if_open(pty_slave);
@@ -331,18 +355,53 @@ int32_t cs_spawn_supervised(
         cs_close_if_open(stdout_pipe[1]);
         cs_close_if_open(stderr_pipe[0]);
         cs_close_if_open(stderr_pipe[1]);
+        cs_close_if_open(exec_status_pipe[0]);
+
+        for (int32_t i = 0; i < inherited_fd_count; i++) {
+            if (cs_clear_cloexec(inherited_fds[i]) != 0) goto child_fail;
+        }
 
         execve(executable_path, argv, envp);
         int exec_errno = errno;
         static const char message[] = "csec exec: target exec failed\n";
         (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+        (void)write(exec_status_pipe[1], &exec_errno, sizeof(exec_errno));
         _exit(exec_errno == ENOENT ? 127 : 126);
+
+child_fail: {
+            int child_errno = errno == 0 ? EIO : errno;
+            (void)write(exec_status_pipe[1], &child_errno, sizeof(child_errno));
+            _exit(126);
+        }
     }
 
     if (!needs_pty) (void)setpgid(pid, pid);
+    cs_close_if_open(exec_status_pipe[1]);
+    exec_status_pipe[1] = -1;
     cs_close_if_open(pty_slave);
+    pty_slave = -1;
     cs_close_if_open(stdout_pipe[1]);
+    stdout_pipe[1] = -1;
     cs_close_if_open(stderr_pipe[1]);
+    stderr_pipe[1] = -1;
+
+    int exec_errno = 0;
+    ssize_t exec_status;
+    do {
+        exec_status = read(exec_status_pipe[0], &exec_errno, sizeof(exec_errno));
+    } while (exec_status < 0 && errno == EINTR);
+    cs_close_if_open(exec_status_pipe[0]);
+    exec_status_pipe[0] = -1;
+    if (exec_status != 0) {
+        int saved_errno = exec_status == (ssize_t)sizeof(exec_errno) ? exec_errno : EIO;
+        (void)kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        cs_close_if_open(pty_master);
+        cs_close_if_open(stdout_pipe[0]);
+        cs_close_if_open(stderr_pipe[0]);
+        errno = saved_errno;
+        return -1;
+    }
 
     *child_pid = (int32_t)pid;
     *pty_master_fd = (int32_t)pty_master;
@@ -358,6 +417,8 @@ fail: {
         cs_close_if_open(stdout_pipe[1]);
         cs_close_if_open(stderr_pipe[0]);
         cs_close_if_open(stderr_pipe[1]);
+        cs_close_if_open(exec_status_pipe[0]);
+        cs_close_if_open(exec_status_pipe[1]);
         errno = saved_errno;
         return -1;
     }

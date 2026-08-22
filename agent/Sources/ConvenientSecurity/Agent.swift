@@ -49,9 +49,16 @@ public actor Agent {
         var lastUsedAt: Date
     }
 
+    private struct RegisteredSession: Sendable {
+        let rootPID: pid_t
+        let rootStartTime: UInt64
+        let auditSessionID: UInt32?
+    }
+
     private static let maximumOutputChunkBytes = 64 * 1024
     private static let maximumRedactionSessions = 32
     private static let redactionSessionIdleSeconds: TimeInterval = 5 * 60
+    private static let maximumRegisteredSessions = 64
 
     private let resolver: SecretResolver
     private let grants: GrantTable
@@ -65,6 +72,7 @@ public actor Agent {
     private var redactionSessions: [String: RedactionSession] = [:]
     private var knownReferencesByCredentialKey: [String: Set<String>] = [:]
     private var nativeEditAuthorizations: [String: NativeEditAuthorization] = [:]
+    private var registeredSessions: [String: RegisteredSession] = [:]
 
     public init(
         resolver: SecretResolver,
@@ -134,7 +142,8 @@ public actor Agent {
                     requestID: requestID
                 )
             }
-            guard let verifiedRoot = Self.verifyRoot(deliveryPlan.root, caller: caller) else {
+            pruneRegisteredSessions()
+            guard let verifiedRoot = verifyRoot(deliveryPlan.root, caller: caller) else {
                 return .failed(
                     .invalidRequest,
                     message: "the requested grant root does not match process ancestry",
@@ -148,6 +157,19 @@ public actor Agent {
                     return .failed(
                         .invalidRequest,
                         message: "the planned executable does not match the verified parent",
+                        requestID: requestID
+                    )
+                }
+            }
+            if deliveryPlan.mechanism == .credentialProtocol {
+                guard let parentPID = ProcessAncestry.parent(of: caller.pid),
+                      parentPID > 1,
+                      ProcessAncestry.executablePath(of: parentPID)
+                        == URL(fileURLWithPath: deliveryPlan.executable.canonicalPath)
+                            .standardizedFileURL.resolvingSymlinksInPath().path else {
+                    return .failed(
+                        .invalidRequest,
+                        message: "the credential consumer does not match the verified parent",
                         requestID: requestID
                     )
                 }
@@ -829,8 +851,14 @@ public actor Agent {
         let weak = plan.mechanism.isWeakCompatibility
             ? "; weak compatibility accepted"
             : ""
+        let root = if case .registeredSession = plan.root {
+            "registered session"
+        } else {
+            "per-command"
+        }
         return "risk \(levels); delivery \(plan.mechanism.rawValue); "
-            + "scope \(plan.descendantScope.rawValue); destination \(plan.destination.rawValue)\(weak)"
+            + "root \(root); scope \(plan.descendantScope.rawValue); "
+            + "destination \(plan.destination.rawValue)\(weak)"
     }
 
     public func beginOutputRedaction(
@@ -1341,6 +1369,46 @@ public actor Agent {
         return Response(capabilities: ProtocolCapabilities(features: features))
     }
 
+    /// Register the authenticated launcher's current process incarnation. A
+    /// descendant can later name the opaque ID, but access succeeds only when
+    /// a fresh kernel ancestry walk reaches this exact PID/start-time pair.
+    public func beginSession(
+        request: BeginSessionRequest,
+        caller: CallerInfo
+    ) -> Response {
+        guard UUID(uuidString: request.requestID) != nil,
+              caller.pid > 1,
+              caller.startTime > 0,
+              isVerifiedLauncher(caller),
+              ProcessAncestry.startTime(of: caller.pid) == caller.startTime else {
+            return .failed(
+                .unverifiedPeer,
+                message: "a live verified launcher is required to register a session",
+                requestID: request.requestID
+            )
+        }
+
+        pruneRegisteredSessions()
+        registeredSessions = registeredSessions.filter {
+            $0.value.rootPID != caller.pid || $0.value.rootStartTime != caller.startTime
+        }
+        guard registeredSessions.count < Self.maximumRegisteredSessions else {
+            return .failed(
+                .policyDenied,
+                message: "too many registered sessions are active",
+                requestID: request.requestID
+            )
+        }
+
+        let sessionID = UUID().uuidString.lowercased()
+        registeredSessions[sessionID] = RegisteredSession(
+            rootPID: caller.pid,
+            rootStartTime: caller.startTime,
+            auditSessionID: caller.peerIdentity?.audit.auditSessionID
+        )
+        return Response(requestID: request.requestID, registeredSessionID: sessionID)
+    }
+
     private func isVerifiedLauncher(_ caller: CallerInfo) -> Bool {
         allowUnverifiedPlansForTesting || caller.peerIdentity?.code.role == .launcher
     }
@@ -1400,7 +1468,7 @@ public actor Agent {
         redactionSessions = redactionSessions.filter { $0.value.lastUsedAt > cutoff }
     }
 
-    private static func verifyRoot(
+    private func verifyRoot(
         _ root: DeliveryRoot,
         caller: CallerInfo
     ) -> (pid: pid_t, startTime: UInt64)? {
@@ -1414,6 +1482,24 @@ public actor Agent {
                   ProcessAncestry.parent(of: caller.pid) == pid,
                   ProcessAncestry.startTime(of: pid) == startTime else { return nil }
             return (pid, startTime)
+        case let .registeredSession(id):
+            guard let canonicalID = UUID(uuidString: id)?.uuidString.lowercased(),
+                  canonicalID == id.lowercased(),
+                  let session = registeredSessions[canonicalID],
+                  session.auditSessionID == nil
+                    || caller.peerIdentity?.audit.auditSessionID == session.auditSessionID,
+                  ProcessAncestry.descends(
+                    caller.pid,
+                    from: session.rootPID,
+                    rootStartTime: session.rootStartTime
+                  ) else { return nil }
+            return (session.rootPID, session.rootStartTime)
+        }
+    }
+
+    private func pruneRegisteredSessions() {
+        registeredSessions = registeredSessions.filter {
+            ProcessAncestry.startTime(of: $0.value.rootPID) == $0.value.rootStartTime
         }
     }
 
@@ -1425,6 +1511,7 @@ public actor Agent {
             && !plan.operationContext.isEmpty
             && plan.operationContext.utf8.count <= 512
             && !plan.operationContext.utf8.contains(0)
+            && hasValidRootScope(plan)
             && (plan.commandDigest.map(isSHA256Digest) ?? true)
             && hasValidOutputGuard(plan)
             && (executable.signingIdentifier.map {
@@ -1436,6 +1523,15 @@ public actor Agent {
             && (executable.cdHash.map {
                 !$0.isEmpty && $0.utf8.count <= 128 && $0.utf8.allSatisfy(isLowerHex)
             } ?? true)
+    }
+
+    private static func hasValidRootScope(_ plan: DeliveryPlan) -> Bool {
+        switch plan.root {
+        case .registeredSession:
+            return plan.descendantScope == .broadSession
+        case .caller, .directParent:
+            return plan.descendantScope != .broadSession
+        }
     }
 
     private static func hasValidNativeEditorMetadata(
