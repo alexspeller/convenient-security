@@ -51,6 +51,29 @@ This limits which values the agent releases; it does not make every descendant
 trustworthy. A process deliberately launched inside an approved subtree is part
 of the authorized consumer boundary.
 
+### Risk policy and stale authorization
+
+Before it consults a plaintext cache or provider, the daemon groups each
+reference into a logical credential, loads only opaque value-free judgment
+metadata, and evaluates the complete delivery plan. Unknown credentials require
+classification in a daemon-owned window. Weak compatibility acceptance is a
+separate decision. The selected risk, delivery, scope, destination, consumer
+assurance, and policy-capped duration are summarized again in the OS Touch ID
+prompt before any new choice is persisted.
+
+Every grant is bound to the delivery-plan digest and the exact effective-risk,
+policy-version, policy-decision, and output-policy snapshot. A raised or
+forgotten classification revokes matching grants, known cache entries, and open
+native edit sessions. Reuse recomputes the binding; expired metadata and a policy
+version change fail closed. Protocol-v1 access is recognized only to return
+`upgrade_required`, so an older or hand-written client cannot omit a plan to
+select the legacy authorization path.
+
+This policy rejects a weak delivery; it cannot turn an allowed environment,
+named-file, raw-output, or authorized-consumer path into a confidentiality
+boundary. The production Keychain stores HMAC-derived logical identifiers and
+value-free metadata, not raw references or values.
+
 ### Ruby heap delivery
 
 Pure Ruby does not trust the agent socket. It invokes the fixed root-owned
@@ -105,9 +128,9 @@ permission changes remain denial of service.
 
 `csec edit` releases the whole decrypted document only to the mutually
 authenticated signed launcher after separate fresh Touch ID consent. The edit
-session is bound to that launcher's kernel PID/start time, expires after 30
-minutes, and rejects stale concurrent saves. The default built-in AppKit editor
-creates no named plaintext file and disables automatic spelling, replacement,
+session is bound to that launcher's kernel PID/start time, expires at the
+risk-policy cap (at most 30 minutes), and rejects stale concurrent saves. The
+default built-in AppKit editor creates no named plaintext file and disables automatic spelling, replacement,
 data detection, and window restoration. Plaintext nevertheless exists in
 launcher and AppKit memory. User-initiated copying, screenshots, input methods,
 accessibility/screen-capture authority, and compromise of the authorized UI
@@ -124,6 +147,13 @@ by csec's output masker. No implicit shell evaluates `$EDITOR`, but a user can
 explicitly select a shell or an editor argument with its own effects. This mode
 warns before biometric consent and should be used only when its editor
 functionality is worth the edit-window exposure.
+
+The named-file mode is available for low risk, separately reviewable for
+standard risk, and forbidden for high/critical stores. Its actual editor path is
+bound before review. The built-in signed editor is treated as a verified-product
+heap consumer; high and critical policy shortens its session. Commit revalidates
+the policy binding, so a risk change cannot leave an earlier edit authorization
+usable.
 
 There is no key export or recovery path; loss of the Mac or Keychain record is
 permanent data loss.
@@ -147,8 +177,8 @@ signed launcher.
 ## Explicitly exposed interfaces
 
 - `csec exec` places plaintext in the child's initial environment. Output
-  masking does not make that environment private. Risk-policy source exists but
-  is not enforced by the shipping request handler.
+  masking does not make that environment private. Policy allows this for low
+  risk and by separate acceptance for standard risk; high/critical are rejected.
 - `csec get` prints plaintext to standard output.
 - The Ruby client returns an ordinary mutable `String` to application code.
 - Claude Code and Codex hook fragments are opt-in user configuration and cover

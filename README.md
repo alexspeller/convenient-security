@@ -49,6 +49,10 @@ rest and in use — as small as macOS allows.
   its child processes (its "subtree") for a bounded lifetime, so a `rails server`
   and the migrations it spawns don't re-prompt you every few seconds — but an
   unrelated process gets nothing.
+- **Risk-aware release.** On first use, an agent-owned window asks you to classify
+  the logical credential as low, standard, high, or critical and reviews the
+  proposed delivery. The agent applies that policy before reading a cache or
+  provider, and binds every live grant to the resulting policy snapshot.
 - **Delivery straight to the heap, not the environment.** The integrated Ruby
   client receives values over a private pipe into its own process memory, which
   another same-user process can't read on a hardened Mac. Plaintext never touches
@@ -69,6 +73,7 @@ switched on.
 |--------|---------------|
 | Malware reads secrets from your environment / `argv` | Values are delivered to the consumer's heap over a private pipe, not injected into the environment (for the integrated Ruby client). |
 | Malware asks a broker for your whole vault | The agent releases only references a human just approved with Touch ID, scoped to the approving process subtree. |
+| An old client or stale grant asks for a now-forbidden delivery | Protocol v1 fails closed; protocol v2 is evaluated against current risk metadata before resolution, and grants are reusable only with the same plan and policy digest. |
 | Malware reads your encrypted files off disk | Files are AES-256-GCM envelopes; the keys live in a Keychain group only the signed, provisioned agent can access, gated by the Secure Enclave. |
 | Malware tampers with or rolls back an encrypted file | Each store's Keychain record pins the current generation, file ID, and ciphertext digest, so modification, cross-store swaps, and replay of an old file fail closed. |
 | A secret leaks into stdout that an AI tool then reads | Optional output redaction masks resolved values from supervised stdout/stderr and from Claude Code / Codex Bash tool calls. |
@@ -122,7 +127,40 @@ BUGSNAG_TOKEN='csec://development/BUGSNAG_TOKEN' \
 ```
 
 One Touch ID prompt covers `rails` and every process it spawns for the grant's
-lifetime.
+lifetime. Because this delivery is readable by unrelated same-UID processes, it
+is allowed for low-risk credentials and requires a separate, time-bounded
+compatibility acceptance for standard-risk credentials. It is forbidden for
+high and critical credentials.
+
+### Classify delivery risk
+
+The first access to a logical credential opens a trusted, value-free review in
+`csecd`. For 1Password, fields under the same vault/item are grouped together;
+for the native store, all keys in one store share a judgment. Unknown credentials
+fail closed until you choose a level:
+
+| Level | Current policy |
+|-------|----------------|
+| `low` | Up to 12 hours; compatibility environment and external-editor delivery are allowed. |
+| `standard` | Up to 4 hours; weaker environment or named-file delivery needs a separately reviewed acceptance. |
+| `high` | Up to 15 minutes; weak delivery and AI destinations are forbidden, and the complete consumer must have stronger assurance. |
+| `critical` | Up to 5 minutes; exact-process scope and the narrowest delivery/consumer set are required. |
+
+Inspect or change policy metadata without resolving the secret value:
+
+```sh
+csec risk inspect 'op://Engineering/Postgres/url'
+csec risk classify standard 'op://Engineering/Postgres/url'
+csec risk raise high 'csec://production-admin/*'
+csec risk forget 'op://Engineering/Postgres/url'
+```
+
+`raise` cannot lower a classification. Lowering one with `classify`, or
+forgetting it back to fail-safe unknown, requires Touch ID. Risk records contain
+only HMAC-derived logical identities and value-free metadata. With the delivery
+mechanisms currently shipped, a high or critical classification intentionally
+blocks normal Ruby, raw-output, and environment access; those generic consumers
+cannot claim the stronger assurance the policy requires.
 
 ### Deliver secrets to a Ruby app without touching the environment
 
@@ -181,6 +219,11 @@ If you need an editor feature the built-in one lacks, you can opt into your own
 ```sh
 EDITOR='code --wait' csec edit --editor development
 ```
+
+The actual editor executable is included in the reviewed plan. External editing
+is allowed for low risk, requires separate compatibility acceptance for standard
+risk, and is forbidden for high and critical stores. The built-in editor remains
+available with policy-capped sessions (15 minutes for high and 5 for critical).
 
 ## Keeping secrets out of AI tool output
 

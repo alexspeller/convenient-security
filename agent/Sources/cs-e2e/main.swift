@@ -93,6 +93,7 @@ await resolver.register(StaticProvider(values: [
     "op://demo/db/url": "postgres://s3cr3t",
     "op://demo/db/url-extended": "postgres://s3cr3t/extended",
     "op://demo/api/key": "sk-demo-123",
+    "op://grant-policy/credential/token": "grant-policy-synthetic-token",
 ], counter: resolutionCounter))
 let nativeKeyBackend = InMemoryNativeStoreKeyBackend()
 let nativeFileBackend = InMemoryNativeStoreFileBackend()
@@ -478,6 +479,40 @@ do {
           "both the already-granted and the newly-granted reference resolve")
 } catch {
     check(false, "consent-delta access failed: \(error)")
+}
+
+// A risk change must take effect against a grant that is already live. The
+// second request uses the identical reference and delivery plan; it may not
+// reuse the earlier low-risk grant after the logical credential is raised.
+do {
+    let reference = "op://grant-policy/credential/token"
+    let initial = try client.access(
+        references: [reference],
+        reason: "create a low-risk live grant",
+        ttlSeconds: 3600
+    )
+    check(initial[reference] == "grant-policy-synthetic-token",
+          "a low-risk reference receives an initial live grant")
+
+    _ = try client.risk(.raise, reference: reference, level: .high)
+    let resolutionsBeforeRetry = await resolutionCounter.calls()
+    let consentBeforeRetry = await consent.calls()
+    do {
+        _ = try client.access(
+            references: [reference],
+            reason: "stale grant must not bypass raised risk",
+            ttlSeconds: 3600
+        )
+        check(false, "a stale low-risk grant cannot survive a risk raise")
+    } catch AgentClient.ClientError.protocolFailure(.policyDenied, _) {
+        let resolutionsAfterRetry = await resolutionCounter.calls()
+        let consentAfterRetry = await consent.calls()
+        check(resolutionsAfterRetry == resolutionsBeforeRetry
+              && consentAfterRetry == consentBeforeRetry,
+              "a raised risk level invalidates a live grant before biometric or resolution")
+    }
+} catch {
+    check(false, "live-grant risk-raise checks succeed (\(error))")
 }
 
 // Native provider management stays on the same mutually authenticated socket,

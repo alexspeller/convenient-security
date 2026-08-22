@@ -11,7 +11,8 @@ Convenient Security protects secret values from unrelated, non-root processes
 running as the same login user. It provides per-reference Touch ID consent,
 process-scoped grants, a code-identity-gated at-rest cache, heap delivery for an
 integrated Ruby client, an environment compatibility launcher, and exact-value
-output redaction. It can resolve from the official 1Password CLI and from
+output redaction. A value-free risk policy gates each delivery before provider or
+cache resolution. It can resolve from the official 1Password CLI and from
 device-bound native encrypted files.
 
 It does not protect a value from root, from code already executing inside an
@@ -57,8 +58,9 @@ value-free failures, and a canonical digest of the delivery plan. See
 ## Grant model
 
 A grant is held only in `csecd` memory. It records a root PID and process start
-time, the approved references, reason, expiry, and the originating protocol-v2
-delivery binding.
+time, the approved references, reason, expiry, the originating protocol-v2
+delivery binding, and the credential's effective risk level, policy version,
+policy-decision digest, and output policy.
 
 The daemon obtains the caller PID from the kernel rather than JSON. A grant is
 usable only when kernel parent traversal reaches the recorded root with the same
@@ -66,19 +68,30 @@ start time, which prevents PID reuse from reviving it. References already
 covered by a compatible live grant are returned without another prompt. Adding
 a reference prompts for the delta and then expands the grant. Grants expire by
 TTL and disappear when the daemon exits; orphaned descendants no longer satisfy
-the ancestry check.
+the ancestry check. Reuse also requires the current delivery-plan and policy
+bindings to match exactly. A risk change revokes affected grants and resolver
+entries; a policy-version change invalidates grants created under the old table.
 
 The subtree model intentionally gives descendants of an approved root access to
 the same granted references. Code running inside that subtree is therefore part
 of the trusted consumer boundary.
 
-## Consent
+## Policy review and consent
 
-The production daemon creates a fresh `LAContext` for every request that adds
-references and evaluates Touch ID without password fallback. The localized
-reason shown by macOS includes the requesting process description, exact new
-references, caller-supplied purpose, and duration. Dynamic text is bounded and
-control, newline, and bidirectional-formatting characters are neutralized.
+Before Touch ID, the production daemon owns an AppKit policy-review window. It
+contains no values: it shows the logical credential references, stored risk,
+delivery mechanism, actual planned executable, consumer assurance, destination,
+scope, and requested duration. A newly observed logical credential must be
+classified as low, standard, high, or critical. Acceptance of a weak
+compatibility delivery is a separate, initially unchecked decision rather than
+part of the classification.
+
+After an allowed review, the daemon creates a fresh `LAContext` and evaluates
+Touch ID without password fallback. The localized reason shown by macOS includes
+the requesting process description, exact new references, caller-supplied
+purpose, policy-capped duration, and a compact risk/delivery/scope/destination
+summary. Dynamic text is bounded and control, newline, and bidirectional-
+formatting characters are neutralized.
 
 Approval returns the evaluated context to the cache read so a cold cached value
 or cold native-store key can be unlocked by the same biometric action. Editing
@@ -109,9 +122,11 @@ loading hostile code into the Ruby process is outside this protection.
 explicit `--set NAME=<reference>` assignments. It then places plaintext in the
 child's initial environment. This works with unmodified tools, but macOS process
 inspection can expose that original environment to unrelated same-UID
-processes. The implemented risk-policy model is not consulted by the shipping
-access path, so `csec exec` does not reject sensitive references according to a
-risk classification.
+processes. Risk policy treats this as weak compatibility delivery: low risk is
+allowed, standard risk requires a separate 30-day compatibility acceptance, and
+high or critical risk is rejected before cache/provider resolution. Output-guard
+configuration is part of both the delivery-plan and policy digests but does not
+make the environment private.
 
 When output policy is active, `csec` remains as the process supervisor and uses
 a child PTY or pipes. Terminal output is guarded by default. Non-terminal output
@@ -127,10 +142,11 @@ responsibility.
 
 ### Native store editing
 
-`csec edit <store>` asks `csecd` to begin a caller-bound, 30-minute edit
-session. After Touch ID, the complete strict-JSON document crosses the mutually
-authenticated socket into the signed launcher. By default a built-in AppKit
-`NSTextView` edits it without a plaintext filesystem object. Automatic spelling,
+`csec edit <store>` asks `csecd` to begin a caller-bound edit session, requesting
+30 minutes but accepting the risk-policy cap (15 minutes for high and 5 minutes
+for critical). After Touch ID, the complete strict-JSON document crosses the
+mutually authenticated socket into the signed launcher. By default a built-in
+AppKit `NSTextView` edits it without a plaintext filesystem object. Automatic spelling,
 grammar, replacement, data detection, smart punctuation, and window restoration
 are disabled. Save validates and canonicalizes the document in both the launcher
 and daemon before the daemon encrypts it; Cancel tells the daemon to discard the
@@ -138,8 +154,10 @@ session. Sessions are bound to the launcher's kernel PID and start time, capped
 at eight, and a stale concurrent editor cannot overwrite a newer generation.
 
 `csec edit --editor <store>` is an explicit compatibility boundary for a user's
-`$EDITOR`. Before Touch ID it warns that the mode creates a named plaintext file.
-The command is parsed into a bounded argv and executed directly, without an
+`$EDITOR`. The launcher resolves the actual executable without a shell and binds
+its canonical path into an unverified-consumer delivery plan before review.
+Before Touch ID it warns that the mode creates a named plaintext file. The
+command is parsed into a bounded argv and executed directly, without an
 implicit shell or expansion; the randomized document path is appended as the
 last argument. The editor must remain in the foreground (for example,
 `code --wait`) until editing is complete. Invalid JSON is reported without its
@@ -157,7 +175,10 @@ behind. These controls reduce accidents and cross-account access; they do not
 restore a same-UID boundary. The editor, plugins, same-UID malware, swap,
 autosave, backup, recovery, and filesystem snapshots can retain plaintext, and
 unlinking is not secure erasure on APFS/SSD storage. Copies outside the
-workspace cannot be removed.
+workspace cannot be removed. Risk policy allows this mode for low-risk stores,
+requires a separate compatibility acceptance for standard-risk stores, and
+forbids it for high and critical stores. A risk change revokes an open edit
+session, and commit recomputes the policy binding before writing.
 
 The built-in editor still authorizes the user and AppKit/input stack to see the
 plaintext; copying, screenshots, accessibility/screen-capture privileges, or a
@@ -238,13 +259,34 @@ provisioned build enables persistence. An unsigned development build reports
 `at-rest cache OFF` and uses a null persistent cache rather than weakening or
 emulating the entitlement.
 
-## Risk-policy code
+## Risk policy
 
-The source contains risk levels, opaque keychain-backed judgment records,
-delivery-acceptance records, and a deterministic `RiskPolicyV1` decision table.
-They are covered by self-tests but are not called by the shipping agent's access
-handler and are not represented in live grants. They provide no runtime
-restriction or authorization in the current product.
+`RiskPolicyV1` is a deterministic pre-resolution decision table. Logical
+credentials are grouped independently of provider: 1Password fields share their
+vault/item judgment, and native references share their store judgment. The
+production judgment backend stores only agent-HMAC-derived account, credential,
+and member identifiers in a ThisDeviceOnly Keychain item; raw references and
+secret values are not persisted there. Unsigned development builds use an
+in-memory backend.
+
+Unknown credentials have an effective high floor and require classification in
+the agent-owned review. Low, standard, high, and critical cap access at 12 hours,
+4 hours, 15 minutes, and 5 minutes respectively. Destination evidence may raise
+the effective level: production and unknown destinations floor at high, while
+staging, AI, and human output floor at standard. High/critical disallow AI
+destinations and require a verified, independently protected, or sealed complete
+consumer; critical also requires exact-process scope and a narrower mechanism
+set. Generic Ruby, shell, and checkout-driven consumers conservatively report
+unverified assurance even when their executable is root-owned.
+
+The agent loads judgments and any mechanism/assurance-specific acceptance before
+consulting a cache or provider. A trusted review can classify unknown scope or
+separately accept standard-risk weak compatibility; those choices are persisted
+only after Touch ID succeeds. `csec risk inspect|classify|raise|forget` operates
+on this metadata without resolving a value. `raise` is monotonic; a downgrade or
+forget requires an additional biometric authentication. Any change clears weak
+acceptances when appropriate, revokes matching grants and native edit sessions,
+and invalidates known resolver entries.
 
 ## Security requirements
 
@@ -270,8 +312,10 @@ available. The signed-package verification procedure is in
 The strongest implemented delivery is the Ruby private-pipe path into a clean,
 hardened consumer heap. The environment launcher is a compatibility feature
 with an acknowledged same-UID disclosure channel. Output redaction is an egress
-safeguard, not a repair for that channel. Native ciphertext and its rollback
-record protect durable data, while the decrypted editor buffer and values
+safeguard, not a repair for that channel. Risk policy prevents high/critical
+credentials from using currently weak or unverified paths; it does not strengthen
+an allowed low/standard path or make an authorized consumer safe. Native
+ciphertext and its rollback record protect durable data, while the decrypted editor buffer and values
 released to consumers remain subject to the authorized-consumer boundary. The
 precise attacker capabilities and limits are recorded in
 [`docs/threat-model.md`](docs/threat-model.md).

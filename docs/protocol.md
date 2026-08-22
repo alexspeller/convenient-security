@@ -65,7 +65,10 @@ The response advertises supported versions and features:
       "plan_digest_binding",
       "output_guard_binding",
       "active_output_redaction",
-      "native_encrypted_store"
+      "native_encrypted_store",
+      "risk_policy_v1",
+      "risk_management",
+      "native_editor_policy"
     ]
   }
 }
@@ -148,15 +151,18 @@ Before resolution, the agent verifies:
 - that the socket peer is the verified launcher;
 - a caller root, or—only for `csec bridge`—that a requested direct parent is the
   launcher's real PPID with the same process start time; and
-- that any existing grant has the same delivery-plan digest and a live
-  kernel-verified ancestry relationship.
+- the current logical-credential risk judgment, delivery acceptance, mechanism,
+  consumer assurance, destination, descendant scope, and policy-capped TTL; and
+- that any existing grant has the same delivery-plan and policy-decision digests
+  plus a live kernel-verified ancestry relationship.
 
 The grant records the request ID, plan digest, peer PID version/CDHash, and
-planned executable. The implemented risk-policy model is not consulted by the
-shipping request handler and no risk snapshot or policy digest is stored in a
-live grant. Generic piped `csec get` cannot identify a shell-pipeline reader, so
-its delivery plan declares an unknown, unverified destination and uses an
-exact-caller grant; it never broadens the grant to the parent shell.
+planned executable, together with the opaque credential key, effective risk,
+policy version/digest, and output policy. A risk change revokes matching grants;
+reuse also recomputes the policy binding, so stale authorization fails closed.
+Generic piped `csec get` cannot identify a shell-pipeline reader, so its delivery
+plan declares an unknown, unverified destination and uses an exact-caller grant;
+the high destination floor currently rejects that path before resolution.
 
 Success echoes the request nonce:
 
@@ -170,6 +176,37 @@ Success echoes the request nonce:
 
 The client rejects a missing/mismatched nonce or a values map whose keys differ
 from the requested reference set.
+
+## Value-free risk management
+
+Only a verified product launcher may inspect or mutate risk metadata. The
+caller supplies one reference so `csecd` can derive its logical group; the agent
+does not resolve the provider value. For example:
+
+```json
+{
+  "version": 2,
+  "type": "risk",
+  "requestID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "operation": "classify",
+  "reference": "op://Vault/Item/field",
+  "level": "standard"
+}
+```
+
+Operations are `inspect`, `classify`, `raise`, and `forget`. `inspect` and
+`forget` omit `level`; `classify` and `raise` require one of `low`, `standard`,
+`high`, or `critical`. `raise` cannot lower the current effective level.
+Mutations pass through an agent-owned value-free review. A classification that
+lowers the effective floor, and every `forget`, additionally requires Touch ID.
+
+The response contains `riskInspection`: provider kind, stored and effective
+levels, decision/review timestamps, policy version, known member count, whether
+the supplied reference is in the recorded scope, and any mechanism/assurance
+acceptances with their review deadlines. It contains neither secret values,
+opaque credential identifiers, nor other raw member references. A successful
+change revokes matching live grants, resolver entries known in memory, and open
+native-store edit sessions before returning the updated inspection.
 
 ## Active-output redaction sessions
 
@@ -247,9 +284,17 @@ The launcher begins with:
   "version": 2,
   "type": "begin_native_store_edit",
   "requestID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-  "store": "development"
+  "store": "development",
+  "mode": "built_in_memory"
 }
 ```
+
+`mode` is `built_in_memory` or `external_temporary_file`. External mode must
+also include the canonical absolute `externalEditorPath`; it is modeled as an
+unverified named-plaintext-file consumer. Built-in mode rejects that field and
+binds delivery to the verified `csec` launcher. The risk policy is evaluated
+before Touch ID or decryption. External mode is allowed at low risk, requires a
+separate acceptance at standard risk, and is forbidden at high/critical risk.
 
 Success returns a fresh edit-session UUID and the complete canonical JSON
 document as JSON's base64 representation of `Data`. For a new empty store this
@@ -265,9 +310,10 @@ is:
 ```
 
 The session is bound to the launcher's kernel PID and start time, lasts at most
-30 minutes, and retains the biometric context needed to authenticate the
-Keychain pointer update. At most eight sessions exist at once. The document is
-limited to 1 MiB and 1024 unique, path-safe keys with string values. The signed
+the policy-capped authorization (30 minutes requested, 15 minutes at high, and
+5 minutes at critical), and retains the biometric context needed to authenticate
+the Keychain pointer update. At most eight sessions exist at once. The document
+is limited to 1 MiB and 1024 unique, path-safe keys with string values. The signed
 launcher validates and canonicalizes it locally; the daemon independently
 validates it again.
 
@@ -276,7 +322,9 @@ Success reports only the new positive `generation` and `secretCount`. Invalid
 JSON returns `invalid_store_document` without consuming the session so the UI
 can correct it. A save whose baseline is no longer current returns
 `edit_conflict`. `cancel_native_store_edit` removes a caller-owned session and
-returns no document.
+returns no document. Before a commit, the daemon recomputes the risk decision
+and requires the exact original policy binding; a risk change also proactively
+cancels matching edit sessions.
 
 The plaintext document crosses only the existing mutually authenticated socket;
 the protocol never puts it in argv, the environment, error text, or logs. The
