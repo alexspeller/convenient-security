@@ -103,6 +103,8 @@ Security **cannot** protect a secret from:
   the capability or bytes to its descendants;
 - **the external-editor mode** of the native store, which necessarily writes
   decrypted JSON to a temp file your editor and its plugins can read;
+- **plaintext sources reviewed or imported by `csec setup`** — setup leaves
+  them intact until you verify the replacement and remediate them separately;
 - **you approving a request that turns out to be misleading.**
 
 The full attacker model — what a same-user, non-root process can and can't do,
@@ -123,6 +125,65 @@ swift run csec get 'op://Vault/Item/Field'    # fetch one secret to stdout — p
 > store (it can't open the provisioned Keychain group) and prints
 > `at-rest cache OFF`. For the full feature set, install the signed build — see
 > [Installing the real agent](#installing-the-real-agent).
+
+### Onboard a project and coding agents
+
+The installed launcher has one dry-run-first bootstrap command. It detects
+Claude Code and Codex, plans an additive user-level Bash hook merge, inventories
+supported local source metadata, and emits a bounded prompt for a deeper
+read-only coding-agent audit:
+
+```sh
+csec setup --project "$PWD"             # inspect only; changes nothing
+csec setup --project "$PWD" --apply     # apply the reviewed hook plan
+```
+
+Auto-detection checks the client executable and its user configuration. Use
+`--agent claude` or `--agent codex` to select an installed client explicitly,
+or `--skip-agents` to review/import sources without changing hooks. Setup merges
+only its generated `PreToolUse` Bash handler into `~/.claude/settings.json` or
+`~/.codex/hooks.json`; unrelated JSON values and the existing file mode are
+preserved, although JSON formatting is normalized. The dry run prints the exact
+value-free managed fragment, but never echoes the complete user configuration.
+It refuses symlinks, unsafe
+ownership/permissions, duplicate JSON keys, concurrent file replacement, an
+older csec handler, and Claude's `disableAllHooks: true`. Replacing only a
+recognized old csec handler requires the separately explicit
+`--replace-csec-hook` flag.
+
+The value-free source review scans the current process environment and a bounded
+set of live `.env` files beneath the project. It displays variable names,
+logical `op://`/`csec://` references, file modes, counts, and warnings—never
+discovered plaintext values. Ambiguous interpolation, duplicate assignments,
+symlinks, oversized files, and unsupported syntax are not interpreted. Import
+is opt-in per source and currently targets only the native encrypted store:
+
+```sh
+csec setup --project "$PWD" --skip-agents \
+  --store development \
+  --import API_TOKEN=dotenv:.env.local:LEGACY_API_TOKEN
+
+# Repeat the exact reviewed command with --apply; Touch ID gates the store edit.
+csec setup --project "$PWD" --skip-agents \
+  --store development \
+  --import API_TOKEN=dotenv:.env.local:LEGACY_API_TOKEN \
+  --apply
+```
+
+Use `DEST=env:NAME` for a selected inherited environment value. Existing native
+keys are protected unless `--replace-secret` is also explicit. Setup rechecks
+the selected source and refuses a changed dotenv file during apply, never
+resolves an existing logical reference, and never removes or rewrites the
+original environment/dotenv source; verify the new `csec://` consumer before
+remediating that source separately.
+
+Setup cannot approve a client's hook trust, override managed policy, detect
+every configuration source, or prove competing-hook order. Restart each client,
+review its effective hook UI, and use the generated audit prompt to close those
+gaps. Each config/store update is individually atomic, but a multi-target apply
+is not one cross-file transaction; a failure reports any earlier completed
+updates and the command is safe to repeat. Use the durable installed `csec`
+path for applied hooks rather than a disposable SwiftPM build path.
 
 ### Run an existing tool with secrets resolved
 
@@ -357,7 +418,11 @@ csec exec --redact-output=always -- bin/rspec
 # recently-released values, failing closed if scanning can't run:
 csec tool-exec --destination ai -- /usr/bin/pgrep -fl rubocop
 
-# Generate a hook fragment to merge into your AI tool's settings:
+# Dry-run and safely merge detected clients' hook configuration:
+csec setup
+csec setup --apply
+
+# Or generate one fragment for a manual merge:
 csec hook-config claude     # → merge into ~/.claude/settings.json
 csec hook-config codex      # → merge into ~/.codex/hooks.json
 ```

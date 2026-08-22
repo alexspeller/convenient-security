@@ -204,6 +204,7 @@ public struct EndOutputRedactionRequest: Codable, Sendable {
 
 public enum NativeStoreEditorMode: String, Codable, Sendable, CaseIterable {
     case builtInMemory = "built_in_memory"
+    case onboardingImport = "onboarding_import"
     case externalTemporaryFile = "external_temporary_file"
 }
 

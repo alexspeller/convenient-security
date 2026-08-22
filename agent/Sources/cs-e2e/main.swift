@@ -1038,6 +1038,79 @@ func runCsecWithExternalTermination() -> (status: Int32, out: String, err: Strin
 }
 
 if FileManager.default.isExecutableFile(atPath: csecURL.path) {
+    do {
+        let setupFixture = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("csec setup fixture \(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: setupFixture,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: setupFixture) }
+        let dotenvURL = setupFixture.appendingPathComponent(".env.local")
+        let firstMarker = "onboarding-import-synthetic-value"
+        try Data("LEGACY_TOKEN='\(firstMarker)'\n".utf8).write(to: dotenvURL)
+        let setupArguments = [
+            "setup", "--skip-agents", "--project", setupFixture.path,
+            "--store", "onboarding_e2e",
+            "--import", "IMPORTED_TOKEN=dotenv:.env.local:LEGACY_TOKEN",
+            "--no-audit-prompt",
+        ]
+
+        let dryRun = runCsec(setupArguments, extraEnv: [:])
+        let dryRunStoreRecord = await nativeKeyBackend.record(for: "onboarding_e2e")
+        check(dryRun.status == 0
+              && dryRun.out.contains("DRY RUN")
+              && dryRun.out.contains("plaintext-candidate: dotenv:.env.local:LEGACY_TOKEN")
+              && dryRun.out.contains("no files, stores, grants, or providers were changed")
+              && !dryRun.out.contains(firstMarker)
+              && !dryRun.err.contains(firstMarker)
+              && dryRunStoreRecord == nil,
+              "setup dry run reviews the selected dotenv credential without values or mutations")
+
+        let applied = runCsec(setupArguments + ["--apply"], extraEnv: [:])
+        let importedValues = try client.access(
+            references: ["csec://onboarding_e2e/IMPORTED_TOKEN"],
+            reason: "onboarding import e2e",
+            ttlSeconds: 300
+        )
+        let originalSource = try Data(contentsOf: dotenvURL)
+        check(applied.status == 0
+              && applied.out.contains("csec setup: apply complete")
+              && applied.out.contains("original environment/dotenv sources were not modified")
+              && !applied.out.contains(firstMarker)
+              && !applied.err.contains(firstMarker)
+              && importedValues["csec://onboarding_e2e/IMPORTED_TOKEN"] == firstMarker
+              && String(data: originalSource, encoding: .utf8)?.contains(firstMarker) == true,
+              "setup imports only the explicitly selected value through the authenticated native-store protocol")
+
+        let protectedExisting = runCsec(setupArguments + ["--apply"], extraEnv: [:])
+        check(protectedExisting.status == 1
+              && protectedExisting.err.contains("would overwrite existing native-store key")
+              && !protectedExisting.out.contains(firstMarker)
+              && !protectedExisting.err.contains(firstMarker),
+              "repeated setup protects an existing native-store key unless replacement is explicit")
+
+        let secondMarker = "onboarding-import-replacement-value"
+        try Data("LEGACY_TOKEN='\(secondMarker)'\n".utf8).write(to: dotenvURL)
+        let replaced = runCsec(
+            setupArguments + ["--replace-secret", "--apply"],
+            extraEnv: [:]
+        )
+        let replacedValues = try client.access(
+            references: ["csec://onboarding_e2e/IMPORTED_TOKEN"],
+            reason: "onboarding replacement e2e",
+            ttlSeconds: 300
+        )
+        check(replaced.status == 0
+              && !replaced.out.contains(secondMarker)
+              && !replaced.err.contains(secondMarker)
+              && replacedValues["csec://onboarding_e2e/IMPORTED_TOKEN"] == secondMarker,
+              "--replace-secret explicitly updates only the selected native-store key")
+    } catch {
+        check(false, "setup CLI import checks succeed (\(error))")
+    }
+
     let policyReference = "op://policy-tests/credential/token"
     let resolutionsBeforeRiskCLI = await resolutionCounter.calls()
     let initialRisk = runCsec(["risk", "inspect", policyReference], extraEnv: [:])

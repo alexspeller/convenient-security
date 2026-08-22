@@ -28,6 +28,7 @@ public enum AICommandHookError: Error, LocalizedError {
 /// proposed shell string with a fail-closed `csec tool-exec` invocation.
 public enum AICommandHook {
     public static let maximumCommandBytes = 1024 * 1024
+    public static let managedStatusMessage = "Convenient Security: protected output scanning"
 
     public static func rewrite(
         input: Data,
@@ -90,21 +91,28 @@ public enum AICommandHook {
         let handler: [String: Any]
         switch client {
         case .claude:
-            // Exec form avoids an extra shell and quoting ambiguity in the hook
-            // itself. The proposed tool command is still encoded in hook stdin.
+            // Always enter through the system shell and translate every launcher
+            // failure to status 2. Both supported clients treat that status as a
+            // denial; a removed/moved csec binary must not silently let the
+            // original unscanned command run.
             handler = [
                 "type": "command",
-                "command": executable,
-                "args": ["hook", "claude"],
+                "command": "/bin/sh",
+                "args": [
+                    "-c", failClosedHookProgram,
+                    "csec-ai-hook", executable, client.rawValue,
+                ],
                 "timeout": 5,
+                "statusMessage": managedStatusMessage,
             ]
         case .codex:
             // Codex command hooks currently use a shell command string.
             handler = [
                 "type": "command",
-                "command": "\(shellQuote(executable)) hook codex",
+                "command": "/bin/sh -c \(shellQuote(failClosedHookProgram)) "
+                    + "csec-ai-hook \(shellQuote(executable)) \(client.rawValue)",
                 "timeout": 5,
-                "statusMessage": "Enabling protected output scanning",
+                "statusMessage": managedStatusMessage,
             ]
         }
 
@@ -163,4 +171,22 @@ public enum AICommandHook {
     private static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
+
+    /// The proposed Bash program remains on hook stdin. Positional arguments
+    /// carry only the trusted csec path and a fixed client label, avoiding a
+    /// second interpretation of either the proposed command or its contents.
+    private static let failClosedHookProgram = """
+    csec_path=$1
+    client=$2
+    if [ ! -x "$csec_path" ]; then
+      printf '%s\\n' 'csec hook: protected output scanner unavailable; command denied' >&2
+      exit 2
+    fi
+    "$csec_path" hook "$client"
+    status=$?
+    if [ "$status" -eq 0 ]; then
+      exit 0
+    fi
+    exit 2
+    """
 }

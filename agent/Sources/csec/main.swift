@@ -46,6 +46,10 @@ import Darwin
 //   csec risk classify|raise <level> <reference>
 //       Inspect or change value-free risk metadata without resolving a value.
 
+//   csec setup [--apply] [options]
+//       Dry-run-first onboarding for coding-agent hooks, value-free local source
+//       discovery, selected native-store import, and a bounded audit prompt.
+
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage:
@@ -84,6 +88,11 @@ func usage() -> Never {
       csec risk classify low|standard|high|critical <reference>
       csec risk raise low|standard|high|critical <reference>
       csec risk forget <reference>
+      csec setup [--apply] [--agent claude|codex]… [--skip-agents]
+                 [--project <directory>] [--replace-csec-hook]
+                 [--store <store>
+                  --import DEST=env:NAME|DEST=dotenv:PATH:NAME]…
+                 [--replace-secret] [--no-audit-prompt]
       csec install | uninstall | status
       csec root-status
 
@@ -110,6 +119,11 @@ func usage() -> Never {
     risk       Inspect or change a logical credential's value-free risk policy.
                classify may set any level; raise cannot lower one; forget resets
                it to fail-safe unknown. Downgrades and forget require Touch ID.
+    setup      Detect supported coding agents and local secret sources without
+               displaying values. The default is a dry run. --apply safely merges
+               fail-closed hooks and may import only explicitly selected plaintext
+               candidates into one native encrypted store; existing hooks/keys are
+               never replaced without their separate explicit replacement flags.
     install    Register csecd as a login-item LaunchAgent so it runs in the background.
     uninstall  Unregister the csecd LaunchAgent.
     status     Show whether the csecd LaunchAgent is registered/enabled.
@@ -148,6 +162,8 @@ case "edit":
     runEdit(Array(arguments.dropFirst()))
 case "risk":
     runRisk(Array(arguments.dropFirst()))
+case "setup":
+    runSetup(Array(arguments.dropFirst()))
 case "install":
     runInstall()
 case "uninstall":

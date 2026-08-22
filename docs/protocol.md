@@ -424,12 +424,16 @@ The launcher begins with:
 }
 ```
 
-`mode` is `built_in_memory` or `external_temporary_file`. External mode must
-also include the canonical absolute `externalEditorPath`; it is modeled as an
-unverified named-plaintext-file consumer. Built-in mode rejects that field and
-binds delivery to the verified `csec` launcher. The risk policy is evaluated
-before Touch ID or decryption. External mode is allowed at low risk, requires a
-separate acceptance at standard risk, and is forbidden at high/critical risk.
+`mode` is `built_in_memory`, `onboarding_import`, or
+`external_temporary_file`. External mode must also include the canonical
+absolute `externalEditorPath`; it is modeled as an unverified
+named-plaintext-file consumer. Built-in and onboarding-import modes reject that
+field and bind direct-heap delivery to the verified `csec` launcher. The
+dedicated onboarding value gives policy review and consent an exact operation
+label; source selection/merge validation still happens in the launcher. The
+risk policy is evaluated before Touch ID or decryption. External mode is allowed
+at low risk, requires a separate acceptance at standard risk, and is forbidden
+at high/critical risk.
 
 Success returns a fresh edit-session UUID and the complete canonical JSON
 document as JSON's base64 representation of `Data`. For a new empty store this

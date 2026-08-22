@@ -1030,7 +1030,7 @@ public actor Agent {
 
         let plannedExecutable: PlannedExecutable
         switch request.mode {
-        case .builtInMemory:
+        case .builtInMemory, .onboardingImport:
             guard let executablePath = ProcessAncestry.executablePath(of: caller.pid) else {
                 return .failed(
                     .unverifiedPeer,
@@ -1051,16 +1051,25 @@ public actor Agent {
             )
         }
         let consentReference = NativeSecretReference.editConsentReference(for: store)
+        let operationContext: String
+        switch request.mode {
+        case .builtInMemory:
+            operationContext = "built-in native-store editor"
+        case .onboardingImport:
+            operationContext = "explicit onboarding import into the native encrypted store"
+        case .externalTemporaryFile:
+            operationContext = "external native-store editor using a named plaintext file"
+        }
         let plan = DeliveryPlan(
-            mechanism: request.mode == .builtInMemory ? .directHeap : .namedPlaintextFile,
+            mechanism: request.mode == .externalTemporaryFile
+                ? .namedPlaintextFile
+                : .directHeap,
             executable: plannedExecutable,
             root: .caller,
             descendantScope: .exactProcess,
             destination: .localDevelopment,
             requestedTTLSeconds: 30 * 60,
-            operationContext: request.mode == .builtInMemory
-                ? "built-in native-store editor"
-                : "external native-store editor using a named plaintext file"
+            operationContext: operationContext
         )
 
         do {
@@ -1559,7 +1568,7 @@ public actor Agent {
         _ request: BeginNativeStoreEditRequest
     ) -> Bool {
         switch request.mode {
-        case .builtInMemory:
+        case .builtInMemory, .onboardingImport:
             return request.externalEditorPath == nil
         case .externalTemporaryFile:
             guard let path = request.externalEditorPath else { return false }

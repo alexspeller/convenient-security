@@ -1165,6 +1165,22 @@ do {
     } else {
         check(false, "native-store edit begin decodes as the correct request")
     }
+    let onboardingBegin = BeginNativeStoreEditRequest(
+        store: "onboarding",
+        mode: .onboardingImport,
+        requestID: UUID(uuidString: "22222222-3333-4444-5555-666666666666")!
+    )
+    let onboardingData = try JSONEncoder().encode(
+        Request.beginNativeStoreEdit(onboardingBegin)
+    )
+    let onboardingDecoded = try JSONDecoder().decode(Request.self, from: onboardingData)
+    if case let .beginNativeStoreEdit(roundTrip) = onboardingDecoded {
+        check(roundTrip.mode == .onboardingImport
+              && roundTrip.externalEditorPath == nil,
+              "native-store onboarding import is an explicit shell-free wire mode")
+    } else {
+        check(false, "native-store onboarding import decodes as the correct request")
+    }
     let commit = CommitNativeStoreEditRequest(
         editSessionID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         document: Data(#"{"TOKEN":"synthetic"}"#.utf8),
@@ -1909,16 +1925,58 @@ do {
         client: .codex,
         csecExecutablePath: "/opt/Convenient Security/csec"
     )
-    let claudeText = String(data: claudeData, encoding: .utf8) ?? ""
+    let claudeObject = try JSONSerialization.jsonObject(with: claudeData) as? [String: Any]
+    let claudeHooks = claudeObject?["hooks"] as? [String: Any]
+    let claudeGroups = claudeHooks?["PreToolUse"] as? [[String: Any]]
+    let claudeHandlers = claudeGroups?.first?["hooks"] as? [[String: Any]]
+    let claudeHandler = claudeHandlers?.first
     let codexObject = try JSONSerialization.jsonObject(with: codexData) as? [String: Any]
     let codexHooks = codexObject?["hooks"] as? [String: Any]
     let codexGroups = codexHooks?["PreToolUse"] as? [[String: Any]]
     let codexHandlers = codexGroups?.first?["hooks"] as? [[String: Any]]
     let codexCommand = codexHandlers?.first?["command"] as? String
-    check(claudeText.contains("\"args\"") && claudeText.contains("\"claude\""),
-          "Claude hook configuration uses shell-free exec-form arguments")
-    check(codexCommand == "'/opt/Convenient Security/csec' hook codex",
-          "Codex hook configuration safely quotes the absolute csec path")
+    let claudeArguments = claudeHandler?["args"] as? [String]
+    check(claudeHandler?["command"] as? String == "/bin/sh"
+          && claudeArguments?.first == "-c"
+          && claudeArguments?.suffix(3) == [
+              "csec-ai-hook", "/opt/Convenient Security/csec", "claude",
+          ],
+          "Claude hook configuration enters through a fixed fail-closed shell wrapper")
+    check(codexCommand?.hasPrefix("/bin/sh -c ") == true
+          && codexCommand?.contains("csec-ai-hook") == true
+          && codexCommand?.contains("codex") == true,
+          "Codex hook configuration safely carries the absolute path through the fail-closed wrapper")
+    check(claudeHandler?["statusMessage"] as? String == AICommandHook.managedStatusMessage
+          && codexHandlers?.first?["statusMessage"] as? String
+              == AICommandHook.managedStatusMessage,
+          "generated hook handlers carry a stable csec ownership marker")
+
+    if let claudeArguments, let codexCommand {
+        let missingClaude = Process()
+        missingClaude.executableURL = URL(fileURLWithPath: "/bin/sh")
+        missingClaude.arguments = Array(claudeArguments.dropLast(2))
+            + ["/definitely/missing/csec", "claude"]
+        missingClaude.standardOutput = Pipe()
+        missingClaude.standardError = Pipe()
+        try missingClaude.run()
+        missingClaude.waitUntilExit()
+        check(missingClaude.terminationStatus == 2,
+              "Claude hook wrapper denies when the configured csec executable is unavailable")
+
+        let missingCodexCommand = codexCommand.replacingOccurrences(
+            of: "'/opt/Convenient Security/csec'",
+            with: "'/definitely/missing/csec'"
+        )
+        let missingCodex = Process()
+        missingCodex.executableURL = URL(fileURLWithPath: "/bin/sh")
+        missingCodex.arguments = ["-c", missingCodexCommand]
+        missingCodex.standardOutput = Pipe()
+        missingCodex.standardError = Pipe()
+        try missingCodex.run()
+        missingCodex.waitUntilExit()
+        check(missingCodex.terminationStatus == 2,
+              "Codex hook wrapper denies when the configured csec executable is unavailable")
+    }
 } catch {
     check(false, "hook configurations serialize")
 }
@@ -1937,6 +1995,368 @@ checkThrows("hook adapter rejects a non-Bash tool instead of silently passing it
 }
 checkThrows("encoded hook command rejects malformed base64url") {
     _ = try AICommandHook.decodeShellCommand("not+base64")
+}
+
+print("\n# SetupOnboarding (dry-run planning, discovery, import, and audit prompt)")
+
+do {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "csec-onboarding-selftest-\(UUID().uuidString)",
+        isDirectory: true
+    )
+    let home = root.appendingPathComponent("home", isDirectory: true)
+    let project = root.appendingPathComponent("project", isDirectory: true)
+    let fakeBin = root.appendingPathComponent("bin", isDirectory: true)
+    let codexDirectory = home.appendingPathComponent(".codex", isDirectory: true)
+    let claudeDirectory = home.appendingPathComponent(".claude", isDirectory: true)
+    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: codexDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: claudeDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let freshHome = root.appendingPathComponent("fresh-home", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: freshHome,
+        withIntermediateDirectories: false,
+        attributes: [.posixPermissions: NSNumber(value: Int16(0o700))]
+    )
+    let freshClaudeDetection = try CodingAgentSetup.detect(
+        homeDirectory: freshHome.path,
+        pathEnvironment: ""
+    ).first { $0.client == .claude }!
+    let createPlan = try CodingAgentSetup.plan(
+        detection: freshClaudeDetection,
+        csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+    )
+    check(createPlan.action == .create,
+          "setup plans creation when a selected client's user configuration is absent")
+    try CodingAgentSetup.apply(createPlan)
+    var freshDirectoryInfo = stat()
+    var freshConfigurationInfo = stat()
+    _ = lstat(
+        freshHome.appendingPathComponent(".claude", isDirectory: true).path,
+        &freshDirectoryInfo
+    )
+    _ = lstat(freshClaudeDetection.configurationPath, &freshConfigurationInfo)
+    check(freshDirectoryInfo.st_mode & 0o777 == 0o700
+          && freshConfigurationInfo.st_mode & 0o777 == 0o600,
+          "setup creates a private client directory and atomically installs a mode-0600 configuration")
+    let createdPlan = try CodingAgentSetup.plan(
+        detection: freshClaudeDetection,
+        csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+    )
+    check(createdPlan.action == .unchanged,
+          "repeating setup after configuration creation is idempotent")
+
+    let fakeCodex = fakeBin.appendingPathComponent("codex")
+    try Data("#!/bin/sh\nexit 0\n".utf8).write(to: fakeCodex)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: Int16(0o700))],
+        ofItemAtPath: fakeCodex.path
+    )
+    let codexConfiguration = codexDirectory.appendingPathComponent("hooks.json")
+    try Data(#"{"keep":{"theme":"dark"},"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"true"}]}]}}"#.utf8)
+        .write(to: codexConfiguration)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: Int16(0o640))],
+        ofItemAtPath: codexConfiguration.path
+    )
+
+    var detections = try CodingAgentSetup.detect(
+        homeDirectory: home.path,
+        pathEnvironment: fakeBin.path
+    )
+    let codexDetection = detections.first { $0.client == .codex }!
+    check(codexDetection.detected && codexDetection.executablePath == fakeCodex.path,
+          "setup detects a supported coding agent without executing it")
+    let mergePlan = try CodingAgentSetup.plan(
+        detection: codexDetection,
+        csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+    )
+    check(mergePlan.action == .merge,
+          "setup plans an additive merge for an existing user-owned Codex configuration")
+    try CodingAgentSetup.apply(mergePlan)
+    let mergedObject = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: codexConfiguration)
+    ) as? [String: Any]
+    let mergedKeep = mergedObject?["keep"] as? [String: Any]
+    let mergedHooks = mergedObject?["hooks"] as? [String: Any]
+    let mergedGroups = mergedHooks?["PreToolUse"] as? [[String: Any]]
+    var mergedInfo = stat()
+    _ = lstat(codexConfiguration.path, &mergedInfo)
+    check(mergedKeep?["theme"] as? String == "dark"
+          && mergedGroups?.count == 2,
+          "setup preserves unrelated settings and hooks while appending its own handler")
+    check(mergedInfo.st_mode & 0o777 == 0o640,
+          "setup preserves an existing configuration file's mode")
+    let unchangedPlan = try CodingAgentSetup.plan(
+        detection: codexDetection,
+        csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+    )
+    check(unchangedPlan.action == .unchanged,
+          "repeating setup with the same executable is idempotent")
+
+    let legacyConfiguration = Data(#"{"keep":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"'/old/csec' hook codex","timeout":5,"statusMessage":"Enabling protected output scanning"}]}]}}"#.utf8)
+    try legacyConfiguration.write(to: codexConfiguration)
+    let blockedPlan = try CodingAgentSetup.plan(
+        detection: codexDetection,
+        csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+    )
+    check(blockedPlan.action == .blocked,
+          "setup refuses to silently replace an older recognized csec hook")
+    let replacementPlan = try CodingAgentSetup.plan(
+        detection: codexDetection,
+        csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec",
+        replaceExistingCSECHook: true
+    )
+    try CodingAgentSetup.apply(replacementPlan)
+    let replacementObject = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: codexConfiguration)
+    ) as? [String: Any]
+    check(replacementObject?["keep"] as? Bool == true,
+          "explicit csec-hook replacement still preserves unrelated user configuration")
+
+    let desiredCodexData = try AICommandHook.hookConfiguration(
+        client: .codex,
+        csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+    )
+    var wrongMatcherObject = try JSONSerialization.jsonObject(
+        with: desiredCodexData
+    ) as! [String: Any]
+    var wrongMatcherHooks = wrongMatcherObject["hooks"] as! [String: Any]
+    var wrongMatcherGroups = wrongMatcherHooks["PreToolUse"] as! [[String: Any]]
+    wrongMatcherGroups[0]["matcher"] = "Write"
+    wrongMatcherHooks["PreToolUse"] = wrongMatcherGroups
+    wrongMatcherObject["hooks"] = wrongMatcherHooks
+    try JSONSerialization.data(withJSONObject: wrongMatcherObject).write(to: codexConfiguration)
+    let wrongMatcherPlan = try CodingAgentSetup.plan(
+        detection: codexDetection,
+        csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+    )
+    check(wrongMatcherPlan.action == .blocked,
+          "an exact csec handler under a non-Bash matcher is never mistaken for coverage")
+
+    try Data(#"{"keep":1,"\u006beep":2,"keep":3}"#.utf8).write(to: codexConfiguration)
+    checkThrows("setup rejects duplicate decoded JSON keys before a merge can collapse them") {
+        _ = try CodingAgentSetup.plan(
+            detection: codexDetection,
+            csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+        )
+    }
+
+    try FileManager.default.removeItem(at: codexConfiguration)
+    try FileManager.default.createSymbolicLink(
+        atPath: codexConfiguration.path,
+        withDestinationPath: codexDirectory.appendingPathComponent("missing-hooks.json").path
+    )
+    let symlinkDetection = try CodingAgentSetup.detect(
+        homeDirectory: home.path,
+        pathEnvironment: fakeBin.path
+    ).first { $0.client == .codex }!
+    check(symlinkDetection.configurationExists,
+          "setup reports a dangling configuration symlink instead of treating its path as empty")
+    checkThrows("setup refuses a dangling coding-agent configuration symlink") {
+        _ = try CodingAgentSetup.plan(
+            detection: symlinkDetection,
+            csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+        )
+    }
+
+    let claudeConfiguration = claudeDirectory.appendingPathComponent("settings.json")
+    try Data(#"{"disableAllHooks":true}"#.utf8).write(to: claudeConfiguration)
+    detections = try CodingAgentSetup.detect(
+        homeDirectory: home.path,
+        pathEnvironment: fakeBin.path
+    )
+    let claudeDetection = detections.first { $0.client == .claude }!
+    let disabledPlan = try CodingAgentSetup.plan(
+        detection: claudeDetection,
+        csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+    )
+    check(disabledPlan.action == .blocked,
+          "setup surfaces Claude's disableAllHooks policy instead of silently overriding it")
+
+    try Data(#"{"theme":"one"}"#.utf8).write(to: claudeConfiguration)
+    let racePlan = try CodingAgentSetup.plan(
+        detection: claudeDetection,
+        csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+    )
+    let concurrentlyEdited = Data(#"{"theme":"changed-by-user"}"#.utf8)
+    try concurrentlyEdited.write(to: claudeConfiguration)
+    checkThrows("setup never overwrites a coding-agent config changed after planning") {
+        try CodingAgentSetup.apply(racePlan)
+    }
+    check(try Data(contentsOf: claudeConfiguration) == concurrentlyEdited,
+          "a concurrent user edit remains byte-for-byte intact")
+
+    let sameBytes = Data(#"{"theme":"same-bytes-new-file"}"#.utf8)
+    try sameBytes.write(to: claudeConfiguration)
+    let replacementRacePlan = try CodingAgentSetup.plan(
+        detection: claudeDetection,
+        csecExecutablePath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+    )
+    try FileManager.default.removeItem(at: claudeConfiguration)
+    try sameBytes.write(to: claudeConfiguration)
+    checkThrows("setup detects a same-byte configuration replacement by file identity") {
+        try CodingAgentSetup.apply(replacementRacePlan)
+    }
+
+    let dotenvMarker = "dotenv-synthetic-value-never-in-audit"
+    let environmentMarker = "environment-synthetic-value-never-in-audit"
+    try Data("""
+    PORT=3000
+    API_TOKEN='\(dotenvMarker)'
+    DATABASE_URL=op://Synthetic/Database/url
+    EXPANDED_SECRET="$TOKEN"
+    """.utf8).write(to: project.appendingPathComponent(".env.local"))
+    let linkedDotenv = root.appendingPathComponent("external.env")
+    try Data("LINKED_SECRET=must-not-be-followed\n".utf8).write(to: linkedDotenv)
+    try FileManager.default.createSymbolicLink(
+        atPath: project.appendingPathComponent(".env.symlink").path,
+        withDestinationPath: linkedDotenv.path
+    )
+    let environment = [
+        "SESSION_SECRET": environmentMarker,
+        "CSEC_REFERENCE": "csec://development/EXISTING_TOKEN",
+        "PORT": "4000",
+    ]
+    let discovery = try LocalSecretDiscoveryEngine.discover(
+        projectDirectory: project.path,
+        environment: environment
+    )
+    check(discovery.candidates.contains {
+        $0.locator.identifier == "env:SESSION_SECRET" && $0.kind == .plaintextCandidate
+    }, "setup detects a secret-named environment candidate without reporting its value")
+    check(discovery.candidates.contains {
+        $0.locator.identifier == "dotenv:.env.local:DATABASE_URL"
+            && $0.kind == .reference
+            && $0.reference == "op://Synthetic/Database/url"
+    }, "setup detects supported logical references as value-safe metadata")
+    check(discovery.candidates.contains {
+        $0.locator.identifier == "dotenv:.env.local:EXPANDED_SECRET"
+            && $0.kind == .unsupported
+    }, "setup flags ambiguous dotenv interpolation instead of guessing its value")
+    check(!discovery.candidates.contains { $0.locator.identifier == "env:PORT" },
+          "setup omits ordinary non-secret-looking environment entries")
+    check(!discovery.candidates.contains {
+        $0.locator.identifier == "dotenv:.env.symlink:LINKED_SECRET"
+    }, "setup never follows a discovered dotenv symlink")
+    checkThrows("an explicitly selected dotenv symlink is refused") {
+        _ = try LocalSecretDiscoveryEngine.load(
+            .dotenv(relativePath: ".env.symlink", name: "LINKED_SECRET"),
+            projectDirectory: project.path,
+            environment: environment
+        )
+    }
+    let selectedDotenvCandidate = discovery.candidates.first {
+        $0.locator.identifier == "dotenv:.env.local:API_TOKEN"
+    }!
+    let loadedDotenv = try LocalSecretDiscoveryEngine.load(
+        selectedDotenvCandidate,
+        projectDirectory: project.path,
+        environment: environment
+    )
+    check(loadedDotenv == dotenvMarker,
+          "an explicitly selected supported dotenv entry can be loaded for import")
+    try Data("API_TOKEN='changed-after-discovery'\n".utf8)
+        .write(to: project.appendingPathComponent(".env.local"))
+    checkThrows("apply rejects a dotenv file changed after its in-process review") {
+        _ = try LocalSecretDiscoveryEngine.load(
+            selectedDotenvCandidate,
+            projectDirectory: project.path,
+            environment: environment
+        )
+    }
+    try Data("API_TOKEN=csec://development/CHANGED_REFERENCE\n".utf8)
+        .write(to: project.appendingPathComponent(".env.local"))
+    checkThrows("apply refuses a plaintext candidate that changed into a logical reference") {
+        _ = try LocalSecretDiscoveryEngine.load(
+            .dotenv(relativePath: ".env.local", name: "API_TOKEN"),
+            projectDirectory: project.path,
+            environment: environment
+        )
+    }
+    try Data("API_TOKEN='\(dotenvMarker)'\n".utf8)
+        .write(to: project.appendingPathComponent(".env.local"))
+
+    let initialStore = try NativeStoreDocument(values: ["EXISTING": "preserved"])
+    let importedStoreData = try NativeStoreImport.merge(
+        existingDocument: initialStore.encoded(),
+        selectedValues: ["API_TOKEN": loadedDotenv],
+        replaceExisting: false
+    )
+    let importedStore = try NativeStoreDocument(data: importedStoreData)
+    check(importedStore.values["EXISTING"] == "preserved"
+          && importedStore.values["API_TOKEN"] == dotenvMarker,
+          "selected import merges into the strict native document without replacing other keys")
+    checkThrows("native import protects an existing destination key by default") {
+        _ = try NativeStoreImport.merge(
+            existingDocument: initialStore.encoded(),
+            selectedValues: ["EXISTING": "replacement"],
+            replaceExisting: false
+        )
+    }
+
+    let auditPrompt = try OnboardingAuditPrompt.generate(facts: OnboardingAuditFacts(
+        projectDirectory: project.path + "/```untrusted-fence",
+        launchAgentStatus: "not registered",
+        productAgentReachable: false,
+        providerSchemes: [],
+        rootHelperReachable: false,
+        sipStatus: .enabled,
+        codingAgentPlans: [unchangedPlan],
+        discovery: discovery
+    ))
+    check(auditPrompt.utf8.count <= OnboardingAuditPrompt.maximumBytes
+          && auditPrompt.contains("Start read-only and remain value-free")
+          && auditPrompt.contains("ship/hold recommendation"),
+          "setup generates a bounded audit prompt with concrete evidence and decision requirements")
+    check(!auditPrompt.contains(dotenvMarker) && !auditPrompt.contains(environmentMarker),
+          "the generated audit prompt contains no discovered plaintext values")
+    check(auditPrompt.components(separatedBy: "```").count == 3
+          && !auditPrompt.contains("```untrusted-fence"),
+          "untrusted metadata cannot terminate the audit prompt's JSON fence")
+
+    let longMetadata = String(repeating: "bounded-metadata-", count: 96)
+    let crowdedDiscovery = LocalSecretDiscovery(
+        candidates: (0..<LocalSecretDiscoveryEngine.maximumCandidateCount).map {
+            LocalSecretCandidate(
+                locator: .dotenv(
+                    relativePath: "\(longMetadata)-\($0)/.env.local",
+                    name: "TOKEN_\($0)"
+                ),
+                kind: .plaintextCandidate
+            )
+        },
+        sources: (0..<32).map {
+            LocalSecretSourceSummary(
+                source: "\(longMetadata)-\($0)",
+                protection: longMetadata,
+                candidateCount: 8,
+                unsupportedEntryCount: 0
+            )
+        },
+        warnings: (0..<32).map { "\(longMetadata)-warning-\($0)" },
+        omittedCandidateCount: 10
+    )
+    let crowdedPrompt = try OnboardingAuditPrompt.generate(facts: OnboardingAuditFacts(
+        projectDirectory: "/" + longMetadata,
+        launchAgentStatus: longMetadata,
+        productAgentReachable: true,
+        providerSchemes: (0..<32).map { "scheme-\($0)-\(longMetadata)" },
+        rootHelperReachable: true,
+        sipStatus: .enabled,
+        codingAgentPlans: [],
+        discovery: crowdedDiscovery
+    ))
+    check(crowdedPrompt.utf8.count <= OnboardingAuditPrompt.maximumBytes
+          && crowdedPrompt.contains("\"omitted_candidates\"")
+          && crowdedPrompt.contains("\"omitted_sources\""),
+          "the audit prompt trims crowded metadata deterministically instead of exceeding its byte bound")
+} catch {
+    check(false, "setup onboarding checks succeed (\(error))")
 }
 
 print("\n# BiometricConsent (prompt formatting + availability, no actual prompt)")

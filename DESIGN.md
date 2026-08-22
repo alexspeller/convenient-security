@@ -307,6 +307,53 @@ transformations, non-Bash tool paths, or a malicious authorized consumer.
 User-level hook configuration is also user-modifiable. Registry entries expire
 at their delivery TTL and are lost when `csecd` restarts.
 
+## Setup and onboarding
+
+`csec setup` is a dry-run-first orchestration command. It detects Claude Code
+and Codex from bounded executable search paths and their user configuration
+files, then computes an additive merge of the generated Bash `PreToolUse` hook.
+The hook enters through `/bin/sh` and converts a missing launcher or every
+nonzero adapter result to exit status 2, while the adapter rewrites the proposed
+command through the fail-closed AI output broker. Configuration reads require a
+user-owned, non-symlink regular file below a user-owned, non-group/other-writable
+client directory. JSON is limited to 1 MiB, rejects duplicate decoded object
+keys and excessive nesting, and is re-read by bytes, mode, device, and inode
+immediately before atomic replacement. Setup preserves unrelated JSON and file
+mode, prints only the exact value-free managed fragment rather than the complete
+user configuration, is idempotent for the exact generated handler, and requires
+explicit flags to replace a recognized older csec handler. It does not replace
+other hooks or override an explicit Claude `disableAllHooks` policy.
+
+Local discovery is intentionally narrow and value-free at its output boundary.
+It examines secret-shaped names in the inherited process environment and up to
+32 non-symlink live dotenv files within a depth-four project walk, excluding
+common dependency/build directories. Files and parsed entries have explicit
+byte/count bounds. Supported `op://` and `csec://` references are reported as
+metadata but never resolved. Dotenv interpolation, duplicates, and ambiguous
+syntax are marked unsupported. Only a locator selected exactly with `--import`
+may be loaded, and apply reclassifies its current value so a source changed into
+a logical reference cannot be copied as plaintext. A selected dotenv file is
+also bound to the filesystem device, inode, size, mode, modification time, and
+status-change time observed during that apply process's discovery pass.
+
+Selected plaintext can be merged into the native encrypted store through a
+dedicated authenticated, exact-launcher, direct-heap edit mode. A fresh policy
+review and Touch ID gate the edit. The strict store document protects every
+existing key unless `--replace-secret` is explicit; the original environment or
+dotenv source is deliberately left untouched for separate verify-then-remediate
+work. Values never enter setup output or argv. The current importer does not
+write to 1Password or resolve references.
+
+The same snapshot generates a maximum-16-KiB audit prompt containing bounded,
+sanitized identifiers and state only. It tells the coding agent to remain
+read-only and value-free while checking signed-device posture, effective hook
+sources/trust, missed secret locations, consumer delivery shape, and source
+retention. This is necessary because setup cannot approve client trust, override
+managed settings, establish competing-hook semantics, or exhaustively discover
+local/provider/CI state. Each target update is atomic and repeatable, but a run
+covering multiple agent files plus a store is not a cross-target transaction;
+partial completion is reported explicitly.
+
 ## Resolution and cache
 
 `SecretResolver` dispatches each reference independently by scheme. The shipping

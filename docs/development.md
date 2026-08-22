@@ -35,6 +35,18 @@ editor checks cover bounded shell-free `$EDITOR` parsing, quoted paths, a real
 edit/commit, an editor failure, the pre-edit warning, value-free output, and
 temporary-workspace cleanup.
 
+The onboarding portion uses temporary homes/projects and synthetic values to
+cover supported-client detection, additive/idempotent JSON merges, explicit
+legacy-hook replacement, disabled-hook policy, duplicate decoded keys,
+permissions and file identity, concurrent edits, dangling symlinks, bounded
+dotenv/environment discovery, interpolation refusal, reference detection,
+selected native-store merging, and prompt size/value exclusion. End-to-end tests
+run the actual `csec setup` dry run and apply against the authenticated fake
+agent, prove dry run mutates nothing, prove only the selected key is imported,
+leave the source intact, protect an existing destination, and exercise explicit
+replacement. All fixture values are synthetic and assertions require that they
+never appear in setup stdout or stderr.
+
 Secure no-root delivery checks exercise session registration over the real
 socket, one-prompt descendant reuse, copied/forged/stale ID rejection, and
 high-risk fallback to an exact per-command root. AWS checks cover separate
@@ -141,4 +153,10 @@ Before treating an artifact as protected, verify on the signed installed app:
     flags/caps and modes, unrelated same-UID denial, GID lifecycle/collision
     checks, daemonized descendants, launcher death, soft/hard TTL, cancellation,
     restart recovery, GUI/headless audit-session behavior, and real consumer
-    compatibility.
+    compatibility; and
+19. `csec setup` against fresh and existing user configurations produces the
+    reviewed dry-run plan, preserves unrelated settings, appears in each
+    client's effective hook/trust UI, and blocks a synthetic Bash call when
+    installed `csec` or `csecd` is unavailable; a selected synthetic dotenv
+    import requires Touch ID, changes only its named native-store key, emits no
+    value, and leaves the source unchanged for separate remediation.

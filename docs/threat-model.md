@@ -268,12 +268,49 @@ expire at delivery TTL, and disappear on daemon restart. The matching interface
 also exposes a bounded equality oracle to callers able to execute the genuine
 signed launcher.
 
+### Setup and onboarding
+
+`csec setup` reports names, paths, logical references, modes, counts, and
+posture—not discovered plaintext values. Its bounded environment/dotenv scan is
+not a secret scanner and is intentionally incomplete. Secret material can still
+exist in ignored syntax, non-secret-shaped names, Keychain, shell files/history,
+credential helpers, cloud profiles, IDE state, containers, CI, logs, backups,
+and provider-side copies. The generated prompt treats every discovered
+identifier as untrusted metadata and asks a coding agent to investigate those
+gaps without values or mutation; a filename can still disclose sensitive
+business metadata even when it contains no credential bytes.
+
+Agent-hook apply rejects symlinked, hard-linked, non-user-owned, or
+group/other-writable configuration files, unsafe parent directories, ambiguous
+or duplicate-key JSON, recognized csec-handler conflicts, and a file whose
+bytes/mode/device/inode changed after planning. It atomically creates or replaces
+one configuration file and preserves unrelated parsed JSON. Re-serialization
+can change formatting. User-level configuration is not a same-UID boundary, and
+setup cannot approve client trust, override managed or project settings, prove
+which hook wins a competing rewrite, or make a disabled/non-running hook
+effective. Those remain explicit post-setup verification targets.
+
+Import accepts only an exact plaintext candidate selected in argv by its
+value-free locator. The value itself is re-read into the signed launcher's heap,
+bound to the dotenv file version observed in the same apply process,
+reclassified, and sent only over the authenticated native-store edit protocol;
+references are not resolved or copied. Touch ID and current risk policy gate the
+store edit, and existing keys require explicit replacement. The source remains
+ordinary plaintext and readable by the same-UID attacker until the user verifies
+the new consumer and separately removes every original/copy. Setup does not
+rotate a provider credential, prove the old source is unused, or make deletion
+from APFS/backup history secure. Multiple target updates are not one transaction,
+so a reported partial apply must be completed or reviewed by repeating setup.
+
 ## Explicitly exposed interfaces
 
 - `csec exec` places plaintext in the child's initial environment. Output
   masking does not make that environment private. Policy allows this for low
   risk and by separate acceptance for standard risk; high/critical are rejected.
 - `csec get` prints plaintext to standard output.
+- `csec setup --import` reads each explicitly selected plaintext source into the
+  signed launcher's heap before merging it into the native encrypted store; it
+  does not erase the source.
 - The Ruby client returns an ordinary mutable `String` to application code.
 - `csec creds aws` and `csec creds git` intentionally return plaintext over the
   credential consumer's private stdout pipe.
