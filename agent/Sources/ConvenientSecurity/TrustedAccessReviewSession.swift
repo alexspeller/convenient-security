@@ -89,7 +89,7 @@
     private func configureWindow() {
       let contentWidth: CGFloat = 760
       window = NSPanel(
-        contentRect: NSRect(x: 0, y: 0, width: contentWidth, height: 720),
+        contentRect: NSRect(x: 0, y: 0, width: contentWidth, height: 820),
         styleMask: [.titled, .closable],
         backing: .buffered,
         defer: false
@@ -141,7 +141,18 @@
       authenticationRow.addArrangedSubview(statusLabel)
 
       let footer = makeFooter()
-      for view in [header, summary, credentials, authenticationRow, footer] {
+      var arrangedViews: [NSView] = [header, summary]
+      if let warning = DeliveryReviewCopy.warning(for: review) {
+        let warningLabel = NSTextField(wrappingLabelWithString: warning)
+        warningLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        warningLabel.textColor = review.plan.recipientAssurance == .ordinaryPersistentFile
+          ? .systemRed : .systemOrange
+        warningLabel.maximumNumberOfLines = 8
+        warningLabel.preferredMaxLayoutWidth = contentWidth - 48
+        arrangedViews.append(warningLabel)
+      }
+      arrangedViews.append(contentsOf: [credentials, authenticationRow, footer])
+      for view in arrangedViews {
         root.addArrangedSubview(view)
       }
 
@@ -234,8 +245,10 @@
 
         if credential.compatibilityReviewOffered {
           let checkbox = NSButton(
-            checkboxWithTitle:
-              "Accept \(review.plan.mechanism.rawValue) compatibility delivery for 30 days",
+            checkboxWithTitle: DeliveryReviewCopy.compatibilityAcceptanceLabel(
+              for: review.plan,
+              storedLevel: credential.storedLevel
+            ),
             target: nil,
             action: nil
           )
@@ -414,8 +427,9 @@
     private static func summary(_ review: AccessPolicyReview) -> String {
       let executable = URL(fileURLWithPath: review.plan.executable.canonicalPath).lastPathComponent
       return """
-        Requester: \(safe(review.caller.description))
-        Consumer: \(safe(executable)) (\(review.plan.executable.assurance.rawValue))
+        Requester / grant owner: \(safe(review.caller.description))
+        Emitter: \(safe(executable)) (\(review.plan.executable.assurance.rawValue))
+        Recipient: \(safe(DeliveryReviewCopy.recipientDescription(for: review.plan)))
         Delivery: \(review.plan.mechanism.rawValue), \(review.plan.descendantScope.rawValue)
         Grant root: \(rootDescription(review.plan.root))
         Destination: \(review.plan.destination.rawValue)

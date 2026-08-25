@@ -478,7 +478,7 @@ if let myStart = ProcessAncestry.startTime(of: me) {
     let binding = PolicyGrantBinding(
         credentialKey: "opaque-credential",
         riskLevel: .standard,
-        policyVersion: RiskPolicyV1.version,
+        policyVersion: RiskPolicyV2.version,
         policyDigest: "policy-a",
         outputPolicy: .exactMatchRedactAndWarn
     )
@@ -526,7 +526,7 @@ if let myStart = ProcessAncestry.startTime(of: me) {
     let oldVersion = PolicyGrantBinding(
         credentialKey: "old-policy-credential",
         riskLevel: .low,
-        policyVersion: RiskPolicyV1.version - 1,
+        policyVersion: RiskPolicyV2.version - 1,
         policyDigest: "old-policy",
         outputPolicy: .exactMatchRedactAndWarn
     )
@@ -538,7 +538,7 @@ if let myStart = ProcessAncestry.startTime(of: me) {
         expiresAt: Date().addingTimeInterval(60),
         policyBinding: oldVersion
     ))
-    check(await table.revalidate(policyVersion: RiskPolicyV1.version)
+    check(await table.revalidate(policyVersion: RiskPolicyV2.version)
           == ["csec://test/TOKEN"],
           "a policy-version change revokes grants created by older policy code")
 } else {
@@ -1067,6 +1067,7 @@ let shellRootedPlan = DeliveryPlan(
     root: .directParent(pid: 4242, startTime: 999_999),
     descendantScope: .subtree,
     destination: .humanOutput,
+    recipientAssurance: .interactiveTerminal,
     requestedTTLSeconds: 3600,
     operationContext: "interactive get"
 )
@@ -1080,11 +1081,37 @@ let otherShellRootedPlan = DeliveryPlan(
     root: shellRootedPlan.root,
     descendantScope: .subtree,
     destination: .humanOutput,
+    recipientAssurance: .interactiveTerminal,
     requestedTTLSeconds: 3600,
     operationContext: "interactive get"
 )
 check((try? shellRootedPlan.digest()) != (try? otherShellRootedPlan.digest()),
       "direct-parent requester identity changes the bound plan digest")
+let shellPipePlan = DeliveryPlan(
+    mechanism: .rawStandardOutput,
+    executable: shellRootedPlan.executable,
+    requestingExecutable: shellRequester,
+    root: shellRootedPlan.root,
+    descendantScope: .subtree,
+    destination: .shellDelegatedPipe,
+    recipientAssurance: .unverifiedPipeReader,
+    requestedTTLSeconds: 3600,
+    operationContext: "interactive get"
+)
+let persistentGetPlan = DeliveryPlan(
+    mechanism: .namedPlaintextFile,
+    executable: shellRootedPlan.executable,
+    requestingExecutable: shellRequester,
+    root: shellRootedPlan.root,
+    descendantScope: .subtree,
+    destination: .persistentPlaintextFile,
+    recipientAssurance: .ordinaryPersistentFile,
+    requestedTTLSeconds: 3600,
+    operationContext: "interactive get"
+)
+check((try? shellRootedPlan.digest()) != (try? shellPipePlan.digest())
+      && (try? shellPipePlan.digest()) != (try? persistentGetPlan.digest()),
+      "terminal, shell-pipe, and persistent-file delivery shapes have distinct plan digests")
 if let encodedShellPlan = try? JSONEncoder().encode(shellRootedPlan),
    let decodedShellPlan = try? JSONDecoder().decode(
     DeliveryPlan.self,
@@ -1119,14 +1146,14 @@ let unguardedEnvPlan = DeliveryPlan(
 )
 check((try? guardedEnvPlan.digest()) != (try? unguardedEnvPlan.digest()),
       "output masking versus byte-exact bypass changes the bound plan digest")
-let guardedOutputDecision = RiskPolicyV1.evaluate(RiskPolicyInput(
+let guardedOutputDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
     credentialKey: "opaque-output-binding",
     storedLevel: .low,
     evidence: [],
     plan: guardedEnvPlan,
     now: Date(timeIntervalSince1970: 2_000_000_000)
 ))
-let unguardedOutputDecision = RiskPolicyV1.evaluate(RiskPolicyInput(
+let unguardedOutputDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
     credentialKey: "opaque-output-binding",
     storedLevel: .low,
     evidence: [],
@@ -1362,10 +1389,10 @@ checkThrows("fd presets reject NUL-bearing file content") {
     _ = try InheritedFilePreset.googleServiceAccount.render("{\"key\":\"bad\0value\"}")
 }
 
-print("\n# RiskPolicyV1 (preview, pure decisions)")
+print("\n# RiskPolicyV2 (preview, pure decisions)")
 
 let policyNow = Date(timeIntervalSince1970: 2_000_000_000)
-let unknownDecision = RiskPolicyV1.evaluate(RiskPolicyInput(
+let unknownDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
     credentialKey: "opaque-credential",
     storedLevel: .unknown,
     evidence: [],
@@ -1377,7 +1404,7 @@ check(unknownDecision.effectiveLevel == .high,
 check(!unknownDecision.allowed && unknownDecision.denialReason == .classificationRequired,
       "unknown credentials fail closed pending classification")
 
-let lowEnvDecision = RiskPolicyV1.evaluate(RiskPolicyInput(
+let lowEnvDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
     credentialKey: "opaque-low",
     storedLevel: .low,
     evidence: [],
@@ -1388,7 +1415,7 @@ check(lowEnvDecision.allowed, "low-risk policy permits labeled compatibility env
 check(lowEnvDecision.ttlCapSeconds == 12 * 3600,
       "low-risk TTL cap comes from the centralized table")
 
-let standardWithoutAcceptance = RiskPolicyV1.evaluate(RiskPolicyInput(
+let standardWithoutAcceptance = RiskPolicyV2.evaluate(RiskPolicyInput(
     credentialKey: "opaque-standard",
     storedLevel: .standard,
     evidence: [],
@@ -1401,13 +1428,12 @@ check(!standardWithoutAcceptance.allowed
 
 let acceptance = DeliveryAcceptance(
     credentialKey: "opaque-standard",
-    mechanism: .unrestrictedInitialEnvironment,
-    consumerAssurance: .userWritable,
-    policyVersion: RiskPolicyV1.version,
+    shape: CompatibilityDeliveryShape(plan: envPlan),
+    policyVersion: RiskPolicyV2.version,
     acceptedAt: policyNow.addingTimeInterval(-60),
     reviewAfter: policyNow.addingTimeInterval(3600)
 )
-let standardWithAcceptance = RiskPolicyV1.evaluate(RiskPolicyInput(
+let standardWithAcceptance = RiskPolicyV2.evaluate(RiskPolicyInput(
     credentialKey: "opaque-standard",
     storedLevel: .standard,
     evidence: [],
@@ -1418,6 +1444,133 @@ let standardWithAcceptance = RiskPolicyV1.evaluate(RiskPolicyInput(
 check(standardWithAcceptance.allowed,
       "matching unexpired delivery acceptance permits standard compatibility env")
 
+let standardPipeWithoutAcceptance = RiskPolicyV2.evaluate(RiskPolicyInput(
+    credentialKey: "opaque-standard-pipe",
+    storedLevel: .standard,
+    evidence: [],
+    plan: shellPipePlan,
+    now: policyNow
+))
+check(!standardPipeWithoutAcceptance.allowed
+      && standardPipeWithoutAcceptance.denialReason == .compatibilityAcceptanceRequired,
+      "standard-risk shell-delegated pipe requires its own compatibility acceptance")
+let pipeAcceptance = DeliveryAcceptance(
+    credentialKey: "opaque-standard-pipe",
+    shape: CompatibilityDeliveryShape(plan: shellPipePlan),
+    policyVersion: RiskPolicyV2.version,
+    acceptedAt: policyNow.addingTimeInterval(-60),
+    reviewAfter: policyNow.addingTimeInterval(3600)
+)
+check(pipeAcceptance.permits(
+    credentialKey: "opaque-standard-pipe",
+    plan: shellPipePlan,
+    policyVersion: RiskPolicyV2.version,
+    at: policyNow
+), "pipe acceptance matches its exact delivery shape")
+check(!pipeAcceptance.permits(
+    credentialKey: "opaque-standard-pipe",
+    plan: shellRootedPlan,
+    policyVersion: RiskPolicyV2.version,
+    at: policyNow
+) && !pipeAcceptance.permits(
+    credentialKey: "opaque-standard-pipe",
+    plan: persistentGetPlan,
+    policyVersion: RiskPolicyV2.version,
+    at: policyNow
+), "pipe acceptance cannot approve terminal or persistent-file delivery")
+let standardPipeWithAcceptance = RiskPolicyV2.evaluate(RiskPolicyInput(
+    credentialKey: "opaque-standard-pipe",
+    storedLevel: .standard,
+    evidence: [],
+    plan: shellPipePlan,
+    acceptance: pipeAcceptance,
+    now: policyNow
+))
+check(standardPipeWithAcceptance.allowed,
+      "reviewed standard-risk shell-delegated pipe is allowed")
+
+let highPipeAcceptance = DeliveryAcceptance(
+    credentialKey: "opaque-high-pipe",
+    shape: CompatibilityDeliveryShape(plan: shellPipePlan),
+    policyVersion: RiskPolicyV2.version,
+    acceptedAt: policyNow,
+    reviewAfter: policyNow.addingTimeInterval(15 * 60)
+)
+let highPipeDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
+    credentialKey: "opaque-high-pipe",
+    storedLevel: .high,
+    evidence: [],
+    plan: shellPipePlan,
+    acceptance: highPipeAcceptance,
+    now: policyNow
+))
+check(highPipeDecision.allowed
+      && highPipeDecision.requiresFreshBiometric
+      && highPipeDecision.grantedTTLSeconds == 15 * 60,
+      "explicit high-risk pipe approval uses fresh authentication and the short TTL cap")
+
+let criticalFileAcceptance = DeliveryAcceptance(
+    credentialKey: "opaque-critical-file",
+    shape: CompatibilityDeliveryShape(plan: persistentGetPlan),
+    policyVersion: RiskPolicyV2.version,
+    acceptedAt: policyNow,
+    reviewAfter: policyNow.addingTimeInterval(5 * 60)
+)
+let criticalFileDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
+    credentialKey: "opaque-critical-file",
+    storedLevel: .critical,
+    evidence: [],
+    plan: persistentGetPlan,
+    acceptance: criticalFileAcceptance,
+    now: policyNow
+))
+check(criticalFileDecision.allowed
+      && criticalFileDecision.requiresFreshBiometric
+      && criticalFileDecision.grantedTTLSeconds == 5 * 60,
+      "explicit critical persistent-file approval uses fresh authentication and the very short cap")
+check(standardPipeWithoutAcceptance.policyDigest == standardPipeWithAcceptance.policyDigest,
+      "transient compatibility approval is represented by the exact live grant, not a broader policy digest")
+
+let reviewIdentity = CredentialIdentity(
+    provider: "op",
+    providerAccountKey: String(repeating: "a", count: 64),
+    credentialKey: String(repeating: "b", count: 64),
+    memberReferenceKeys: [String(repeating: "c", count: 64)]
+)
+let fileReview = AccessPolicyReview(
+    caller: CallerInfo(pid: 4242, startTime: 999_999, description: "fish [user_writable]"),
+    reason: "review persistent delivery",
+    plan: persistentGetPlan,
+    credentials: [PolicyReviewCredential(
+        identity: reviewIdentity,
+        references: [try! SecretRef("op://Synthetic/Item/token")],
+        storedLevel: .critical,
+        scopeExpanded: false,
+        compatibilityReviewOffered: true,
+        compatibilityAccepted: false
+    )]
+)
+let fileWarning = DeliveryReviewCopy.warning(for: fileReview) ?? ""
+check(fileWarning.contains("Plaintext will persist in an ordinary file")
+      && fileWarning.contains("processes running as you")
+      && fileWarning.contains("copying, backups")
+      && fileWarning.contains("csec exec-file")
+      && fileWarning.contains("CRITICAL-RISK")
+      && !fileWarning.contains("secret-output.txt")
+      && !fileWarning.contains("synthetic-secret-value"),
+      "persistent-file review gives the complete value-free strongest warning")
+let pipeReview = AccessPolicyReview(
+    caller: fileReview.caller,
+    reason: "review delegated pipe",
+    plan: shellPipePlan,
+    credentials: fileReview.credentials
+)
+let pipeWarning = DeliveryReviewCopy.warning(for: pipeReview) ?? ""
+check(DeliveryReviewCopy.recipientDescription(for: shellPipePlan)
+        .contains("unverified pipe reader")
+      && pipeWarning.contains("generic Unix pipelines do not reveal or authenticate"),
+      "pipe review distinguishes the shell grant owner, csec emitter, and unverified reader")
+
 let aiSubtreePlan = DeliveryPlan(
     mechanism: .directHeap,
     executable: baseExecutable,
@@ -1427,7 +1580,7 @@ let aiSubtreePlan = DeliveryPlan(
     requestedTTLSeconds: 300,
     operationContext: "AI-assisted development"
 )
-let aiSubtreeDecision = RiskPolicyV1.evaluate(RiskPolicyInput(
+let aiSubtreeDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
     credentialKey: "opaque-standard",
     storedLevel: .standard,
     evidence: [],
@@ -1445,7 +1598,7 @@ let criticalEvidence = RiskEvidence(
     evidenceDigest: "opaque-evidence",
     observedAt: policyNow
 )
-let raisedDecision = RiskPolicyV1.evaluate(RiskPolicyInput(
+let raisedDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
     credentialKey: "opaque-low",
     storedLevel: .low,
     evidence: [criticalEvidence],
@@ -1469,7 +1622,7 @@ let protectedHighPlan = DeliveryPlan(
     requestedTTLSeconds: 3600,
     operationContext: "bounded production read"
 )
-let highDecision = RiskPolicyV1.evaluate(RiskPolicyInput(
+let highDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
     credentialKey: "opaque-high",
     storedLevel: .high,
     evidence: [],
@@ -1480,7 +1633,7 @@ check(highDecision.allowed && highDecision.grantedTTLSeconds == 15 * 60,
       "high-risk protected exact-process delivery is allowed with a 15-minute cap")
 check(highDecision.outputPolicy == .stopAndSuppressOnMatch,
       "high-risk output matches fail closed")
-check(highDecision.policyDigest == RiskPolicyV1.evaluate(RiskPolicyInput(
+check(highDecision.policyDigest == RiskPolicyV2.evaluate(RiskPolicyInput(
     credentialKey: "opaque-high",
     storedLevel: .high,
     evidence: [],
@@ -1500,7 +1653,7 @@ let highSessionPlan = DeliveryPlan(
     requestedTTLSeconds: 300,
     operationContext: "broad high-risk session"
 )
-let highSessionDecision = RiskPolicyV1.evaluate(RiskPolicyInput(
+let highSessionDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
     credentialKey: "opaque-high-session",
     storedLevel: .high,
     evidence: [],
@@ -1545,29 +1698,27 @@ do {
         source: .explicitUser,
         decidedAt: policyNow,
         reviewAfter: policyNow.addingTimeInterval(3600),
-        policyVersion: RiskPolicyV1.version
+        policyVersion: RiskPolicyV2.version
     )
     try await store.save(judgment)
     check(try await store.load(
         credentialKey: identity.credentialKey,
-        policyVersion: RiskPolicyV1.version,
+        policyVersion: RiskPolicyV2.version,
         at: policyNow
     ) == judgment, "current judgment round-trips separately from grants and values")
 
     let storedAcceptance = DeliveryAcceptance(
         credentialKey: identity.credentialKey,
-        mechanism: .unrestrictedInitialEnvironment,
-        consumerAssurance: .unverified,
-        policyVersion: RiskPolicyV1.version,
+        shape: CompatibilityDeliveryShape(plan: envPlan),
+        policyVersion: RiskPolicyV2.version,
         acceptedAt: policyNow,
         reviewAfter: policyNow.addingTimeInterval(3600)
     )
     try await store.save(storedAcceptance)
     check(try await store.loadAcceptance(
         credentialKey: identity.credentialKey,
-        mechanism: .unrestrictedInitialEnvironment,
-        assurance: .unverified,
-        policyVersion: RiskPolicyV1.version,
+        plan: envPlan,
+        policyVersion: RiskPolicyV2.version,
         at: policyNow
     ) == storedAcceptance, "weaker-delivery acceptance is stored separately from risk judgment")
 
@@ -1582,7 +1733,7 @@ do {
 
     check(try await store.load(
         credentialKey: identity.credentialKey,
-        policyVersion: RiskPolicyV1.version + 1,
+        policyVersion: RiskPolicyV2.version + 1,
         at: policyNow
     ) == nil, "policy-version change invalidates and removes a cached judgment")
 } catch {
@@ -1615,7 +1766,7 @@ let namedFilePlan = DeliveryPlan(
     requestedTTLSeconds: 300,
     operationContext: "external editor"
 )
-let namedFileDecision = RiskPolicyV1.evaluate(RiskPolicyInput(
+let namedFileDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
     credentialKey: "opaque-standard",
     storedLevel: .standard,
     evidence: [],

@@ -61,6 +61,19 @@ high-numbered descriptors, no value in initial environment/argv/current
 directory, literal argv behavior, output masking, and rejection when an
 unrelated same-UID process tries the same `/dev/fd/N` path.
 
+`csec get` compatibility checks use synthetic values through the real launcher
+and authenticated socket. They cover a reviewed pipe, command substitution, two
+piped sibling gets reusing one live-shell grant, rejection/review in a different
+shell, and refusal after the parent exits, reparents, or changes executable.
+Terminal, pipe, and regular-file approvals are exercised as distinct shapes.
+Regular-file denial occurs before provider resolution and leaves no plaintext;
+explicit approval writes the exact synthetic value. High and critical paths
+require fresh authentication, retain no compatibility acceptance beyond their
+15-minute/5-minute live grant, and remain usable when approved. Malformed
+requester/recipient metadata fails closed, and warnings, errors, protocol
+metadata, and captured review state are checked for absence of synthetic values
+and sensitive target filenames.
+
 Secure regular-file checks use only synthetic payloads and an explicitly
 unprivileged fake root daemon. Core checks cover plan canonicalization/tamper,
 outer/nested request binding, path/environment rejection, bounded raw and
@@ -118,8 +131,15 @@ Before treating an artifact as protected, verify on the signed installed app:
    second csec authentication sheet; and
 7. one touch permits a cold cache read, followed by a warm read with no second
    biometric prompt;
-8. two interactive `csec get` children of one shell show that shell as the
-   requester and reuse one compatible grant, while piped get cannot reuse it;
+8. terminal, piped, command-substitution, and ordinary-file `csec get` show the
+   live direct-parent shell as requester/grant owner and signed `csec` as
+   emitter; pipe review identifies an unverified reader; two compatible piped
+   siblings reuse one exact grant while another shell cannot; replaced, exited,
+   or reparented parents fail before output; terminal, pipe, and file approvals
+   do not cross-authorize; file denial precedes provider resolution and writes
+   no plaintext; approved high/critical compatibility uses fresh Touch ID and
+   only the 15-minute/5-minute live grant; and no value or target filename enters
+   warnings, errors, logs, or protocol metadata;
 9. the native-store spike proves a signed-but-unentitled same-UID helper cannot
    query the provisioned access-group item, and that the `.biometryAny`,
    `WhenUnlockedThisDeviceOnly` record cannot be read without an authorized

@@ -307,6 +307,12 @@ int32_t cs_fd_is_pipe_or_socket(int fd) {
     return (S_ISFIFO(info.st_mode) || S_ISSOCK(info.st_mode)) ? 1 : 0;
 }
 
+int32_t cs_fd_is_regular_file(int fd) {
+    struct stat info;
+    if (fstat(fd, &info) != 0) return 0;
+    return S_ISREG(info.st_mode) ? 1 : 0;
+}
+
 int32_t cs_proc_ppid(int32_t pid) {
     struct proc_bsdshortinfo info;
     int n = proc_pidinfo(pid, PROC_PIDT_SHORTBSDINFO, 0, &info, sizeof(info));

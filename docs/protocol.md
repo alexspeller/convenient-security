@@ -68,7 +68,7 @@ The response advertises supported versions and features:
       "output_guard_binding",
       "active_output_redaction",
       "native_encrypted_store",
-      "risk_policy_v1",
+      "risk_policy_v2",
       "risk_management",
       "native_editor_policy",
       "registered_session_roots",
@@ -124,7 +124,11 @@ plan:
 ```
 
 The launcher sends only a SHA-256 command digest, not argv, where a command must
-be bound. Plaintext is forbidden in the plan and all metadata.
+be bound. Plaintext is forbidden in the plan and all metadata. Compatibility
+output plans can additionally carry one of the value-free recipient assurances
+`interactive_terminal`, `unverified_pipe_reader`, or
+`ordinary_persistent_file`. A regular-file plan never carries or derives the
+redirection pathname.
 
 For unrestricted-environment `csec exec`, the plan must additionally bind the
 exact value-free guard configuration declared for the launch:
@@ -156,7 +160,7 @@ Before resolution, the agent verifies:
   supported output-matcher version, and plan/TTL agreement;
 - a recomputed canonical plan digest;
 - that the socket peer is the verified launcher;
-- a caller root; for bridge/credential consumers and interactive `csec get`, a
+- a caller root; for bridge/credential consumers and every `csec get` stdout shape, a
   requested direct parent that is the launcher's real PPID with the same process
   start time and canonical executable; or a registered-session ID whose live
   PID/start-time root is an ancestor of the caller in the same audit session;
@@ -174,14 +178,38 @@ The grant records the request ID, plan digest, peer PID version/CDHash, and
 planned executable, together with the opaque credential key, effective risk,
 policy version/digest, and output policy. A risk change revokes matching grants;
 reuse also recomputes the policy binding, so stale authorization fails closed.
-Interactive terminal `csec get` keeps signed `csec` as the raw-output consumer,
-binds its direct parent as `requestingExecutable`, and uses that parent's exact
-PID/start-time as a subtree grant root. Consecutive sibling gets from the same
-live shell can therefore reuse a compatible grant. The launcher rechecks the
-parent incarnation and executable again before writing the response.
-Generic piped `csec get` cannot identify a shell-pipeline reader, so its delivery
-plan declares an unknown, unverified destination and uses an exact-caller grant;
-the high destination floor currently rejects that path before resolution.
+Every `csec get` stdout shape keeps signed `csec` as the emitter, binds its
+verified direct parent as `requestingExecutable`, and uses that parent's exact
+PID/start-time as a subtree grant root. The daemon repeats the live
+PID/start-time/ancestry/executable check after review and immediately before it
+can resolve a provider; the launcher repeats it before writing the response.
+Consecutive compatible sibling gets from the same live shell can therefore
+reuse a grant, while another shell incarnation cannot.
+
+The three accepted compatibility triples are deliberately exact:
+
+| Mechanism | Destination | Recipient assurance |
+|-----------|-------------|---------------------|
+| `raw_stdout` | `human_output` | `interactive_terminal` |
+| `raw_stdout` | `shell_delegated_pipe` | `unverified_pipe_reader` |
+| `named_plaintext_file` | `persistent_plaintext_file` | `ordinary_persistent_file` |
+
+A generic Unix pipeline does not expose the sibling reader's process identity
+through its write descriptor. The shell is therefore the authenticated
+requester and grant owner, `csec` is the emitter, and the recipient remains
+explicitly unverified; command substitution uses the same shape. For ordinary
+redirection, `fstat` identifies only that stdout is a regular file. The shell
+may already have created or truncated it, but csec sends no pathname and no
+plaintext is resolved or written unless review and authentication succeed.
+
+Compatibility acceptance is bound to mechanism, destination, descendant scope,
+emitter assurance, requester assurance, and recipient assurance. A terminal
+acceptance therefore cannot approve a pipe or file, and a pipe acceptance cannot
+approve a file. Standard acceptance may be retained for 30 days. High and
+critical acceptance is not persisted: fresh Touch ID creates only the exact
+risk-capped live-shell grant (15 minutes or 5 minutes respectively). Policy
+version 2 invalidates version-1 decisions and acceptances instead of assigning
+them these broader semantics.
 
 Success echoes the request nonce:
 

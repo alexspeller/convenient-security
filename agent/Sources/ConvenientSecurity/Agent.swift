@@ -144,40 +144,12 @@ public actor Agent {
                 )
             }
             pruneRegisteredSessions()
-            guard let verifiedRoot = verifyRoot(deliveryPlan.root, caller: caller) else {
+            guard let verifiedRoot = verifyDeliveryRoot(deliveryPlan, caller: caller) else {
                 return .failed(
                     .invalidRequest,
                     message: "the requested grant root does not match process ancestry",
                     requestID: requestID
                 )
-            }
-            if case let .directParent(pid, _) = deliveryPlan.root {
-                let requester = deliveryPlan.requestingExecutable ?? deliveryPlan.executable
-                let claimedPath = URL(fileURLWithPath: requester.canonicalPath)
-                    .standardizedFileURL.resolvingSymlinksInPath().path
-                guard ProcessAncestry.executablePath(of: pid) == claimedPath else {
-                    return .failed(
-                        .invalidRequest,
-                        message: "the planned requester does not match the verified parent",
-                        requestID: requestID
-                    )
-                }
-                // A separate requester identity is a signed-launcher assertion,
-                // but csecd still recomputes its path, signature metadata, and
-                // writable-path assurance. Recheck the live image afterwards
-                // so an intervening parent exec cannot race the inspection.
-                if deliveryPlan.requestingExecutable != nil {
-                    guard let inspected = try? ExecutableInspection.plannedExecutable(
-                        command: claimedPath
-                    ), inspected == requester,
-                    ProcessAncestry.executablePath(of: pid) == claimedPath else {
-                        return .failed(
-                            .invalidRequest,
-                            message: "the planned requester identity could not be verified",
-                            requestID: requestID
-                        )
-                    }
-                }
             }
             if deliveryPlan.mechanism == .credentialProtocol {
                 guard let parentPID = ProcessAncestry.parent(of: caller.pid),
@@ -261,7 +233,7 @@ public actor Agent {
         planDigest: String,
         now: Date
     ) async -> Response {
-        let invalidated = await grants.revalidate(policyVersion: RiskPolicyV1.version)
+        let invalidated = await grants.revalidate(policyVersion: RiskPolicyV2.version)
         await resolver.invalidate(references: invalidated)
 
         var states: [CredentialPolicyState] = []
@@ -275,18 +247,17 @@ public actor Agent {
                 )
                 let judgment = try await riskJudgments.load(
                     credentialKey: identity.credentialKey,
-                    policyVersion: RiskPolicyV1.version,
+                    policyVersion: RiskPolicyV2.version,
                     at: now
                 )
                 let acceptance = try await riskJudgments.loadAcceptance(
                     credentialKey: identity.credentialKey,
-                    mechanism: plan.mechanism,
-                    assurance: plan.executable.assurance,
-                    policyVersion: RiskPolicyV1.version,
+                    plan: plan,
+                    policyVersion: RiskPolicyV2.version,
                     at: now
                 )
                 let storedLevel = judgment?.level ?? .unknown
-                let decision = RiskPolicyV1.evaluate(RiskPolicyInput(
+                let decision = RiskPolicyV2.evaluate(RiskPolicyInput(
                     credentialKey: identity.credentialKey,
                     storedLevel: storedLevel,
                     evidence: judgment?.evidence ?? [],
@@ -391,7 +362,7 @@ public actor Agent {
                     states[index].storedLevel = selected
                 }
 
-                states[index].decision = RiskPolicyV1.evaluate(RiskPolicyInput(
+                states[index].decision = RiskPolicyV2.evaluate(RiskPolicyInput(
                     credentialKey: states[index].identity.credentialKey,
                     storedLevel: states[index].storedLevel,
                     evidence: states[index].judgment?.evidence ?? [],
@@ -405,18 +376,15 @@ public actor Agent {
                    approval.acceptedCompatibilityCredentialKeys.contains(
                        states[index].identity.credentialKey
                    ) {
-                    states[index].acceptance = DeliveryAcceptance(
+                    let newAcceptance = compatibilityAcceptance(
                         credentialKey: states[index].identity.credentialKey,
-                        mechanism: plan.mechanism,
-                        consumerAssurance: plan.executable.assurance,
-                        policyVersion: RiskPolicyV1.version,
-                        acceptedAt: now,
-                        reviewAfter: now.addingTimeInterval(
-                            TimeInterval(RiskPolicyV1.compatibilityAcceptanceReviewSeconds)
-                        )
+                        plan: plan,
+                        decision: states[index].decision,
+                        now: now
                     )
-                    states[index].acceptanceWasAdded = true
-                    states[index].decision = RiskPolicyV1.evaluate(RiskPolicyInput(
+                    states[index].acceptance = newAcceptance.acceptance
+                    states[index].acceptanceWasAdded = newAcceptance.shouldPersist
+                    states[index].decision = RiskPolicyV2.evaluate(RiskPolicyInput(
                         credentialKey: states[index].identity.credentialKey,
                         storedLevel: states[index].storedLevel,
                         evidence: states[index].judgment?.evidence ?? [],
@@ -427,7 +395,23 @@ public actor Agent {
                 }
             }
 
-            if let denied = states.first(where: { !$0.decision.allowed }) {
+            if let denied = states.first(where: { state in
+                guard !state.decision.allowed else { return false }
+
+                // High/critical compatibility acceptance deliberately lives
+                // only for the risk-capped live grant. When a mixed request
+                // adds another credential, do not make an already-accessible
+                // reference recreate a persisted acceptance merely because
+                // its policy evaluation once again reports the review gate.
+                // Any credential that needs a new grant must still be
+                // explicitly accepted in this review.
+                if state.decision.denialReason == .compatibilityAcceptanceRequired {
+                    return state.descriptor.references.contains {
+                        newReferenceURIs.contains($0.uri)
+                    }
+                }
+                return true
+            }) {
                 await approval.authenticationSession?.cancel()
                 return policyDenied(denied.decision, plan: plan, requestID: request.requestID)
             }
@@ -459,6 +443,16 @@ public actor Agent {
                 )
             }
 
+            guard let releaseRoot = verifyDeliveryRoot(plan, caller: caller),
+                  releaseRoot.pid == rootPID,
+                  releaseRoot.startTime == rootStartTime else {
+                return .failed(
+                    .invalidRequest,
+                    message: "the approved requester changed before release",
+                    requestID: request.requestID
+                )
+            }
+
             // Classification/scope/compatibility choices become durable only
             // after the fresh OS authentication succeeds.
             do {
@@ -481,9 +475,9 @@ public actor Agent {
                             source: .explicitUser,
                             decidedAt: now,
                             reviewAfter: now.addingTimeInterval(
-                                TimeInterval(RiskPolicyV1.judgmentReviewSeconds)
+                                TimeInterval(RiskPolicyV2.judgmentReviewSeconds)
                             ),
-                            policyVersion: RiskPolicyV1.version,
+                            policyVersion: RiskPolicyV2.version,
                             providerRevision: state.judgment?.providerRevision,
                             observedScopeDigest: state.judgment?.observedScopeDigest
                         )
@@ -522,17 +516,30 @@ public actor Agent {
                 ))
             }
 
-            return await resolve(
+            let response = await resolve(
                 refs: refs,
                 requestID: request.requestID,
                 unlock: approvedUnlock,
                 activeUntil: now.addingTimeInterval(TimeInterval(grantedTTL))
             )
+            guard let finalRoot = verifyDeliveryRoot(plan, caller: caller),
+                  finalRoot.pid == rootPID,
+                  finalRoot.startTime == rootStartTime else {
+                return .failed(
+                    .invalidRequest,
+                    message: "the approved requester changed during release",
+                    requestID: request.requestID
+                )
+            }
+            return response
         }
 
         guard let grantedTTL = states.map(\.decision.grantedTTLSeconds).min(),
               grantedTTL > 0,
-              states.allSatisfy({ $0.decision.allowed }) else {
+              states.allSatisfy({
+                  $0.decision.allowed
+                    || $0.decision.denialReason == .compatibilityAcceptanceRequired
+              }) else {
             let denied = states.first(where: { !$0.decision.allowed })?.decision
             return denied.map {
                 policyDenied($0, plan: plan, requestID: request.requestID)
@@ -542,12 +549,31 @@ public actor Agent {
                 requestID: request.requestID
             )
         }
-        return await resolve(
+        guard let releaseRoot = verifyDeliveryRoot(plan, caller: caller),
+              releaseRoot.pid == rootPID,
+              releaseRoot.startTime == rootStartTime else {
+            return .failed(
+                .invalidRequest,
+                message: "the granted requester changed before release",
+                requestID: request.requestID
+            )
+        }
+        let response = await resolve(
             refs: refs,
             requestID: request.requestID,
             unlock: nil,
             activeUntil: now.addingTimeInterval(TimeInterval(grantedTTL))
         )
+        guard let finalRoot = verifyDeliveryRoot(plan, caller: caller),
+              finalRoot.pid == rootPID,
+              finalRoot.startTime == rootStartTime else {
+            return .failed(
+                .invalidRequest,
+                message: "the granted requester changed during release",
+                requestID: request.requestID
+            )
+        }
+        return response
     }
 
     private func handleLegacyAccess(
@@ -637,6 +663,28 @@ public actor Agent {
             policyVersion: state.decision.policyVersion,
             policyDigest: state.decision.policyDigest,
             outputPolicy: state.decision.outputPolicy
+        )
+    }
+
+    private func compatibilityAcceptance(
+        credentialKey: String,
+        plan: DeliveryPlan,
+        decision: PolicyDecision,
+        now: Date
+    ) -> (acceptance: DeliveryAcceptance, shouldPersist: Bool) {
+        let shouldPersist = decision.effectiveLevel == .standard
+        let lifetime = shouldPersist
+            ? RiskPolicyV2.compatibilityAcceptanceReviewSeconds
+            : decision.grantedTTLSeconds
+        return (
+            DeliveryAcceptance(
+                credentialKey: credentialKey,
+                shape: CompatibilityDeliveryShape(plan: plan),
+                policyVersion: RiskPolicyV2.version,
+                acceptedAt: now,
+                reviewAfter: now.addingTimeInterval(TimeInterval(lifetime))
+            ),
+            shouldPersist
         )
     }
 
@@ -792,9 +840,9 @@ public actor Agent {
                     source: .explicitUser,
                     decidedAt: now,
                     reviewAfter: now.addingTimeInterval(
-                        TimeInterval(RiskPolicyV1.judgmentReviewSeconds)
+                        TimeInterval(RiskPolicyV2.judgmentReviewSeconds)
                     ),
-                    policyVersion: RiskPolicyV1.version,
+                    policyVersion: RiskPolicyV2.version,
                     providerRevision: context.judgment?.providerRevision,
                     observedScopeDigest: context.judgment?.observedScopeDigest
                 ))
@@ -846,12 +894,12 @@ public actor Agent {
         )
         let judgment = try await riskJudgments.load(
             credentialKey: identity.credentialKey,
-            policyVersion: RiskPolicyV1.version,
+            policyVersion: RiskPolicyV2.version,
             at: now
         )
         let acceptances = try await riskJudgments.loadAcceptances(
             credentialKey: identity.credentialKey,
-            policyVersion: RiskPolicyV1.version,
+            policyVersion: RiskPolicyV2.version,
             at: now
         )
         let knownMembers = Set(judgment?.credential.memberReferenceKeys ?? [])
@@ -872,13 +920,17 @@ public actor Agent {
             effectiveLevel: level.effectiveFloor,
             decidedAt: context.judgment?.decidedAt,
             reviewAfter: context.judgment?.reviewAfter,
-            policyVersion: RiskPolicyV1.version,
+            policyVersion: RiskPolicyV2.version,
             knownMemberCount: context.judgment?.credential.memberReferenceKeys.count ?? 0,
             referenceInKnownScope: context.referenceInKnownScope,
             acceptances: context.acceptances.map {
                 RiskAcceptanceInspection(
-                    mechanism: $0.mechanism,
-                    consumerAssurance: $0.consumerAssurance,
+                    mechanism: $0.shape.mechanism,
+                    destination: $0.shape.destination,
+                    descendantScope: $0.shape.descendantScope,
+                    emitterAssurance: $0.shape.emitterAssurance,
+                    requesterAssurance: $0.shape.requesterAssurance,
+                    recipientAssurance: $0.shape.recipientAssurance,
                     reviewAfter: $0.reviewAfter
                 )
             }
@@ -903,7 +955,8 @@ public actor Agent {
         }
         return "risk \(levels); delivery \(plan.mechanism.rawValue); "
             + "root \(root); scope \(plan.descendantScope.rawValue); "
-            + "destination \(plan.destination.rawValue)\(weak)"
+            + "destination \(plan.destination.rawValue); recipient "
+            + "\(plan.recipientAssurance?.rawValue ?? "planned_consumer")\(weak)"
     }
 
     /// Production policy review freezes its visible choices at biometric
@@ -1138,10 +1191,14 @@ public actor Agent {
                 .insert(consentReference.uri)
             var storedLevel = context.judgment?.level ?? .unknown
             var acceptance = context.acceptances.first {
-                $0.mechanism == plan.mechanism
-                    && $0.consumerAssurance == plan.executable.assurance
+                $0.permits(
+                    credentialKey: context.identity.credentialKey,
+                    plan: plan,
+                    policyVersion: RiskPolicyV2.version,
+                    at: now
+                )
             }
-            var decision = RiskPolicyV1.evaluate(RiskPolicyInput(
+            var decision = RiskPolicyV2.evaluate(RiskPolicyInput(
                 credentialKey: context.identity.credentialKey,
                 storedLevel: storedLevel,
                 evidence: context.judgment?.evidence ?? [],
@@ -1193,7 +1250,7 @@ public actor Agent {
                 }
                 storedLevel = selected
             }
-            decision = RiskPolicyV1.evaluate(RiskPolicyInput(
+            decision = RiskPolicyV2.evaluate(RiskPolicyInput(
                 credentialKey: context.identity.credentialKey,
                 storedLevel: storedLevel,
                 evidence: context.judgment?.evidence ?? [],
@@ -1207,18 +1264,15 @@ public actor Agent {
                approval.acceptedCompatibilityCredentialKeys.contains(
                    context.identity.credentialKey
                ) {
-                acceptance = DeliveryAcceptance(
+                let newAcceptance = compatibilityAcceptance(
                     credentialKey: context.identity.credentialKey,
-                    mechanism: plan.mechanism,
-                    consumerAssurance: plan.executable.assurance,
-                    policyVersion: RiskPolicyV1.version,
-                    acceptedAt: now,
-                    reviewAfter: now.addingTimeInterval(
-                        TimeInterval(RiskPolicyV1.compatibilityAcceptanceReviewSeconds)
-                    )
+                    plan: plan,
+                    decision: decision,
+                    now: now
                 )
-                acceptanceWasAdded = true
-                decision = RiskPolicyV1.evaluate(RiskPolicyInput(
+                acceptance = newAcceptance.acceptance
+                acceptanceWasAdded = newAcceptance.shouldPersist
+                decision = RiskPolicyV2.evaluate(RiskPolicyInput(
                     credentialKey: context.identity.credentialKey,
                     storedLevel: storedLevel,
                     evidence: context.judgment?.evidence ?? [],
@@ -1268,9 +1322,9 @@ public actor Agent {
                     source: .explicitUser,
                     decidedAt: now,
                     reviewAfter: now.addingTimeInterval(
-                        TimeInterval(RiskPolicyV1.judgmentReviewSeconds)
+                        TimeInterval(RiskPolicyV2.judgmentReviewSeconds)
                     ),
-                    policyVersion: RiskPolicyV1.version,
+                    policyVersion: RiskPolicyV2.version,
                     providerRevision: context.judgment?.providerRevision,
                     observedScopeDigest: context.judgment?.observedScopeDigest
                 ))
@@ -1406,10 +1460,14 @@ public actor Agent {
         let now = Date()
         let context = try await riskContext(for: authorization.reference, now: now)
         let acceptance = context.acceptances.first {
-            $0.mechanism == authorization.plan.mechanism
-                && $0.consumerAssurance == authorization.plan.executable.assurance
+            $0.permits(
+                credentialKey: context.identity.credentialKey,
+                plan: authorization.plan,
+                policyVersion: RiskPolicyV2.version,
+                at: now
+            )
         }
-        let decision = RiskPolicyV1.evaluate(RiskPolicyInput(
+        let decision = RiskPolicyV2.evaluate(RiskPolicyInput(
             credentialKey: context.identity.credentialKey,
             storedLevel: context.judgment?.level ?? .unknown,
             evidence: context.judgment?.evidence ?? [],
@@ -1589,6 +1647,30 @@ public actor Agent {
         }
     }
 
+    private func verifyDeliveryRoot(
+        _ plan: DeliveryPlan,
+        caller: CallerInfo
+    ) -> (pid: pid_t, startTime: UInt64)? {
+        guard let root = verifyRoot(plan.root, caller: caller) else { return nil }
+        guard case let .directParent(pid, _) = plan.root else { return root }
+
+        let requester = plan.requestingExecutable ?? plan.executable
+        let claimedPath = URL(fileURLWithPath: requester.canonicalPath)
+            .standardizedFileURL.resolvingSymlinksInPath().path
+        guard ProcessAncestry.executablePath(of: pid) == claimedPath else { return nil }
+
+        // A separate requester identity is a signed-launcher assertion, but
+        // csecd independently recomputes it and then rechecks the live image.
+        if plan.requestingExecutable != nil {
+            guard let inspected = try? ExecutableInspection.plannedExecutable(
+                command: claimedPath
+            ), inspected == requester,
+            ProcessAncestry.startTime(of: pid) == root.startTime,
+            ProcessAncestry.executablePath(of: pid) == claimedPath else { return nil }
+        }
+        return root
+    }
+
     private func pruneRegisteredSessions() {
         registeredSessions = registeredSessions.filter {
             ProcessAncestry.startTime(of: $0.value.rootPID) == $0.value.rootStartTime
@@ -1599,6 +1681,7 @@ public actor Agent {
         let executable = plan.executable
         return hasValidExecutableMetadata(executable)
             && hasValidRequesterMetadata(plan)
+            && hasValidRecipientMetadata(plan)
             && !plan.operationContext.isEmpty
             && plan.operationContext.utf8.count <= 512
             && !plan.operationContext.utf8.contains(0)
@@ -1634,6 +1717,32 @@ public actor Agent {
             && (executable.cdHash.map {
                 !$0.isEmpty && $0.utf8.count <= 128 && $0.utf8.allSatisfy(isLowerHex)
             } ?? true)
+    }
+
+    private static func hasValidRecipientMetadata(_ plan: DeliveryPlan) -> Bool {
+        switch (plan.mechanism, plan.destination, plan.recipientAssurance) {
+        case (.rawStandardOutput, .humanOutput, .interactiveTerminal),
+             (.rawStandardOutput, .shellDelegatedPipe, .unverifiedPipeReader),
+             (.namedPlaintextFile, .persistentPlaintextFile, .ordinaryPersistentFile):
+            guard plan.executable.assurance == .verifiedProduct,
+                  plan.executable.signingIdentifier == ProductCodeIdentity.launcherIdentifier,
+                  plan.executable.teamIdentifier == ProductCodeIdentity.teamIdentifier,
+                  plan.requestingExecutable != nil,
+                  plan.descendantScope == .subtree,
+                  case .directParent = plan.root else { return false }
+            return true
+        case (.rawStandardOutput, _, _):
+            // Raw stdout is exposed only through the fully described csec-get
+            // shapes above. In particular, omitting the requester/recipient or
+            // relabelling a pipe as terminal output is malformed metadata.
+            return false
+        case (_, .shellDelegatedPipe, _), (_, .persistentPlaintextFile, _):
+            return false
+        case (_, _, .some):
+            return false
+        case (_, _, .none):
+            return true
+        }
     }
 
     private static func hasValidRootScope(_ plan: DeliveryPlan) -> Bool {

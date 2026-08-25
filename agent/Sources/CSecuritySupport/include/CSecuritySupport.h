@@ -55,6 +55,10 @@ int32_t cs_proc_path(int32_t pid, char *path_buf, int32_t path_bufsize);
 /// terminal. Used to keep bridge plaintext off accidental stdout destinations.
 int32_t cs_fd_is_pipe_or_socket(int fd);
 
+/// Whether an fd is an ordinary regular file. The path used to open it is not
+/// inspected or returned.
+int32_t cs_fd_is_regular_file(int fd);
+
 /// Parent PID of `pid`, or -1 if unavailable.
 int32_t cs_proc_ppid(int32_t pid);
 

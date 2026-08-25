@@ -30,11 +30,15 @@ public actor InMemoryRiskJudgmentBackend: RiskJudgmentBackend {
     }
 }
 
+private struct DeliveryAcceptanceLedger: Codable {
+    let entries: [DeliveryAcceptance]
+}
+
 /// Integrity-protected judgment store. It stores no raw provider reference:
 /// account names and member identities are HMACs under an agent-only device key.
 public actor RiskJudgmentStore {
     public static let policyService = "com.alexspeller.convenient-security.judgments"
-    public static let acceptanceService = "com.alexspeller.convenient-security.delivery-acceptance"
+    public static let acceptanceService = "com.alexspeller.convenient-security.delivery-acceptance-v2"
     public static let keyService = "com.alexspeller.convenient-security.judgment-key"
     private static let keyAccount = "device-hmac-key-v1"
 
@@ -129,62 +133,68 @@ public actor RiskJudgmentStore {
         guard Self.isOpaqueDigest(acceptance.credentialKey) else {
             throw RiskJudgmentStoreError.invalidOpaqueMetadata
         }
-        guard acceptance.acceptedAt < acceptance.reviewAfter else {
+        guard acceptance.shape.mechanism.isWeakCompatibility,
+              acceptance.acceptedAt < acceptance.reviewAfter else {
             throw RiskJudgmentStoreError.invalidReviewWindow
         }
-        let account = "\(acceptance.credentialKey).\(acceptance.mechanism.rawValue).\(acceptance.consumerAssurance.rawValue)"
+        var acceptances = try await currentAcceptances(
+            credentialKey: acceptance.credentialKey,
+            policyVersion: acceptance.policyVersion,
+            at: acceptance.acceptedAt
+        )
+        acceptances.removeAll { $0.shape == acceptance.shape }
+        acceptances.append(acceptance)
         try await backend.store(
             service: Self.acceptanceService,
-            account: account,
-            data: try JSONEncoder().encode(acceptance)
+            account: acceptance.credentialKey,
+            data: try JSONEncoder().encode(DeliveryAcceptanceLedger(entries: acceptances))
         )
     }
 
     public func loadAcceptance(
         credentialKey: String,
-        mechanism: DeliveryMechanism,
-        assurance: ConsumerAssurance,
+        plan: DeliveryPlan,
         policyVersion: Int,
         at date: Date = Date()
     ) async throws -> DeliveryAcceptance? {
-        guard Self.isOpaqueDigest(credentialKey) else { return nil }
-        let account = "\(credentialKey).\(mechanism.rawValue).\(assurance.rawValue)"
-        guard let data = try await backend.load(
-            service: Self.acceptanceService,
-            account: account
-        ) else { return nil }
-        guard let acceptance = try? JSONDecoder().decode(DeliveryAcceptance.self, from: data),
-              acceptance.credentialKey == credentialKey,
-              acceptance.mechanism == mechanism,
-              acceptance.consumerAssurance == assurance,
-              acceptance.acceptedAt < acceptance.reviewAfter,
-              acceptance.policyVersion == policyVersion,
-              date < acceptance.reviewAfter else {
-            try? await backend.delete(service: Self.acceptanceService, account: account)
-            return nil
-        }
-        return acceptance
+        guard plan.mechanism.isWeakCompatibility else { return nil }
+        return try await currentAcceptances(
+            credentialKey: credentialKey,
+            policyVersion: policyVersion,
+            at: date
+        ).first { $0.permits(
+            credentialKey: credentialKey,
+            plan: plan,
+            policyVersion: policyVersion,
+            at: date
+        ) }
     }
 
     public func forgetAcceptance(
         credentialKey: String,
-        mechanism: DeliveryMechanism,
-        assurance: ConsumerAssurance
+        shape: CompatibilityDeliveryShape,
+        policyVersion: Int,
+        at date: Date = Date()
     ) async throws {
-        let account = "\(credentialKey).\(mechanism.rawValue).\(assurance.rawValue)"
-        try await backend.delete(service: Self.acceptanceService, account: account)
+        var acceptances = try await currentAcceptances(
+            credentialKey: credentialKey,
+            policyVersion: policyVersion,
+            at: date
+        )
+        acceptances.removeAll { $0.shape == shape }
+        if acceptances.isEmpty {
+            try await forgetAcceptances(credentialKey: credentialKey)
+        } else {
+            try await backend.store(
+                service: Self.acceptanceService,
+                account: credentialKey,
+                data: try JSONEncoder().encode(DeliveryAcceptanceLedger(entries: acceptances))
+            )
+        }
     }
 
     public func forgetAcceptances(credentialKey: String) async throws {
-        for mechanism in DeliveryMechanism.allCases {
-            for assurance in ConsumerAssurance.allCases {
-                try await forgetAcceptance(
-                    credentialKey: credentialKey,
-                    mechanism: mechanism,
-                    assurance: assurance
-                )
-            }
-        }
+        try await backend.delete(service: Self.acceptanceService, account: credentialKey)
     }
 
     public func loadAcceptances(
@@ -192,24 +202,61 @@ public actor RiskJudgmentStore {
         policyVersion: Int,
         at date: Date = Date()
     ) async throws -> [DeliveryAcceptance] {
-        var result: [DeliveryAcceptance] = []
-        for mechanism in DeliveryMechanism.allCases {
-            for assurance in ConsumerAssurance.allCases {
-                if let acceptance = try await loadAcceptance(
-                    credentialKey: credentialKey,
-                    mechanism: mechanism,
-                    assurance: assurance,
-                    policyVersion: policyVersion,
-                    at: date
-                ) {
-                    result.append(acceptance)
-                }
+        try await currentAcceptances(
+            credentialKey: credentialKey,
+            policyVersion: policyVersion,
+            at: date
+        ).sorted { acceptanceSortKey($0) < acceptanceSortKey($1) }
+    }
+
+    private func currentAcceptances(
+        credentialKey: String,
+        policyVersion: Int,
+        at date: Date
+    ) async throws -> [DeliveryAcceptance] {
+        guard Self.isOpaqueDigest(credentialKey) else { return [] }
+        guard let data = try await backend.load(
+            service: Self.acceptanceService,
+            account: credentialKey
+        ) else { return [] }
+        guard let ledger = try? JSONDecoder().decode(DeliveryAcceptanceLedger.self, from: data)
+        else {
+            try? await forgetAcceptances(credentialKey: credentialKey)
+            return []
+        }
+        let current = ledger.entries.filter {
+            $0.credentialKey == credentialKey
+                && $0.shape.mechanism.isWeakCompatibility
+                && $0.acceptedAt < $0.reviewAfter
+                && $0.policyVersion == policyVersion
+                && date < $0.reviewAfter
+        }
+        if current.count != ledger.entries.count {
+            if current.isEmpty {
+                try? await forgetAcceptances(credentialKey: credentialKey)
+            } else {
+                try? await backend.store(
+                    service: Self.acceptanceService,
+                    account: credentialKey,
+                    data: JSONEncoder().encode(DeliveryAcceptanceLedger(entries: current))
+                )
             }
         }
-        return result.sorted {
-            ($0.mechanism.rawValue, $0.consumerAssurance.rawValue)
-                < ($1.mechanism.rawValue, $1.consumerAssurance.rawValue)
-        }
+        return current
+    }
+
+    private func acceptanceSortKey(
+        _ acceptance: DeliveryAcceptance
+    ) -> (String, String, String, String, String, String) {
+        let shape = acceptance.shape
+        return (
+            shape.mechanism.rawValue,
+            shape.destination.rawValue,
+            shape.descendantScope.rawValue,
+            shape.emitterAssurance.rawValue,
+            shape.requesterAssurance?.rawValue ?? "",
+            shape.recipientAssurance?.rawValue ?? ""
+        )
     }
 
     private func deviceKey() async throws -> SymmetricKey {

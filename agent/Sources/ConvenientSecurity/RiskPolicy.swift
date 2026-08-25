@@ -138,25 +138,43 @@ public struct RiskJudgment: Codable, Sendable, Equatable {
 
 /// Explicit acceptance of a weaker compatibility delivery, stored separately
 /// from the credential's inherent risk judgment.
+public struct CompatibilityDeliveryShape: Codable, Sendable, Equatable {
+    public let mechanism: DeliveryMechanism
+    public let destination: DestinationClass
+    public let descendantScope: DescendantScope
+    public let emitterAssurance: ConsumerAssurance
+    public let requesterAssurance: ConsumerAssurance?
+    public let recipientAssurance: RecipientAssurance?
+
+    public init(plan: DeliveryPlan) {
+        self.mechanism = plan.mechanism
+        self.destination = plan.destination
+        self.descendantScope = plan.descendantScope
+        self.emitterAssurance = plan.executable.assurance
+        self.requesterAssurance = plan.requestingExecutable?.assurance
+        self.recipientAssurance = plan.recipientAssurance
+    }
+}
+
 public struct DeliveryAcceptance: Codable, Sendable, Equatable {
     public let credentialKey: String
-    public let mechanism: DeliveryMechanism
-    public let consumerAssurance: ConsumerAssurance
+    public let shape: CompatibilityDeliveryShape
     public let policyVersion: Int
     public let acceptedAt: Date
     public let reviewAfter: Date
 
+    public var mechanism: DeliveryMechanism { shape.mechanism }
+    public var consumerAssurance: ConsumerAssurance { shape.emitterAssurance }
+
     public init(
         credentialKey: String,
-        mechanism: DeliveryMechanism,
-        consumerAssurance: ConsumerAssurance,
+        shape: CompatibilityDeliveryShape,
         policyVersion: Int,
         acceptedAt: Date,
         reviewAfter: Date
     ) {
         self.credentialKey = credentialKey
-        self.mechanism = mechanism
-        self.consumerAssurance = consumerAssurance
+        self.shape = shape
         self.policyVersion = policyVersion
         self.acceptedAt = acceptedAt
         self.reviewAfter = reviewAfter
@@ -169,8 +187,7 @@ public struct DeliveryAcceptance: Codable, Sendable, Equatable {
         at date: Date
     ) -> Bool {
         self.credentialKey == credentialKey
-            && mechanism == plan.mechanism
-            && consumerAssurance == plan.executable.assurance
+            && shape == CompatibilityDeliveryShape(plan: plan)
             && self.policyVersion == policyVersion
             && date < reviewAfter
     }
@@ -235,8 +252,8 @@ public struct PolicyDecision: Codable, Sendable, Equatable {
 /// Single, versioned policy table used by the shipping agent before it resolves
 /// plaintext. Review windows live beside the mechanism/TTL matrix so UI, grant,
 /// and persistence code cannot silently choose different policy lifetimes.
-public enum RiskPolicyV1 {
-    public static let version = 1
+public enum RiskPolicyV2 {
+    public static let version = 2
     public static let judgmentReviewSeconds = 90 * 24 * 60 * 60
     public static let compatibilityAcceptanceReviewSeconds = 30 * 24 * 60 * 60
 
@@ -248,29 +265,23 @@ public enum RiskPolicyV1 {
         let rule = rule(for: effective)
         var mechanisms = rule.mechanisms
         var denial: PolicyDenialReason?
+        let compatibilityApprovalRequired = effective != .low
+            && input.plan.mechanism.isWeakCompatibility
+        let hasCompatibilityApproval = input.acceptance?.permits(
+            credentialKey: input.credentialKey,
+            plan: input.plan,
+            policyVersion: version,
+            at: input.now
+        ) == true
 
-        if effective == .standard, input.plan.mechanism.isWeakCompatibility {
-            if input.acceptance?.permits(
-                credentialKey: input.credentialKey,
-                plan: input.plan,
-                policyVersion: version,
-                at: input.now
-            ) == true {
-                mechanisms.insert(input.plan.mechanism)
-            } else {
-                denial = .compatibilityAcceptanceRequired
-            }
+        if hasCompatibilityApproval {
+            mechanisms.insert(input.plan.mechanism)
         }
 
         if classificationRequired {
             denial = .classificationRequired
         } else if input.plan.requestedTTLSeconds <= 0 {
             denial = .invalidTTL
-        } else if denial != nil {
-            // Preserve the more specific compatibility-acceptance result set
-            // above instead of collapsing it into mechanism_forbidden.
-        } else if !mechanisms.contains(input.plan.mechanism) {
-            denial = .mechanismForbidden
         } else if !rule.assurances.contains(input.plan.executable.assurance) {
             denial = .consumerAssuranceInsufficient
         } else if (effective == .high || effective == .critical)
@@ -285,8 +296,14 @@ public enum RiskPolicyV1 {
             // High-impact credentials keep a per-command root. A convenience
             // session deliberately expands trust to sibling descendants.
             denial = .descendantScopeTooBroad
-        } else if effective == .critical && input.plan.descendantScope != .exactProcess {
+        } else if effective == .critical
+                    && input.plan.descendantScope != .exactProcess
+                    && !isShellScopedGetCompatibility(input.plan) {
             denial = .descendantScopeTooBroad
+        } else if compatibilityApprovalRequired && !hasCompatibilityApproval {
+            denial = .compatibilityAcceptanceRequired
+        } else if !mechanisms.contains(input.plan.mechanism) {
+            denial = .mechanismForbidden
         }
 
         let grantedTTL = min(max(input.plan.requestedTTLSeconds, 0), rule.ttlCap)
@@ -306,9 +323,14 @@ public enum RiskPolicyV1 {
             assurance: input.plan.executable.assurance,
             descendantScope: input.plan.descendantScope,
             destination: input.plan.destination,
+            recipientAssurance: input.plan.recipientAssurance,
             outputGuard: input.plan.outputGuard,
             ttl: grantedTTL,
-            allowed: denial == nil
+            // A live grant is the proof that a transient high/critical
+            // compatibility approval occurred. Keep pending-versus-approved
+            // acceptance out of this digest so that exact, risk-capped grant
+            // can be reused without persisting a broader acceptance.
+            compatibilityDelivery: input.plan.mechanism.isWeakCompatibility
         )
         let digest = (try? digestMaterial.digest()) ?? "policy-digest-error"
 
@@ -378,9 +400,29 @@ public enum RiskPolicyV1 {
     private static func destinationFloors(_ destination: DestinationClass) -> [RiskLevel] {
         switch destination {
         case .production: return [.high]
-        case .staging, .aiTool, .humanOutput: return [.standard]
+        case .staging, .aiTool: return [.standard]
         case .unknown: return [.high]
-        case .localDevelopment, .credentialConsumer: return []
+        case .localDevelopment, .humanOutput, .shellDelegatedPipe,
+             .persistentPlaintextFile, .credentialConsumer:
+            return []
+        }
+    }
+
+    /// Critical credentials normally require an exact-process root. Signed
+    /// `csec get` is the narrow exception: the explicitly verified parent shell
+    /// owns a short, digest-bound grant while csec remains the byte emitter.
+    private static func isShellScopedGetCompatibility(_ plan: DeliveryPlan) -> Bool {
+        guard plan.executable.assurance == .verifiedProduct,
+              plan.requestingExecutable != nil,
+              plan.descendantScope == .subtree,
+              case .directParent = plan.root else { return false }
+        switch (plan.mechanism, plan.destination, plan.recipientAssurance) {
+        case (.rawStandardOutput, .humanOutput, .interactiveTerminal),
+             (.rawStandardOutput, .shellDelegatedPipe, .unverifiedPipeReader),
+             (.namedPlaintextFile, .persistentPlaintextFile, .ordinaryPersistentFile):
+            return true
+        default:
+            return false
         }
     }
 }
@@ -392,9 +434,10 @@ private struct PolicyDigestMaterial: Codable {
     let assurance: ConsumerAssurance
     let descendantScope: DescendantScope
     let destination: DestinationClass
+    let recipientAssurance: RecipientAssurance?
     let outputGuard: OutputGuardPlan?
     let ttl: Int
-    let allowed: Bool
+    let compatibilityDelivery: Bool
 
     func digest() throws -> String {
         let encoder = JSONEncoder()

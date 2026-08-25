@@ -16,8 +16,9 @@ public enum DeliveryMechanism: String, Codable, Sendable, CaseIterable {
     case credentialProtocol = "credential_protocol"
 
     /// Compatibility mechanisms that deliberately expose plaintext outside a
-    /// protected consumer heap/fd/capability boundary. Standard-risk use needs
-    /// a separately cached acceptance; high and critical policy forbid them.
+    /// protected consumer heap/fd/capability boundary. Policy applies explicit
+    /// review, authentication, and risk-capped reuse rather than treating the
+    /// weaker delivery choice itself as an integrity failure.
     public var isWeakCompatibility: Bool {
         switch self {
         case .unrestrictedInitialEnvironment, .rawStandardOutput, .namedPlaintextFile:
@@ -51,8 +52,19 @@ public enum DestinationClass: String, Codable, Sendable, CaseIterable {
     case production
     case aiTool = "ai_tool"
     case humanOutput = "human_output"
+    case shellDelegatedPipe = "shell_delegated_pipe"
+    case persistentPlaintextFile = "persistent_plaintext_file"
     case credentialConsumer = "credential_consumer"
     case unknown
+}
+
+/// What receives plaintext after the planned emitter. This is deliberately
+/// separate from `executable`: for `csec get`, signed csec emits the bytes but
+/// cannot authenticate a generic pipeline reader or protect an ordinary file.
+public enum RecipientAssurance: String, Codable, Sendable, CaseIterable {
+    case interactiveTerminal = "interactive_terminal"
+    case unverifiedPipeReader = "unverified_pipe_reader"
+    case ordinaryPersistentFile = "ordinary_persistent_file"
 }
 
 /// The process to which a successful subtree grant is rooted. Only the signed
@@ -142,6 +154,9 @@ public struct DeliveryPlan: Codable, Sendable, Equatable {
     public let root: DeliveryRoot
     public let descendantScope: DescendantScope
     public let destination: DestinationClass
+    /// Explicit final-recipient semantics for compatibility output. It carries
+    /// no file name, command line, secret reference, or secret value.
+    public let recipientAssurance: RecipientAssurance?
     public let requestedTTLSeconds: Int
     /// A bounded human description (for example "rails boot"), never argv.
     public let operationContext: String
@@ -159,6 +174,7 @@ public struct DeliveryPlan: Codable, Sendable, Equatable {
         root: DeliveryRoot = .caller,
         descendantScope: DescendantScope,
         destination: DestinationClass,
+        recipientAssurance: RecipientAssurance? = nil,
         requestedTTLSeconds: Int,
         operationContext: String,
         commandDigest: String? = nil,
@@ -170,6 +186,7 @@ public struct DeliveryPlan: Codable, Sendable, Equatable {
         self.root = root
         self.descendantScope = descendantScope
         self.destination = destination
+        self.recipientAssurance = recipientAssurance
         self.requestedTTLSeconds = requestedTTLSeconds
         self.operationContext = operationContext
         self.commandDigest = commandDigest

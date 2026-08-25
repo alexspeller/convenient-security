@@ -85,8 +85,8 @@ of the trusted consumer boundary.
 
 The production daemon owns one AppKit policy-and-authentication window. It
 contains no values: it shows the logical credential references, stored risk,
-delivery mechanism, actual planned executable, consumer assurance, destination,
-scope, and requested duration. A newly observed logical credential must be
+delivery mechanism, requester/grant owner, emitter, recipient assurance,
+destination, scope, and requested duration. A newly observed logical credential must be
 classified as low, standard, high, or critical. Acceptance of a weak
 compatibility delivery is a separate, initially unchecked decision rather than
 part of the classification.
@@ -232,9 +232,10 @@ child's initial environment. This works with unmodified tools, but macOS process
 inspection can expose that original environment to unrelated same-UID
 processes. Risk policy treats this as weak compatibility delivery: low risk is
 allowed, standard risk requires a separate 30-day compatibility acceptance, and
-high or critical risk is rejected before cache/provider resolution. Output-guard
-configuration is part of both the delivery-plan and policy digests but does not
-make the environment private.
+high or critical risk is rejected before cache/provider resolution because the
+generic complete consumer is unverified. The weak mechanism alone is not the
+integrity failure. Output-guard configuration is part of both the delivery-plan
+and policy digests but does not make the environment private.
 
 When output policy is active, `csec` remains as the process supervisor and uses
 a child PTY or pipes. Terminal output is guarded by default. Non-terminal output
@@ -243,18 +244,38 @@ remains byte-exact with a warning unless `--redact-output=always` is selected.
 
 ### Raw output
 
-`csec get` writes the requested plaintext to standard output. It is an explicit
-raw-output interface intended for a deliberate receiver; shell history,
-pipelines, redirection targets, and downstream commands remain the caller's
-responsibility. When stdout is an interactive terminal, the signed launcher
-records its real direct parent's PID, start time, canonical executable identity,
-and writable-path assurance separately from the signed `csec` byte consumer.
-The daemon independently verifies that parent, shows it as the requester, and
-roots a subtree grant there so consecutive sibling gets from the same live shell
-can reuse a compatible decision. `csec` rechecks the parent before printing.
-For a pipe, the reader is generally a sibling and cannot be recovered from the
-file descriptor, so generic piped get remains an unknown-destination,
-exact-caller request and cannot reuse the shell grant.
+`csec get` writes requested plaintext to standard output in three explicitly
+modelled shapes: interactive terminal output, a shell-delegated pipe, or an
+ordinary persistent plaintext file. In every shape, the signed launcher records
+its real direct parent's PID, process start time, canonical executable identity,
+signature metadata, and writable-path assurance separately from signed `csec`,
+which remains the byte emitter. The daemon independently recomputes that parent
+identity and roots a digest-bound subtree grant there. It repeats the
+PID/start-time/ancestry/executable check immediately after approval and before
+provider resolution, and `csec` checks the parent incarnation again immediately
+before output. Consecutive compatible gets from that same live shell can reuse
+the risk-capped grant; a different shell process cannot.
+
+For a pipeline, the reader is normally a sibling process and cannot be recovered
+or authenticated from the write descriptor. The plan and review therefore name
+the shell as requester/grant owner, `csec` as emitter, and an **unverified pipe
+reader** as recipient. Command substitution is the same shell-delegated pipe
+shape. The pipe itself expresses user intent, so no second unsafe CLI flag is
+required, but a new exact plan still requires normal trusted review and consent.
+
+When `fstat(STDOUT_FILENO)` identifies a regular file, the plan instead declares
+`named_plaintext_file` delivery to `persistent_plaintext_file` with an
+`ordinary_persistent_file` recipient. No pathname is resolved, logged, or sent
+to the daemon. The trusted review warns that plaintext persists, may be readable
+by same-UID processes, and can be copied, synchronized, backed up, or accessed
+later outside csec's control; it recommends `csec exec-file`. The shell can
+create or truncate the target before launching csec, but denial occurs before
+provider resolution and csec writes no plaintext unless approval succeeds.
+
+Terminal, pipe, and ordinary-file shapes have different canonical plan and
+policy digests. Compatibility acceptance is additionally keyed by mechanism,
+destination, descendant scope, emitter/requester assurance, and recipient
+assurance, so one shape cannot silently authorize another.
 
 ### Native store editing
 
@@ -293,8 +314,9 @@ autosave, backup, recovery, and filesystem snapshots can retain plaintext, and
 unlinking is not secure erasure on APFS/SSD storage. Copies outside the
 workspace cannot be removed. Risk policy allows this mode for low-risk stores,
 requires a separate compatibility acceptance for standard-risk stores, and
-forbids it for high and critical stores. A risk change revokes an open edit
-session, and commit recomputes the policy binding before writing.
+rejects it for high and critical stores because an arbitrary external editor is
+an unverified complete consumer. A risk change revokes an open edit session,
+and commit recomputes the policy binding before writing.
 
 The built-in editor still authorizes the user and AppKit/input stack to see the
 plaintext; copying, screenshots, accessibility/screen-capture privileges, or a
@@ -424,7 +446,7 @@ emulating the entitlement.
 
 ## Risk policy
 
-`RiskPolicyV1` is a deterministic pre-resolution decision table. Logical
+`RiskPolicyV2` is a deterministic pre-resolution decision table. Logical
 credentials are grouped independently of provider: 1Password fields share their
 vault/item judgment, and native references share their store judgment. The
 production judgment backend stores only agent-HMAC-derived account, credential,
@@ -436,20 +458,34 @@ Unknown credentials have an effective high floor and require classification in
 the agent-owned review. Low, standard, high, and critical cap access at 12 hours,
 4 hours, 15 minutes, and 5 minutes respectively. Destination evidence may raise
 the effective level: production and unknown destinations floor at high, while
-staging, AI, and human output floor at standard. High/critical disallow AI
-destinations and require a verified, independently protected, or sealed complete
-consumer; critical also requires exact-process scope and a narrower mechanism
-set. Generic Ruby, shell, and checkout-driven consumers conservatively report
-unverified assurance even when their executable is root-owned.
+staging and AI floor at standard. High/critical disallow AI destinations and
+require a verified, independently protected, or sealed complete consumer;
+critical also normally requires exact-process scope. The narrow exception is
+signed `csec get`: its independently verified direct-parent shell may own a
+subtree grant while signed `csec` remains the emitter and the terminal, pipe, or
+file recipient is described separately. Generic Ruby, Node.js, shell, and
+checkout-driven complete consumers conservatively report unverified assurance
+even when their executable is root-owned.
 
-The agent loads judgments and any mechanism/assurance-specific acceptance before
-consulting a cache or provider. A trusted review can classify unknown scope or
-separately accept standard-risk weak compatibility; those choices are persisted
-only after Touch ID succeeds. `csec risk inspect|classify|raise|forget` operates
-on this metadata without resolving a value. `raise` is monotonic; a downgrade or
-forget requires an additional biometric authentication. Any change clears weak
-acceptances when appropriate, revokes matching grants and native edit sessions,
-and invalidates known resolver entries.
+The agent loads judgments and any exact delivery-shape acceptance before
+consulting a cache or provider. Low compatibility delivery follows normal
+approval. Standard requires a separate compatibility acceptance, which can be
+remembered for 30 days. High and critical show stronger warnings, require fresh
+Touch ID, and do not persist that acceptance: only the resulting 15-minute or
+5-minute exact live grant can be reused. A weaker choice is not itself an
+integrity failure, but malformed metadata, requester verification failure,
+stale/reparented/replaced processes, invalid scope/assurance, denial, or required
+authentication failure remain hard pre-resolution failures.
+
+Compatibility acceptance matches the mechanism, destination, descendant scope,
+emitter assurance, requester assurance, and recipient assurance. The policy
+version is 2, which invalidates old judgments, grants, and compatibility
+acceptances rather than broadening their prior meaning. `csec risk
+inspect|classify|raise|forget` operates on this metadata without resolving a
+value. `raise` is monotonic; a downgrade or forget requires an additional
+biometric authentication. Any change clears weak acceptances when appropriate,
+revokes matching grants and native edit sessions, and invalidates known resolver
+entries.
 
 ## Security requirements
 
@@ -481,8 +517,10 @@ root-owned regular file traversable only by one capability-GID process tree.
 The environment launcher is a compatibility feature with an acknowledged
 same-UID disclosure channel. Output redaction is an egress safeguard, not a
 repair for any authorized consumer's ability to disclose a value. Risk policy
-prevents high/critical credentials from using weak, broad, or unverified paths;
-it does not strengthen an allowed path or make an authorized consumer safe.
+uses warnings, fresh authentication, shorter grants, assurance, and scope rather
+than treating weakness alone as an irrevocable prohibition. It still rejects
+unverified complete consumers and invalid broad scopes; approving a compatibility
+shape does not strengthen that path or make an authorized recipient safe.
 Native ciphertext and its rollback record protect durable data, while decrypted
 editor buffers and values released to consumers remain subject to the
 authorized-consumer boundary. The precise attacker capabilities and limits are

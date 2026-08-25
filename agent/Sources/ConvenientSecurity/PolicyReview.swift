@@ -50,6 +50,79 @@ public struct AccessPolicyReview: Sendable {
     }
 }
 
+/// Value-free copy for the trusted review window and tests. It never accepts a
+/// path, argv, reference value, or resolved secret, so compatibility warnings
+/// cannot accidentally disclose the redirection target or plaintext.
+public enum DeliveryReviewCopy {
+    public static func recipientDescription(for plan: DeliveryPlan) -> String {
+        switch plan.recipientAssurance {
+        case .interactiveTerminal:
+            return "requesting terminal (interactive human output)"
+        case .unverifiedPipeReader:
+            return "unverified pipe reader (identity unavailable; delegated by the shell)"
+        case .ordinaryPersistentFile:
+            return "ordinary persistent file (unverified; potentially same-user readable)"
+        case nil:
+            return "planned executable consumer"
+        }
+    }
+
+    public static func warning(for review: AccessPolicyReview) -> String? {
+        let deliveryWarning: String
+        switch review.plan.recipientAssurance {
+        case .unverifiedPipeReader:
+            deliveryWarning = """
+            UNVERIFIED PIPE READER: The requesting shell delegates csec's output, but generic Unix pipelines do not reveal or authenticate the sibling process that reads it. That reader can retain or forward the plaintext. Prefer csec exec, exec-fd, exec-file, or a credential helper when practical.
+            """
+        case .ordinaryPersistentFile:
+            deliveryWarning = """
+            PERSISTENT PLAINTEXT FILE: Plaintext will persist in an ordinary file. Other processes running as you may be able to read it. Convenient Security cannot control copying, backups, synchronization, or later access. Prefer csec exec-file for a protected regular file.
+            """
+        case .interactiveTerminal:
+            deliveryWarning = """
+            TERMINAL PLAINTEXT: The value will be displayed in the requesting terminal and may be retained by terminal logging, scrollback, or screen capture.
+            """
+        case nil:
+            return nil
+        }
+
+        let effective = RiskLevel.maximum(review.credentials.map(\.storedLevel))
+        switch effective {
+        case .critical:
+            return "CRITICAL-RISK DELIVERY — strongest warning. Fresh Touch ID is required and reuse is limited to the very short live grant.\n\n\(deliveryWarning)"
+        case .high, .unknown:
+            return "HIGH-RISK DELIVERY — strong warning. Fresh Touch ID is required and reuse is limited to the short live grant.\n\n\(deliveryWarning)"
+        case .low, .standard:
+            return deliveryWarning
+        }
+    }
+
+    public static func compatibilityAcceptanceLabel(
+        for plan: DeliveryPlan,
+        storedLevel: RiskLevel
+    ) -> String {
+        let shape: String
+        switch plan.recipientAssurance {
+        case .interactiveTerminal: shape = "terminal plaintext output"
+        case .unverifiedPipeReader: shape = "shell-delegated pipe with an unverified reader"
+        case .ordinaryPersistentFile: shape = "ordinary persistent plaintext-file delivery"
+        case nil: shape = plan.mechanism.rawValue
+        }
+        switch storedLevel {
+        case .standard:
+            return "Accept \(shape) for 30 days"
+        case .high:
+            return "Explicitly approve \(shape) for this short live grant"
+        case .critical:
+            return "Explicitly approve \(shape) for this very short live grant"
+        case .unknown:
+            return "Approve \(shape); high/critical approval is limited to this live grant"
+        case .low:
+            return "Approve \(shape)"
+        }
+    }
+}
+
 public struct AccessPolicyApproval: Sendable {
     /// Entries are accepted only for credentials that were previously unknown.
     public let classifications: [String: RiskLevel]

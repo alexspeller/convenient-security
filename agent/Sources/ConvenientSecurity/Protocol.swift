@@ -14,7 +14,7 @@ public enum WireCapability: String, Codable, Sendable, CaseIterable {
     case outputGuardBinding = "output_guard_binding"
     case activeOutputRedaction = "active_output_redaction"
     case nativeEncryptedStore = "native_encrypted_store"
-    case riskPolicyV1 = "risk_policy_v1"
+    case riskPolicyV2 = "risk_policy_v2"
     case riskManagement = "risk_management"
     case nativeEditorPolicy = "native_editor_policy"
     case registeredSessionRoots = "registered_session_roots"
@@ -277,16 +277,28 @@ public struct RiskOperationRequest: Codable, Sendable {
 
 public struct RiskAcceptanceInspection: Codable, Sendable, Equatable {
     public let mechanism: DeliveryMechanism
-    public let consumerAssurance: ConsumerAssurance
+    public let destination: DestinationClass
+    public let descendantScope: DescendantScope
+    public let emitterAssurance: ConsumerAssurance
+    public let requesterAssurance: ConsumerAssurance?
+    public let recipientAssurance: RecipientAssurance?
     public let reviewAfter: Date
 
     public init(
         mechanism: DeliveryMechanism,
-        consumerAssurance: ConsumerAssurance,
+        destination: DestinationClass,
+        descendantScope: DescendantScope,
+        emitterAssurance: ConsumerAssurance,
+        requesterAssurance: ConsumerAssurance?,
+        recipientAssurance: RecipientAssurance?,
         reviewAfter: Date
     ) {
         self.mechanism = mechanism
-        self.consumerAssurance = consumerAssurance
+        self.destination = destination
+        self.descendantScope = descendantScope
+        self.emitterAssurance = emitterAssurance
+        self.requesterAssurance = requesterAssurance
+        self.recipientAssurance = recipientAssurance
         self.reviewAfter = reviewAfter
     }
 }

@@ -81,10 +81,16 @@ version change fail closed. Protocol-v1 access is recognized only to return
 `upgrade_required`, so an older or hand-written client cannot omit a plan to
 select the legacy authorization path.
 
-This policy rejects a weak delivery; it cannot turn an allowed environment,
-named-file, raw-output, or authorized-consumer path into a confidentiality
-boundary. The production Keychain stores HMAC-derived logical identifiers and
-value-free metadata, not raw references or values.
+Weakness alone is warn-and-confirm rather than an integrity failure. Low uses
+normal approval; standard requires exact-shape compatibility acceptance; high
+and critical require fresh Touch ID and retain acceptance only as the resulting
+15-minute or 5-minute live grant. Policy still fails closed on malformed or
+spoofed metadata, unverifiable/stale/reparented/replaced requesters, invalid
+scope or consumer assurance, denial, and unavailable required authentication.
+It cannot turn an approved environment, named-file, raw-output, or authorized-
+consumer path into a confidentiality boundary. The production Keychain stores
+HMAC-derived logical identifiers and value-free metadata, not raw references or
+values.
 
 ### Language-client heap delivery
 
@@ -245,12 +251,13 @@ explicitly select a shell or an editor argument with its own effects. This mode
 warns before biometric consent and should be used only when its editor
 functionality is worth the edit-window exposure.
 
-The named-file mode is available for low risk, separately reviewable for
-standard risk, and forbidden for high/critical stores. Its actual editor path is
-bound before review. The built-in signed editor is treated as a verified-product
-heap consumer; high and critical policy shortens its session. Commit revalidates
-the policy binding, so a risk change cannot leave an earlier edit authorization
-usable.
+The external named-file editor mode is available for low risk and separately
+reviewable for standard risk. It remains unavailable for high/critical stores
+because the arbitrary editor is an unverified complete consumer, not solely
+because a named file is weaker. Its actual editor path is bound before review.
+The built-in signed editor is treated as a verified-product heap consumer; high
+and critical policy shortens its session. Commit revalidates the policy binding,
+so a risk change cannot leave an earlier edit authorization usable.
 
 There is no key export or recovery path; loss of the Mac or Keychain record is
 permanent data loss.
@@ -310,11 +317,22 @@ so a reported partial apply must be completed or reviewed by repeating setup.
 - `csec exec` places plaintext in the child's initial environment. Output
   masking does not make that environment private. Policy allows this for low
   risk and by separate acceptance for standard risk; high/critical are rejected.
-- Interactive `csec get` prints plaintext to standard output and roots a
-  digest-bound grant at its kernel-verified direct parent, allowing compatible
-  sibling gets from that same live shell. It rechecks the parent before output.
-  Piped get cannot identify its reader and remains an unknown-destination,
-  exact-caller request.
+- `csec get` prints plaintext to a terminal, a shell-delegated pipe (including
+  command substitution), or an explicitly approved ordinary file. Signed
+  `csec` is the emitter; the kernel-verified direct-parent shell is the
+  requester, subtree grant owner, and authorization delegate. The daemon
+  rechecks that shell incarnation before provider resolution and `csec` checks
+  again before output, so a different, exited, reparented, PID-reused, or
+  exec-replaced shell cannot use the grant.
+- Generic Unix pipelines do not let `csec` identify or authenticate the sibling
+  reader. The review calls it an unverified pipe reader; approval authorizes the
+  shell's delegation, not the reader's identity or behavior. That reader can
+  retain, copy, log, or forward the value.
+- `csec get > file` is ordinary persistent plaintext, not protected
+  `exec-file` delivery. Same-UID processes may read it, and later access,
+  copying, synchronization, and backup are outside csec's control. The shell may
+  create/truncate the target before csec runs; csec sends no filename in protocol
+  metadata and resolves/writes no plaintext before approval.
 - `csec setup --import` reads each explicitly selected plaintext source into the
   signed launcher's heap before merging it into the native encrypted store; it
   does not erase the source.

@@ -94,6 +94,9 @@ Security **cannot** protect a secret from:
 - **root** or the Apple platform itself;
 - **a consumer you deliberately authorized** — once your Rails app or your shell
   holds a plaintext value, it can log it, assign it to `ENV`, or send it anywhere;
+- **a pipe reader or ordinary redirection file you explicitly approve** — Unix
+  does not identify a pipeline's sibling reader to `csec`, and an ordinary file
+  can be read later, copied, synchronized, or backed up outside csec's control;
 - **`csec exec`'s environment channel** — this is an explicit, labeled
   *compatibility* path for unmodified tools that injects plaintext into the
   child's environment, where same-user process inspection can read it (output
@@ -127,6 +130,42 @@ swift run csec get 'op://Vault/Item/Field'    # terminal get — identifies the 
 > store (it can't open the provisioned Keychain group) and prints
 > `at-rest cache OFF`. For the full feature set, install the signed build — see
 > [Installing the real agent](#installing-the-real-agent).
+
+### Deliberate plaintext output with `csec get`
+
+`csec get` supports the ordinary shell shapes people actually use:
+
+```sh
+csec get 'op://Vault/Item/Field'                    # terminal output
+csec get 'op://Vault/Item/Field' | command          # pipeline
+value="$(csec get 'op://Vault/Item/Field')"         # command substitution
+csec get 'op://Vault/Item/Field' > ./ordinary-file  # persistent plaintext file
+```
+
+For all four forms, the verified direct-parent shell is the requester, grant
+owner, and subtree root; signed `csec` is the emitter. The daemon binds the
+shell's PID, process start time, canonical executable identity, and subtree
+scope, then `csec` rechecks that exact process incarnation immediately before
+writing plaintext. Compatible consecutive gets from the same live shell can
+reuse its risk-capped grant. A different, exited, reparented, or replaced shell
+cannot.
+
+A generic Unix pipe exposes no authenticated identity for the sibling process
+that reads it. The review therefore says **unverified pipe reader**: approval is
+delegated to the requesting shell and does not claim the reader was verified.
+Command substitution has the same shell-delegated pipe semantics.
+
+Regular-file stdout is reviewed separately as **persistent plaintext-file
+delivery**. The file may be readable by other same-user processes, and csec
+cannot control later reads, copies, backup, or synchronization. The shell may
+create or truncate the target before `csec` starts, but csec neither resolves
+the reference nor writes plaintext until approval succeeds, and it never sends
+the target filename in protocol metadata. Prefer `csec exec-file` for a
+protected regular file. Prefer `exec`, `exec-fd`, or a credential helper when
+the consumer supports those narrower channels.
+
+Terminal, pipe, and persistent-file approvals are distinct delivery shapes; an
+approval for one never silently approves either of the others.
 
 ### Onboard a project and coding agents
 
@@ -202,8 +241,10 @@ BUGSNAG_TOKEN='csec://development/BUGSNAG_TOKEN' \
 One Touch ID prompt covers `rails` and every process it spawns for the grant's
 lifetime. Because this delivery is readable by unrelated same-UID processes, it
 is allowed for low-risk credentials and requires a separate, time-bounded
-compatibility acceptance for standard-risk credentials. It is forbidden for
-high and critical credentials.
+compatibility acceptance for standard-risk credentials. High and critical
+remain unavailable to this generic launcher because its complete environment
+consumer is unverified, rather than merely because the channel is a
+compatibility mechanism.
 
 ### Secure no-root delivery
 
@@ -322,10 +363,10 @@ fail closed until you choose a level:
 
 | Level | Current policy |
 |-------|----------------|
-| `low` | Up to 12 hours; compatibility environment and external-editor delivery are allowed. |
-| `standard` | Up to 4 hours; weaker environment or named-file delivery needs a separately reviewed acceptance. |
-| `high` | Up to 15 minutes; weak delivery and AI destinations are forbidden, and the complete consumer must have stronger assurance. |
-| `critical` | Up to 5 minutes; exact-process scope and the narrowest delivery/consumer set are required. |
+| `low` | Up to 12 hours; normal approval and normal capped reuse, including compatibility delivery. |
+| `standard` | Up to 4 hours; compatibility delivery needs a separate, exact-shape acceptance. |
+| `high` | Up to 15 minutes; strong warning, fresh Touch ID, and compatibility acceptance limited to the resulting live grant. AI destinations and insufficiently assured consumers still fail. |
+| `critical` | Up to 5 minutes; strongest warning, fresh Touch ID, and compatibility acceptance limited to the resulting live grant. Scope and consumer-integrity requirements still apply. |
 
 Inspect or change policy metadata without resolving the secret value:
 
@@ -338,10 +379,14 @@ csec risk forget 'op://Engineering/Postgres/url'
 
 `raise` cannot lower a classification. Lowering one with `classify`, or
 forgetting it back to fail-safe unknown, requires Touch ID. Risk records contain
-only HMAC-derived logical identities and value-free metadata. With the delivery
-mechanisms currently shipped, a high or critical classification intentionally
-blocks normal Ruby, raw-output, and environment access; those generic consumers
-cannot claim the stronger assurance the policy requires.
+only HMAC-derived logical identities and value-free metadata. A compatibility
+choice is warn-and-confirm, not a permanent denial solely because it is weaker.
+Acceptance is bound to mechanism, destination, scope, emitter/requester
+assurance, and recipient assurance. Standard acceptance can be remembered for
+30 days; high and critical acceptance is represented only by the short-lived,
+exact live-shell grant. Malformed metadata, unverifiable requesters, stale
+process incarnations, insufficient consumer assurance, and unavailable or
+denied authentication still fail closed before provider resolution.
 
 ### Deliver secrets to Ruby and Node.js apps without touching the environment
 
@@ -415,8 +460,9 @@ EDITOR='code --wait' csec edit --editor development
 
 The actual editor executable is included in the reviewed plan. External editing
 is allowed for low risk, requires separate compatibility acceptance for standard
-risk, and is forbidden for high and critical stores. The built-in editor remains
-available with policy-capped sessions (15 minutes for high and 5 for critical).
+risk, and remains unavailable for high and critical because the arbitrary editor
+is an unverified complete consumer. The built-in editor remains available with
+policy-capped sessions (15 minutes for high and 5 for critical).
 
 ## Keeping secrets out of AI tool output
 
@@ -477,7 +523,7 @@ team-prefixed Keychain access group, **no** `get-task-allow`, **no** Hardened
 Runtime exception entitlements (library validation, DYLD variables, JIT/unsigned
 executable memory, executable-page protection, or debugging), and **only** on a
 host with **SIP enabled**. A startup self-audit refuses to run in production if
-this posture is absent. Regular-file guarantees additionally require the exact
+this posture is absent. Protected `exec-file` guarantees additionally require the exact
 signed root helper and system LaunchDaemon installed at root-owned, non-writable
 paths by the verified package. Unsigned development builds deliberately drop
 the persistent cache and compile in test-only trust seams rather than fake the

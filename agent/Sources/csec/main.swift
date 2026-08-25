@@ -8,7 +8,8 @@ import Darwin
 // The launcher / CLI.
 //
 //   csec get <reference> [--reason <text>] [--for <seconds>]
-//       Fetch a secret from the running agent and print it to stdout.
+//       Fetch a secret from the running agent after reviewing the exact stdout
+//       shape: terminal, shell-delegated pipe, or ordinary persistent file.
 //
 //   csec exec [options] [--set NAME=<reference>]… -- <cmd> [args…]
 //       Resolve secret references (from the environment and any --set flags) and
@@ -96,7 +97,20 @@ func usage() -> Never {
       csec install | uninstall | status
       csec root-status
 
-    get        Fetch a secret from the running agent (csecd) and print it to stdout.
+    get        Fetch a secret from csecd and write it to the selected stdout shape:
+                 csec get REF                    interactive terminal output
+                 csec get REF | command          shell-delegated pipeline
+                 value=$(csec get REF)           shell-delegated command substitution
+                 csec get REF > file             ordinary persistent plaintext file
+               The verified direct-parent shell owns the PID/start-time-bound subtree
+               grant; signed csec is the emitter. A generic Unix pipe does not reveal
+               its sibling reader, so the review labels that recipient unverified.
+               File redirection persists plaintext and may expose it to same-user
+               processes, copies, backups, and later access. Each delivery shape is
+               approved separately. Prefer csec exec for environment injection,
+               csec exec-fd for anonymous file-shaped input, csec exec-file for
+               protected regular files, or csec creds for supported tool-native
+               credential protocols.
     exec       Run <cmd> with secret references resolved into its environment. Any env
                value that is a secret reference (DATABASE_URL=csec://…) is resolved in
                place; --set NAME=<ref> injects additional ones. Terminal output is
@@ -368,7 +382,11 @@ func runRisk(_ arguments: [String]) -> Never {
             for acceptance in inspection.acceptances {
                 print(
                     "compatibility-acceptance: \(acceptance.mechanism.rawValue) "
-                        + "\(acceptance.consumerAssurance.rawValue) until "
+                        + "\(acceptance.destination.rawValue) "
+                        + "scope=\(acceptance.descendantScope.rawValue) "
+                        + "emitter=\(acceptance.emitterAssurance.rawValue) "
+                        + "requester=\(acceptance.requesterAssurance?.rawValue ?? "none") "
+                        + "recipient=\(acceptance.recipientAssurance?.rawValue ?? "planned_consumer") until "
                         + formatter.string(from: acceptance.reviewAfter)
                 )
             }
@@ -560,67 +578,67 @@ func runGet(_ arguments: [String]) -> Never {
 
     let client = makeAgentClient()
     do {
-        let plan: DeliveryPlan
-        var requestingParent: (pid: pid_t, startTime: UInt64, executablePath: String)? = nil
-        if isatty(STDOUT_FILENO) == 1 {
-            let parentPID = getppid()
-            guard parentPID > 1,
-                  let parentStartTime = ProcessAncestry.startTime(of: parentPID),
-                  let parentPath = ProcessAncestry.executablePath(of: parentPID),
-                  let parentExecutable = try? ExecutableInspection.plannedExecutable(
-                    command: parentPath
-                  ) else {
-                FileHandle.standardError.write(Data(
-                    "csec get: requesting parent identity is unavailable\n".utf8
-                ))
-                exit(1)
-            }
-            requestingParent = (parentPID, parentStartTime, parentExecutable.canonicalPath)
-            plan = DeliveryPlan(
-                mechanism: .rawStandardOutput,
-                executable: PlannedExecutable(
-                    canonicalPath: URL(fileURLWithPath: CommandLine.arguments[0])
-                        .standardizedFileURL.resolvingSymlinksInPath().path,
-                    signingIdentifier: ProductCodeIdentity.launcherIdentifier,
-                    teamIdentifier: ProductCodeIdentity.teamIdentifier,
-                    assurance: .verifiedProduct
-                ),
-                requestingExecutable: parentExecutable,
-                root: .directParent(pid: parentPID, startTime: parentStartTime),
-                descendantScope: .subtree,
-                destination: .humanOutput,
-                requestedTTLSeconds: ttlSeconds,
-                operationContext: reason
-            )
-        } else {
-            // Never let `csec get > secrets.txt` turn a typo into persistence.
-            guard cs_fd_is_pipe_or_socket(STDOUT_FILENO) == 1 else {
-                FileHandle.standardError.write(Data(
-                    "csec get: refusing to write plaintext to a regular file; use a protected delivery mechanism\n".utf8
-                ))
-                exit(2)
-            }
-            // In a shell pipeline the reader is normally csec's sibling, not
-            // its parent. A pipe fd does not reveal that reader's identity, so
-            // do not mislabel the shell as the consumer or root a reusable
-            // grant at the shell. The dedicated exec-hook/fd mechanisms can
-            // later bind a known receiver; generic piped stdout stays unknown.
-            plan = DeliveryPlan(
-                mechanism: .rawStandardOutput,
-                executable: PlannedExecutable(
-                    canonicalPath: URL(fileURLWithPath: CommandLine.arguments[0])
-                        .standardizedFileURL.resolvingSymlinksInPath().path,
-                    signingIdentifier: ProductCodeIdentity.launcherIdentifier,
-                    teamIdentifier: ProductCodeIdentity.teamIdentifier,
-                    assurance: .unverified
-                ),
-                root: .caller,
-                descendantScope: .exactProcess,
-                destination: .unknown,
-                requestedTTLSeconds: ttlSeconds,
-                operationContext: "raw pipe to an unverified recipient: \(reason)"
-            )
+        let parentPID = getppid()
+        guard parentPID > 1,
+              let parentStartTime = ProcessAncestry.startTime(of: parentPID),
+              let parentPath = ProcessAncestry.executablePath(of: parentPID),
+              let parentExecutable = try? ExecutableInspection.plannedExecutable(
+                command: parentPath
+              ) else {
+            FileHandle.standardError.write(Data(
+                "csec get: requesting parent identity is unavailable\n".utf8
+            ))
+            exit(1)
         }
+        let requestingParent = (
+            pid: parentPID,
+            startTime: parentStartTime,
+            executablePath: parentExecutable.canonicalPath
+        )
+        let mechanism: DeliveryMechanism
+        let destination: DestinationClass
+        let recipient: RecipientAssurance
+        if isatty(STDOUT_FILENO) == 1 {
+            mechanism = .rawStandardOutput
+            destination = .humanOutput
+            recipient = .interactiveTerminal
+        } else if cs_fd_is_pipe_or_socket(STDOUT_FILENO) == 1 {
+            mechanism = .rawStandardOutput
+            destination = .shellDelegatedPipe
+            recipient = .unverifiedPipeReader
+            FileHandle.standardError.write(Data(
+                "csec get: stdout is a shell-delegated pipe with an unverified reader; review required\n".utf8
+            ))
+        } else if cs_fd_is_regular_file(STDOUT_FILENO) == 1 {
+            mechanism = .namedPlaintextFile
+            destination = .persistentPlaintextFile
+            recipient = .ordinaryPersistentFile
+            FileHandle.standardError.write(Data(
+                "csec get: stdout is an ordinary persistent plaintext file; review required; prefer csec exec-file\n".utf8
+            ))
+        } else {
+            FileHandle.standardError.write(Data(
+                "csec get: unsupported stdout destination\n".utf8
+            ))
+            exit(2)
+        }
+        let plan = DeliveryPlan(
+            mechanism: mechanism,
+            executable: PlannedExecutable(
+                canonicalPath: URL(fileURLWithPath: CommandLine.arguments[0])
+                    .standardizedFileURL.resolvingSymlinksInPath().path,
+                signingIdentifier: ProductCodeIdentity.launcherIdentifier,
+                teamIdentifier: ProductCodeIdentity.teamIdentifier,
+                assurance: .verifiedProduct
+            ),
+            requestingExecutable: parentExecutable,
+            root: .directParent(pid: parentPID, startTime: parentStartTime),
+            descendantScope: .subtree,
+            destination: destination,
+            recipientAssurance: recipient,
+            requestedTTLSeconds: ttlSeconds,
+            operationContext: reason
+        )
         if isatty(STDERR_FILENO) == 1 {
             FileHandle.standardError.write(Data(
                 "csec: waiting for the Convenient Security review window and Touch ID…\n".utf8
@@ -635,17 +653,15 @@ func runGet(_ arguments: [String]) -> Never {
         // The response is already in csec's heap at this point, but it must not
         // cross stdout if the shell exited, was replaced, or csec was
         // reparented while review/Touch ID was in progress.
-        if let requestingParent {
-            guard getppid() == requestingParent.pid,
-                  ProcessAncestry.startTime(of: requestingParent.pid)
-                    == requestingParent.startTime,
-                  ProcessAncestry.executablePath(of: requestingParent.pid)
-                    == requestingParent.executablePath else {
-                FileHandle.standardError.write(Data(
-                    "csec get: requesting parent changed during access; refusing output\n".utf8
-                ))
-                exit(1)
-            }
+        guard getppid() == requestingParent.pid,
+              ProcessAncestry.startTime(of: requestingParent.pid)
+                == requestingParent.startTime,
+              ProcessAncestry.executablePath(of: requestingParent.pid)
+                == requestingParent.executablePath else {
+            FileHandle.standardError.write(Data(
+                "csec get: requesting parent changed during access; refusing output\n".utf8
+            ))
+            exit(1)
         }
         for reference in references {
             guard let value = values[reference] else {
