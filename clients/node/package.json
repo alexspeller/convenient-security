@@ -1,0 +1,48 @@
+{
+  "name": "convenient-security",
+  "version": "0.0.1",
+  "description": "Heap-safe Node.js client for the Convenient Security secrets agent",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "author": "Stateful Ltd",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alexspeller/convenient-security.git",
+    "directory": "clients/node"
+  },
+  "homepage": "https://github.com/alexspeller/convenient-security#readme",
+  "bugs": {
+    "url": "https://github.com/alexspeller/convenient-security/issues"
+  },
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "LICENSE.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "os": [
+    "darwin"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && tsc -p tsconfig.types.json && node scripts/write-package-markers.mjs",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test test/*.test.mjs",
+    "test:unit": "npm run build && tsc -p tsconfig.test.json && node --test test/client.test.mjs",
+    "test:cross-stack": "npm run build && node --test test/cross-stack.test.mjs",
+    "pack:check": "npm pack --dry-run",
+    "prepack": "npm run build"
+  }
+}

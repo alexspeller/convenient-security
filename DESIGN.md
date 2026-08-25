@@ -9,12 +9,12 @@ persistent keychain cache and with test-only trust seams compiled in.
 
 Convenient Security protects secret values from unrelated, non-root processes
 running as the same login user. It provides per-reference Touch ID consent,
-process-scoped grants, a code-identity-gated at-rest cache, heap delivery for an
-integrated Ruby client, tool-native AWS/Git credential adapters, anonymous
-inherited-fd files, capability-GID regular files, an environment compatibility
-launcher, and exact-value output redaction. A value-free risk policy gates each
-delivery before provider or cache resolution. It can resolve from the official
-1Password CLI and from device-bound native encrypted files.
+process-scoped grants, a code-identity-gated at-rest cache, heap delivery for
+integrated Ruby and Node.js clients, tool-native AWS/Git credential adapters,
+anonymous inherited-fd files, capability-GID regular files, an environment
+compatibility launcher, and exact-value output redaction. A value-free risk
+policy gates each delivery before provider or cache resolution. It can resolve
+from the official 1Password CLI and from device-bound native encrypted files.
 
 It does not protect a value from root, from code already executing inside an
 authorized consumer, from a consumer the user deliberately launches, or from a
@@ -38,9 +38,9 @@ user who approves a misleading request.
   AES-256-GCM encryption, per-store biometric Keychain records, immutable
   ciphertext versions, rollback detection, and bounded edit sessions. Both
   providers can be registered at once.
-- **The Ruby client** invokes the independently protected `csec bridge` binary
-  and receives framed values through a private pipe. It does not connect to the
-  agent socket itself.
+- **The Ruby and Node.js clients** invoke the independently protected `csec
+  bridge` binary and receive framed values through a private pipe. They do not
+  connect to the agent socket themselves.
 
 ## Authenticated agent socket
 
@@ -116,17 +116,18 @@ account-access request—which csecd cannot merge into its window.
 
 ## Delivery
 
-### Ruby heap delivery
+### Language-client heap delivery
 
-The Ruby gem sends references, reason, and TTL to the fixed root-owned
-`/Library/Application Support/ConvenientSecurity/bin/csec` bridge. The helper
-uses a scrubbed environment and private close-on-exec pipes. It verifies the
-direct Ruby parent PID, start time, and executable path before requesting and
-again before returning a response. Plaintext reaches a Ruby `String`, not Ruby's
-initial environment or argv.
+The Ruby gem and Node.js npm package send references, reason, and TTL to the
+fixed root-owned `/Library/Application Support/ConvenientSecurity/bin/csec`
+bridge. The helper uses a scrubbed environment and private close-on-exec pipes.
+It verifies the direct language-runtime parent PID, start time, and executable
+path before requesting and again before returning a response. Plaintext reaches
+the authorized process's heap, not its initial environment or argv.
 
-Assigning that string to `ENV`, interpolating it into a command, logging it, or
-loading hostile code into the Ruby process is outside this protection.
+Assigning a returned string to `ENV`/`process.env`, interpolating it into a
+command, logging it, or loading hostile code into the language process is
+outside this protection.
 
 ### Registered session roots
 
@@ -374,7 +375,7 @@ partial completion is reported explicitly.
 `SecretResolver` dispatches each reference independently by scheme. The shipping
 daemon registers `op://` when the verified official 1Password CLI is installed
 and registers `csec://` when its provisioned Keychain group is usable. A single
-request, Ruby call, or `csec exec` launch can contain both schemes.
+request, language-client call, or `csec exec` launch can contain both schemes.
 
 For 1Password, resolution checks the warm in-process cache, then—only when a
 just-approved biometric context is present—the data-protection keychain, then

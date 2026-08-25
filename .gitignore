@@ -14,6 +14,11 @@ clients/ruby/.bundle/
 clients/ruby/vendor/
 clients/ruby/Gemfile.lock
 
+# Node / npm
+node_modules/
+clients/node/dist/
+clients/node/*.tgz
+
 # Signing / local secrets
 *.provisionprofile
 *.mobileprovision

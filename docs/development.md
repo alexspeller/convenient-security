@@ -1,18 +1,21 @@
 # Development and verification
 
-Run the complete synthetic suite from the repository root:
+Install the pinned npm development toolchain, then run the complete synthetic
+suite from the repository root:
 
 ```sh
+mise exec -- npm ci --ignore-scripts
 bin/ci
 ```
 
 It builds every Swift target, runs the framework-free core checks, exercises
-mutual identity and protocol behavior over real Unix sockets, runs the Ruby
-unit suite, and performs a Ruby → `csec bridge` → Swift fake-agent cross-stack
-round trip. It also syntax-checks release scripts/plists and proves the
-synthetic inherited-fd key handoff used by Fastlane. Test values are unique
-synthetic fixtures; the suite must never enumerate or print the developer's
-real environment.
+mutual identity and protocol behavior over real Unix sockets, runs the Ruby and
+Node.js unit suites, and performs Ruby → `csec bridge` → Swift and Node.js →
+`csec bridge` → Swift fake-agent cross-stack round trips. It also builds both npm
+module formats and TypeScript declarations, inspects the npm tarball,
+syntax-checks release scripts/plists, and proves the synthetic inherited-fd key
+handoff used by Fastlane. Test values are unique synthetic fixtures; the suite
+must never enumerate or print the developer's real environment.
 
 The output-guard portion covers binary and split writes, longest-prefix
 selection, stdout/stderr, canonical encodings, short-value policy, explicit
@@ -81,15 +84,20 @@ The current physical-machine baseline (verified 2026-08-21) is:
 - system Ruby 2.6.10 (the gem supports Ruby 3.0 and later for distribution;
   this older system runtime remains a useful compatibility test while present).
 
+The Node.js client was additionally verified on 2026-08-25 with Node.js
+24.11.1/npm 11.6.2 and Node.js 22.22.0. The npm package requires Node.js 22 or
+later.
+
 On that baseline, the Developer-ID-signed native-store spike passed its
 signed-but-unentitled helper exclusion, non-interactive unauthenticated-read
 rejection, one-touch context fold, and authenticated `.biometryAny` record
 read/update checks.
 
-GitHub CI uses the explicit `macos-15` runner label rather than the moving
-`macos-latest` alias. CI is synthetic and ad-hoc signed. Developer-ID identity,
-hardened-runtime/provisioning, Touch ID, cold/warm cache behavior, and native
-store Keychain behavior remain a separate physical-machine release gate.
+GitHub CI uses the explicit `macos-15` runner label and provisions Node.js 24
+rather than relying on the runner's ambient Node installation. CI is synthetic
+and ad-hoc signed. Developer-ID identity, hardened-runtime/provisioning, Touch
+ID, cold/warm cache behavior, and native-store Keychain behavior remain a
+separate physical-machine release gate.
 
 SwiftPM invokes Apple's own sandbox. In an already sandboxed automation host,
 the build may need to run outside that outer restriction; a failure containing
@@ -127,8 +135,8 @@ Before treating an artifact as protected, verify on the signed installed app:
     (without claiming crash cleanup, secure erasure, or removal of copies);
 12. the signed/notarized package installs the bridge at
    `/Library/Application Support/ConvenientSecurity/bin/csec` with every path
-   component root-owned and non-user-writable, and Ruby reaches the installed
-   agent through it; and
+   component root-owned and non-user-writable, and both Ruby and Node.js reach
+   the installed agent through it; and
 13. provisioning consumes the real App Store Connect key through `/dev/fd/3`;
    notarization uses only a short-lived `0600` key file beneath an atomically
    created `0700` directory because `notarytool --key` requires a filesystem

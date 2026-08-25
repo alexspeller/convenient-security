@@ -142,11 +142,12 @@ Changing `tty`/`always` to `never`, opting into reference metadata, changing
 short-value handling, or changing matcher semantics therefore changes the
 canonical plan digest and cannot reuse a grant for the previous policy.
 
-The Ruby bridge and generic `csec exec` conservatively report `unverified`
-consumer assurance even when `/usr/bin/ruby`, a shell, or another executable is
-root-owned: scripts, gems, plugins, configuration, and the checkout remain
-user-writable. Only a dedicated verifier/root launcher may assert an
-independently protected whole consumer context.
+The language-client bridge and generic `csec exec` conservatively report
+`unverified` consumer assurance even when `/usr/bin/ruby`, the Node.js runtime,
+a shell, or another executable is root-owned: scripts, packages, plugins,
+configuration, and the checkout remain user-writable. Only a dedicated
+verifier/root launcher may assert an independently protected whole consumer
+context.
 
 Before resolution, the agent verifies:
 
@@ -509,28 +510,29 @@ The decoder recognizes a v1 flat `access` request only to return
 `upgrade_required`. Production never invents a secure plan for v1. Fake agents
 may opt into v1 solely for migration tests.
 
-## Ruby/private bridge protocol
+## Language-client/private bridge protocol
 
-Ruby cannot natively perform the Security.framework peer check, so the gem does
-not connect to `agent.sock`. It executes
+Ruby and Node.js do not perform the product's Security.framework peer check, so
+their packages do not connect to `agent.sock`. Each executes
 `/Library/Application Support/ConvenientSecurity/bin/csec bridge` by fixed
 absolute path with a scrubbed environment and private stdin/stdout pipes. The
 signed package installs that copy and every controlling directory root-owned
 and non-writable by the login user; `/Applications` alone is not sufficient
 because its `admin` group can replace directory entries.
 
-Ruby marks every parent-side pipe endpoint close-on-exec, so replacing the Ruby
-image closes the response channel in the kernel.
+The clients use close-on-exec parent-side pipe endpoints, so replacing the
+language-runtime image closes the response channel in the kernel.
 
 The request is one framed JSON object containing only `version`, `references`,
 `reason`, and `ttlSeconds`. `csec bridge` refuses a terminal or regular-file
-stdin/stdout, derives its Ruby parent from `getppid()` plus kernel process start
-time and executable path, submits a v2 `direct_heap` plan, then rechecks all
-three before output so parent re-exec cannot change the reviewed consumer. It
-writes one framed `BridgeResponse`; a failure uses the same value-free typed
-failure shape.
+stdin/stdout, derives its language-runtime parent from `getppid()` plus kernel
+process start time and executable path, submits a v2 `direct_heap` plan, then
+rechecks all three before output so parent re-exec cannot change the reviewed
+consumer. It writes one framed `BridgeResponse`; a failure uses the same
+value-free typed failure shape.
 
-The Ruby heap receives plaintext; the helper's argv and environment do not. If
-application code assigns a returned value to `ENV`, launches a child with it,
-or writes it elsewhere, that disclosure is outside the bridge boundary; see
-[`threat-model.md`](threat-model.md#ruby-heap-delivery).
+The Ruby or Node.js heap receives plaintext; the helper's argv and environment
+do not. If application code assigns a returned value to `ENV`/`process.env`,
+launches a child with it, or writes it elsewhere, that disclosure is outside the
+bridge boundary; see
+[`threat-model.md`](threat-model.md#language-client-heap-delivery).

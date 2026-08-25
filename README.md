@@ -55,10 +55,10 @@ rest and in use — as small as macOS allows.
   the logical credential as low, standard, high, or critical and reviews the
   proposed delivery. The agent applies that policy before reading a cache or
   provider, and binds every live grant to the resulting policy snapshot.
-- **Narrow delivery without root.** The Ruby client and AWS/Git credential
-  adapters use private pipes, while `exec-fd` gives file-oriented tools an
-  anonymous inherited descriptor. Plaintext need not touch `ENV`, `argv`, or a
-  named file.
+- **Narrow delivery without root.** The Ruby and Node.js clients and AWS/Git
+  credential adapters use private pipes, while `exec-fd` gives file-oriented
+  tools an anonymous inherited descriptor. Plaintext need not touch `ENV`,
+  `argv`, or a named file.
 - **Seekable files without same-UID ambient access.** The packaged `csec-rootd`
   can create root-owned regular files on bounded `nodev,nosuid,noexec` tmpfs and
   launch one approved process tree with a fresh, non-reused capability GID.
@@ -77,7 +77,7 @@ switched on.
 
 | Threat | What stops it |
 |--------|---------------|
-| Malware reads secrets from your environment / `argv` | Ruby and credential-helper values cross private pipes; `exec-fd` puts only non-secret `/dev/fd/N` paths in the child environment. The explicit `csec exec` compatibility mode remains an exception. |
+| Malware reads secrets from your environment / `argv` | Ruby, Node.js, and credential-helper values cross private pipes; `exec-fd` puts only non-secret `/dev/fd/N` paths in the child environment. The explicit `csec exec` compatibility mode remains an exception. |
 | Malware reads an ordinary same-user configuration file | `csec exec-file` creates root-owned `0050` directories and `0040` regular files on bounded tmpfs. Only the freshly launched capability-GID tree can traverse and read them; paths, not values, enter its environment. |
 | Malware asks a broker for your whole vault | The agent releases only references a human just approved with Touch ID, scoped to the approving process subtree. |
 | An old client or stale grant asks for a now-forbidden delivery | Protocol v1 fails closed; protocol v2 is evaluated against current risk metadata before resolution, and grants are reusable only with the same plan and policy digest. |
@@ -343,11 +343,11 @@ mechanisms currently shipped, a high or critical classification intentionally
 blocks normal Ruby, raw-output, and environment access; those generic consumers
 cannot claim the stronger assurance the policy requires.
 
-### Deliver secrets to a Ruby app without touching the environment
+### Deliver secrets to Ruby and Node.js apps without touching the environment
 
-For consumers you control — a Rails app at boot, say — the Ruby client is the
-strongest path. It receives values over a private pipe into the process heap,
-never via `ENV` or `argv`:
+For consumers you control — a Rails or Node.js app at boot, say — the language
+clients are the strongest path. They receive values over a private pipe into the
+process heap, never via `ENV`/`process.env` or `argv`:
 
 ```ruby
 require 'convenient_security'
@@ -362,8 +362,20 @@ db_url = secrets.fetch('op://Vault/DB/url')             # a plain String, only i
 token  = secrets.fetch('csec://development/LOCAL_API_TOKEN')
 ```
 
-See [`clients/ruby/README.md`](clients/ruby/README.md) for the delivery
-guarantees and how the bridge verifies its Ruby parent.
+```ts
+import { access } from 'convenient-security';
+
+const secrets = await access(
+  ['op://Vault/DB/url', 'csec://development/LOCAL_API_TOKEN'],
+  { reason: 'boot node service', ttl: 8 * 60 * 60 },
+);
+
+const dbUrl = secrets['op://Vault/DB/url'];
+const token = secrets['csec://development/LOCAL_API_TOKEN'];
+```
+
+See the [Ruby](clients/ruby/README.md) and [Node.js](clients/node/README.md)
+client guides for their delivery guarantees, startup patterns, and error APIs.
 
 ## Native encrypted files
 
@@ -481,6 +493,7 @@ entitlements. Details in [`DESIGN.md`](DESIGN.md#security-requirements).
 | [`docs/development.md`](docs/development.md) | Toolchain baseline, CI entry point, and signed release gates. |
 | [`docs/regular-file-security-matrix.md`](docs/regular-file-security-matrix.md) | Synthetic evidence and the signed-device gate for regular-file delivery. |
 | [`clients/ruby/`](clients/ruby/) | The heap-delivery Ruby client gem. |
+| [`clients/node/`](clients/node/) | The heap-delivery Node.js npm package, written in TypeScript. |
 | [`packaging/`](packaging/README.md) | Signing, notarization, `.pkg` build, and install pipeline. |
 
 ### Repository layout
@@ -493,6 +506,8 @@ entitlements. Details in [`DESIGN.md`](DESIGN.md#security-requirements).
 - `agent/Sources/csecd/`, `agent/Sources/csec/`, `agent/Sources/csec-rootd/` —
   the credential daemon, signed CLI/supervisor, and narrow root helper.
 - `clients/ruby/` — the Ruby heap-fetch client.
+- `clients/node/` — the TypeScript Node.js heap-fetch client; the root
+  `package.json` owns the npm workspace and lockfile.
 - `packaging/` — the signing, notarization, and install pipeline.
 
 ## Licence

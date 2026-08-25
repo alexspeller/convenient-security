@@ -116,6 +116,7 @@ clang -fsyntax-only -Wall -Wextra -Werror \
 # licences outside its SPDX allow-list as "Nonstandard"; LICENSE.md is the
 # authoritative identifier and text.
 cmp "$repo_root/LICENSE.md" "$repo_root/clients/ruby/LICENSE.md"
+cmp "$repo_root/LICENSE.md" "$repo_root/clients/node/LICENSE.md"
 (
   cd "$repo_root/clients/ruby"
   ruby -e '
@@ -126,6 +127,15 @@ cmp "$repo_root/LICENSE.md" "$repo_root/clients/ruby/LICENSE.md"
     abort "RubyGems MFA is not required" unless spec.metadata["rubygems_mfa_required"] == "true"
   '
 )
+node -e '
+  const spec = require(process.argv[1]);
+  if (spec.license !== "SEE LICENSE IN LICENSE.md") {
+    throw new Error("npm package licence metadata must point to LICENSE.md");
+  }
+  if (!spec.files.includes("LICENSE.md") || !spec.files.includes("README.md")) {
+    throw new Error("npm package omits its licence or README");
+  }
+' "$repo_root/clients/node/package.json"
 
 # Prove the inherited private-key handoff used by provisioning survives exec
 # while remaining outside argv/environment/disk. The marker is synthetic test data.
@@ -207,3 +217,5 @@ ruby -I"$repo_root/clients/ruby/lib" \
   "$repo_root/clients/ruby/test/convenient_security_test.rb"
 ruby -I"$repo_root/clients/ruby/lib" \
   "$repo_root/clients/ruby/test/cross_stack_test.rb"
+npm test --prefix "$repo_root"
+npm run pack:check --prefix "$repo_root"

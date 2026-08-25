@@ -9,16 +9,36 @@ permissions:
   contents: read
 
 jobs:
-  swift-and-ruby:
+  swift-ruby-and-node:
     runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts
       - name: Toolchain report
         run: |
           sw_vers
           xcodebuild -version
           swift --version
           ruby --version
+          node --version
+          npm --version
       - name: Build and test
         run: bin/ci
+
+  node-minimum:
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run test:unit --workspace=clients/node

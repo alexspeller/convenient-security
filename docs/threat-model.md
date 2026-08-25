@@ -86,17 +86,18 @@ named-file, raw-output, or authorized-consumer path into a confidentiality
 boundary. The production Keychain stores HMAC-derived logical identifiers and
 value-free metadata, not raw references or values.
 
-### Ruby heap delivery
+### Language-client heap delivery
 
-Pure Ruby does not trust the agent socket. It invokes the fixed root-owned
-signed bridge, which uses a scrubbed environment and close-on-exec private
-pipes. The agent verifies the bridge and its actual direct Ruby parent; the
-bridge rechecks the parent before writing its response. Plaintext therefore
-arrives in the Ruby heap without appearing in the initial environment or argv.
+The Ruby and Node.js clients do not trust the agent socket. They invoke the
+fixed root-owned signed bridge, which uses a scrubbed environment and
+close-on-exec private pipes. The agent verifies the bridge and its actual direct
+language-runtime parent; the bridge rechecks the parent before writing its
+response. Plaintext therefore arrives in the authorized process heap without
+appearing in the initial environment or argv.
 
-This protection ends if the application assigns the returned value to `ENV`,
-passes it in argv, writes or logs it, sends it over an unintended connection, or
-loads hostile code into the same Ruby process.
+This protection ends if the application assigns the returned value to
+`ENV`/`process.env`, passes it in argv, writes or logs it, sends it over an
+unintended connection, or loads hostile code into the same language process.
 
 ### Tool-native credential protocols
 
@@ -317,7 +318,8 @@ so a reported partial apply must be completed or reviewed by repeating setup.
 - `csec setup --import` reads each explicitly selected plaintext source into the
   signed launcher's heap before merging it into the native encrypted store; it
   does not erase the source.
-- The Ruby client returns an ordinary mutable `String` to application code.
+- The Ruby and Node.js clients return ordinary language strings to application
+  code; neither can revoke or erase every runtime copy after delivery.
 - `csec creds aws` and `csec creds git` intentionally return plaintext over the
   credential consumer's private stdout pipe.
 - `csec exec-fd` authorizes the launched process and any descendants retaining

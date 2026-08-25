@@ -4,7 +4,7 @@ import ConvenientSecurity
 // A long-running FAKE agent for cross-language client integration tests. It
 // serves a fixed set of demo references from memory with auto-approved consent —
 // no 1Password, no real secrets, no biometrics. NOT a production surface; it
-// exists so clients (Ruby, and later Node) can be tested against a real agent
+// exists so the Ruby and Node.js clients can be tested against a real agent
 // speaking the real wire protocol without a provisioned build or a live vault.
 //
 // Listens on AgentSocket.defaultPath() (honouring CSEC_SOCKET), so a test points
