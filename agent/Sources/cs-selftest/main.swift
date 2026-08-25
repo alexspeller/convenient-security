@@ -1053,6 +1053,48 @@ let envPlan = DeliveryPlan(
 )
 check((try? basePlan.digest()) != (try? envPlan.digest()),
       "delivery mechanism changes the bound plan digest")
+let shellRequester = PlannedExecutable(
+    canonicalPath: "/bin/fish",
+    assurance: .independentlyProtected
+)
+let shellRootedPlan = DeliveryPlan(
+    mechanism: .rawStandardOutput,
+    executable: PlannedExecutable(
+        canonicalPath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec",
+        assurance: .verifiedProduct
+    ),
+    requestingExecutable: shellRequester,
+    root: .directParent(pid: 4242, startTime: 999_999),
+    descendantScope: .subtree,
+    destination: .humanOutput,
+    requestedTTLSeconds: 3600,
+    operationContext: "interactive get"
+)
+let otherShellRootedPlan = DeliveryPlan(
+    mechanism: .rawStandardOutput,
+    executable: shellRootedPlan.executable,
+    requestingExecutable: PlannedExecutable(
+        canonicalPath: "/bin/zsh",
+        assurance: .independentlyProtected
+    ),
+    root: shellRootedPlan.root,
+    descendantScope: .subtree,
+    destination: .humanOutput,
+    requestedTTLSeconds: 3600,
+    operationContext: "interactive get"
+)
+check((try? shellRootedPlan.digest()) != (try? otherShellRootedPlan.digest()),
+      "direct-parent requester identity changes the bound plan digest")
+if let encodedShellPlan = try? JSONEncoder().encode(shellRootedPlan),
+   let decodedShellPlan = try? JSONDecoder().decode(
+    DeliveryPlan.self,
+    from: encodedShellPlan
+   ) {
+    check(decodedShellPlan.requestingExecutable == shellRequester,
+          "direct-parent requester identity round-trips")
+} else {
+    check(false, "direct-parent requester identity round-trips")
+}
 let guardedEnvPlan = DeliveryPlan(
     mechanism: .unrestrictedInitialEnvironment,
     executable: baseExecutable,

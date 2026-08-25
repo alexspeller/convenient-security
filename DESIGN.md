@@ -245,7 +245,15 @@ remains byte-exact with a warning unless `--redact-output=always` is selected.
 `csec get` writes the requested plaintext to standard output. It is an explicit
 raw-output interface intended for a deliberate receiver; shell history,
 pipelines, redirection targets, and downstream commands remain the caller's
-responsibility.
+responsibility. When stdout is an interactive terminal, the signed launcher
+records its real direct parent's PID, start time, canonical executable identity,
+and writable-path assurance separately from the signed `csec` byte consumer.
+The daemon independently verifies that parent, shows it as the requester, and
+roots a subtree grant there so consecutive sibling gets from the same live shell
+can reuse a compatible decision. `csec` rechecks the parent before printing.
+For a pipe, the reader is generally a sibling and cannot be recovered from the
+file descriptor, so generic piped get remains an unknown-destination,
+exact-caller request and cannot reuse the shell grant.
 
 ### Native store editing
 

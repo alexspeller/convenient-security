@@ -120,7 +120,7 @@ Build and run the agent, then fetch a secret:
 bin/ci                                        # build + run the full test suite
 
 swift run csecd                               # start the agent (foreground, dev mode)
-swift run csec get 'op://Vault/Item/Field'    # fetch one secret to stdout — prompts for Touch ID
+swift run csec get 'op://Vault/Item/Field'    # terminal get — identifies the parent shell and prompts once per grant
 ```
 
 > An unsigned `swift run csecd` runs without the at-rest cache and the native

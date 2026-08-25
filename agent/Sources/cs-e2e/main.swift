@@ -82,6 +82,30 @@ actor DenyPolicyReview: PolicyReviewProvider {
     func calls() -> Int { count }
 }
 
+actor AccessReviewCapture {
+    private var latestReview: AccessPolicyReview?
+
+    func record(_ review: AccessPolicyReview) {
+        latestReview = review
+    }
+
+    func latest() -> AccessPolicyReview? { latestReview }
+}
+
+struct CapturingAutoApprovePolicyReview: PolicyReviewProvider {
+    let capture: AccessReviewCapture
+    private let delegate = AutoApprovePolicyReview()
+
+    func reviewAccess(_ review: AccessPolicyReview) async -> AccessPolicyReviewOutcome {
+        await capture.record(review)
+        return await delegate.reviewAccess(review)
+    }
+
+    func reviewRiskChange(_ review: RiskChangeReview) async -> Bool {
+        await delegate.reviewRiskChange(review)
+    }
+}
+
 actor EmbeddedAuthenticationCounter: AccessPolicyAuthenticationSession {
     private var preauthenticationCount = 0
     private var authenticationCount = 0
@@ -164,6 +188,7 @@ await resolver.register(StaticProvider(values: [
     "op://fd-high/pgpass/content": "high-fd-synthetic-secret",
     "op://file-delivery/config/content": "regular-file-synthetic-secret",
     "op://github/profile/token": "github-regular-file-synthetic-token",
+    "op://get-tests/credential/token": "interactive-get-synthetic-token",
 ], counter: resolutionCounter))
 let nativeKeyBackend = InMemoryNativeStoreKeyBackend()
 let nativeFileBackend = InMemoryNativeStoreFileBackend()
@@ -175,12 +200,13 @@ await resolver.register(nativeProvider)
 let grants = GrantTable()
 let consent = ConsentCounter()
 let capture = RequestCapture()
+let accessReviewCapture = AccessReviewCapture()
 let agent = Agent(
     resolver: resolver,
     grants: grants,
     consent: consent,
     riskJudgments: RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend()),
-    policyReview: AutoApprovePolicyReview(),
+    policyReview: CapturingAutoApprovePolicyReview(capture: accessReviewCapture),
     nativeStore: nativeProvider,
     allowUnverifiedPlansForTesting: true
 )
@@ -355,6 +381,42 @@ if let invalidMetadataRequest = try? AccessRequest(
           "malformed delivery metadata fails before consent or resolution")
 } else {
     check(false, "malformed-metadata request can be constructed for rejection testing")
+}
+
+let misplacedRequesterPlan = DeliveryPlan(
+    mechanism: .directHeap,
+    executable: PlannedExecutable(canonicalPath: "/usr/bin/ruby", assurance: .unverified),
+    requestingExecutable: PlannedExecutable(
+        canonicalPath: "/bin/sh",
+        assurance: .independentlyProtected
+    ),
+    root: .caller,
+    descendantScope: .subtree,
+    destination: .localDevelopment,
+    requestedTTLSeconds: 60,
+    operationContext: "misplaced requester metadata test"
+)
+if let misplacedRequesterRequest = try? AccessRequest(
+    references: ["op://demo/db/url"],
+    reason: "requester identity is valid only for a direct parent",
+    ttlSeconds: 60,
+    deliveryPlan: misplacedRequesterPlan
+) {
+    let consentBefore = await consent.calls()
+    let response = await agent.handle(
+        request: misplacedRequesterRequest,
+        caller: CallerInfo(
+            pid: getpid(),
+            startTime: ProcessAncestry.startTime(of: getpid()) ?? 0,
+            description: "misplaced requester test"
+        )
+    )
+    let consentAfter = await consent.calls()
+    check(response.failure?.code == .invalidRequest
+          && consentAfter == consentBefore,
+          "requester executable metadata is rejected outside a direct-parent root")
+} else {
+    check(false, "misplaced-requester request can be constructed for rejection testing")
 }
 
 let unsupportedMatcherPlan = DeliveryPlan(
@@ -1109,6 +1171,40 @@ func runCsecInPTY(
     )
 }
 
+/// Run two sibling interactive `csec get` processes beneath one long-lived
+/// shell. The trailing `:` prevents the shell from replacing itself with the
+/// second csec, so both requests have the exact same direct parent incarnation.
+func runRepeatedInteractiveGet(
+    reference: String
+) -> (status: Int32, out: String, err: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
+    process.arguments = [
+        "-q", "/dev/null", "/bin/sh", "-c",
+        "\"$1\" get --for 60 \"$2\"; \"$1\" get --for 60 \"$2\"; :",
+        "csec-get-parent-e2e", csecURL.path, reference,
+    ]
+    var environment = ProcessInfo.processInfo.environment
+    environment["CSEC_SOCKET"] = socketPath
+    process.environment = environment
+    let outPipe = Pipe(), errPipe = Pipe()
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+    do {
+        try process.run()
+    } catch {
+        return (-1, "", "spawn failed: \(error)")
+    }
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return (
+        process.terminationStatus,
+        String(data: outData, encoding: .utf8) ?? "",
+        String(data: errData, encoding: .utf8) ?? ""
+    )
+}
+
 func runCsecThroughStopAndContinue() -> (
     status: Int32,
     observedStop: Bool,
@@ -1195,6 +1291,50 @@ func runCsecWithExternalTermination() -> (status: Int32, out: String, err: Strin
 }
 
 if FileManager.default.isExecutableFile(atPath: csecURL.path) {
+    let interactiveGetReference = "op://get-tests/credential/token"
+    let interactiveGetValue = "interactive-get-synthetic-token"
+    let consentBeforeInteractiveGets = await consent.calls()
+    let repeatedInteractiveGets = runRepeatedInteractiveGet(
+        reference: interactiveGetReference
+    )
+    let consentAfterInteractiveGets = await consent.calls()
+    let repeatedValueCount = repeatedInteractiveGets.out
+        .components(separatedBy: interactiveGetValue).count - 1
+    let interactiveReview = await accessReviewCapture.latest()
+    var directParentReviewIsBound = false
+    if let interactiveReview,
+       case .directParent = interactiveReview.plan.root,
+       let requester = interactiveReview.plan.requestingExecutable {
+        let requesterName = URL(fileURLWithPath: requester.canonicalPath).lastPathComponent
+        directParentReviewIsBound = interactiveReview.plan.descendantScope == .subtree
+            && interactiveReview.plan.destination == .humanOutput
+            && URL(fileURLWithPath: interactiveReview.plan.executable.canonicalPath)
+                .lastPathComponent == "csec"
+            && requesterName != "csec"
+            && interactiveReview.caller.description.contains("\(requesterName) [")
+            && interactiveReview.caller.description.contains(" via ")
+    }
+    check(repeatedInteractiveGets.status == 0
+          && repeatedValueCount == 2
+          && consentAfterInteractiveGets == consentBeforeInteractiveGets + 1
+          && directParentReviewIsBound,
+          "interactive get identifies its direct parent and sibling gets reuse one grant")
+
+    let consentBeforePipedGet = await consent.calls()
+    let resolutionsBeforeInteractivePipedGet = await resolutionCounter.calls()
+    let pipedGet = runCsec(
+        ["get", "--for", "60", interactiveGetReference],
+        extraEnv: [:]
+    )
+    let consentAfterPipedGet = await consent.calls()
+    let resolutionsAfterInteractivePipedGet = await resolutionCounter.calls()
+    check(pipedGet.status == 1
+          && pipedGet.out.isEmpty
+          && pipedGet.err.contains("policy_denied")
+          && consentAfterPipedGet == consentBeforePipedGet
+          && resolutionsAfterInteractivePipedGet == resolutionsBeforeInteractivePipedGet,
+          "piped get keeps its unknown-reader exact-caller policy and reuses no shell grant")
+
     do {
         let setupFixture = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("csec setup fixture \(UUID().uuidString)", isDirectory: true)

@@ -110,24 +110,26 @@ Before treating an artifact as protected, verify on the signed installed app:
    second csec authentication sheet; and
 7. one touch permits a cold cache read, followed by a warm read with no second
    biometric prompt;
-8. the native-store spike proves a signed-but-unentitled same-UID helper cannot
+8. two interactive `csec get` children of one shell show that shell as the
+   requester and reuse one compatible grant, while piped get cannot reuse it;
+9. the native-store spike proves a signed-but-unentitled same-UID helper cannot
    query the provisioned access-group item, and that the `.biometryAny`,
    `WhenUnlockedThisDeviceOnly` record cannot be read without an authorized
    context, then can be loaded and atomically updated with the just-evaluated
    Touch ID context;
-9. `csec edit` creates only ciphertext under the documented directory, a cold
+10. `csec edit` creates only ciphertext under the documented directory, a cold
    daemon requires Touch ID, a warm granted read does not reprompt, and
    ciphertext modification plus replay of an older version both fail closed;
-10. built-in editing and cancelling a synthetic store leaves no named plaintext,
+11. built-in editing and cancelling a synthetic store leaves no named plaintext,
     editor swap, backup, or autosave file; external `--editor` mode shows its
     plaintext warning before Touch ID, uses `0700`/`0600` workspace objects, and
     removes that exact workspace after success, invalid input, and editor failure
     (without claiming crash cleanup, secure erasure, or removal of copies);
-11. the signed/notarized package installs the bridge at
+12. the signed/notarized package installs the bridge at
    `/Library/Application Support/ConvenientSecurity/bin/csec` with every path
    component root-owned and non-user-writable, and Ruby reaches the installed
    agent through it; and
-12. provisioning consumes the real App Store Connect key through `/dev/fd/3`;
+13. provisioning consumes the real App Store Connect key through `/dev/fd/3`;
    notarization uses only a short-lived `0600` key file beneath an atomically
    created `0700` directory because `notarytool --key` requires a filesystem
    path; both leave no private-key environment entry, notarization removes its
@@ -135,33 +137,33 @@ Before treating an artifact as protected, verify on the signed installed app:
    and the pipeline fails on a deliberately invalid signature/ticket check
    (without claiming cleanup after `SIGKILL`, process crash, or machine loss);
    and
-13. interactive `csec exec` preserves input, terminal resize, Ctrl-C/Ctrl-Z,
+14. interactive `csec exec` preserves input, terminal resize, Ctrl-C/Ctrl-Z,
     colors, and the target's exit status while replacing a synthetic output
     marker on both stdout and stderr; and
-14. before enabling generated AI hooks globally, the installed Claude Code and
+15. before enabling generated AI hooks globally, the installed Claude Code and
     Codex versions preserve normal allow/ask/deny and OS-sandbox behavior, run
     representative multiline Rails/Node/test shell programs correctly, block
     when the adapter exits 2, and return no raw synthetic value for the
     RuboCop/`pgrep` regression; and
-15. a signed `csec session` gives compatible low/standard descendant helpers one
+16. a signed `csec session` gives compatible low/standard descendant helpers one
     bounded grant, a copied session ID outside the registered subtree fails, and
     high-impact access uses a fresh per-command root; and
-16. real AWS `credential_process` and Git helper invocations receive their exact
+17. real AWS `credential_process` and Git helper invocations receive their exact
     synthetic protocol response through a private pipe, reject a mismatched
     Git host/path without resolution, and create no credential cache or file;
     and
-17. installed supported versions of libpq, kubectl, the AWS SDK/CLI, and Google
+18. installed supported versions of libpq, kubectl, the AWS SDK/CLI, and Google
     authentication tooling each consume their preset once through `/dev/fd/N`,
     while a concurrent same-UID process cannot read that descriptor and no
     plaintext named file, argv, or initial-environment value is created; and
-18. every signed/root row in
+19. every signed/root row in
     [`regular-file-security-matrix.md`](regular-file-security-matrix.md) passes
     with synthetic data, including exact installed identities, verified tmpfs
     flags/caps and modes, unrelated same-UID denial, GID lifecycle/collision
     checks, daemonized descendants, launcher death, soft/hard TTL, cancellation,
     restart recovery, GUI/headless audit-session behavior, and real consumer
     compatibility; and
-19. `csec setup` against fresh and existing user configurations produces the
+20. `csec setup` against fresh and existing user configurations produces the
     reviewed dry-run plan, preserves unrelated settings, appears in each
     client's effective hook/trust UI, and blocks a synthetic Bash call when
     installed `csec` or `csecd` is unavailable; a selected synthetic dotenv

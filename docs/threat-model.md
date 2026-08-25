@@ -309,7 +309,11 @@ so a reported partial apply must be completed or reviewed by repeating setup.
 - `csec exec` places plaintext in the child's initial environment. Output
   masking does not make that environment private. Policy allows this for low
   risk and by separate acceptance for standard risk; high/critical are rejected.
-- `csec get` prints plaintext to standard output.
+- Interactive `csec get` prints plaintext to standard output and roots a
+  digest-bound grant at its kernel-verified direct parent, allowing compatible
+  sibling gets from that same live shell. It rechecks the parent before output.
+  Piped get cannot identify its reader and remains an unknown-destination,
+  exact-caller request.
 - `csec setup --import` reads each explicitly selected plaintext source into the
   signed launcher's heap before merging it into the native encrypted store; it
   does not erase the source.

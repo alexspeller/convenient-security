@@ -155,10 +155,13 @@ Before resolution, the agent verifies:
   supported output-matcher version, and plan/TTL agreement;
 - a recomputed canonical plan digest;
 - that the socket peer is the verified launcher;
-- a caller root; only for `csec bridge`, a requested direct parent that is the
-  launcher's real PPID with the same process start time; or a registered-session
-  ID whose live PID/start-time root is an ancestor of the caller in the same
-  audit session;
+- a caller root; for bridge/credential consumers and interactive `csec get`, a
+  requested direct parent that is the launcher's real PPID with the same process
+  start time and canonical executable; or a registered-session ID whose live
+  PID/start-time root is an ancestor of the caller in the same audit session;
+- when the direct-parent requester differs from the byte consumer, a separate
+  `requestingExecutable` identity whose path, signature metadata, and
+  writable-path assurance csecd independently recomputes;
 - for `credential_protocol`, that the plan's consumer executable is the
   helper's current direct parent's canonical executable path; and
 - the current logical-credential risk judgment, delivery acceptance, mechanism,
@@ -170,6 +173,11 @@ The grant records the request ID, plan digest, peer PID version/CDHash, and
 planned executable, together with the opaque credential key, effective risk,
 policy version/digest, and output policy. A risk change revokes matching grants;
 reuse also recomputes the policy binding, so stale authorization fails closed.
+Interactive terminal `csec get` keeps signed `csec` as the raw-output consumer,
+binds its direct parent as `requestingExecutable`, and uses that parent's exact
+PID/start-time as a subtree grant root. Consecutive sibling gets from the same
+live shell can therefore reuse a compatible grant. The launcher rechecks the
+parent incarnation and executable again before writing the response.
 Generic piped `csec get` cannot identify a shell-pipeline reader, so its delivery
 plan declares an unknown, unverified destination and uses an exact-caller grant;
 the high destination floor currently rejects that path before resolution.

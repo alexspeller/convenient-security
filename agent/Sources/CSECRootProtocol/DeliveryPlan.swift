@@ -132,7 +132,13 @@ public struct PlannedExecutable: Codable, Sendable, Equatable {
 /// Complete, plaintext-free context for one release decision.
 public struct DeliveryPlan: Codable, Sendable, Equatable {
     public let mechanism: DeliveryMechanism
+    /// The process that directly receives or emits the plaintext bytes.
     public let executable: PlannedExecutable
+    /// Optional identity of a direct-parent requester when it differs from the
+    /// byte consumer. The signed launcher supplies this for interactive
+    /// `csec get`, and csecd independently resolves the parent before use.
+    /// It is invalid for caller and registered-session roots.
+    public let requestingExecutable: PlannedExecutable?
     public let root: DeliveryRoot
     public let descendantScope: DescendantScope
     public let destination: DestinationClass
@@ -149,6 +155,7 @@ public struct DeliveryPlan: Codable, Sendable, Equatable {
     public init(
         mechanism: DeliveryMechanism,
         executable: PlannedExecutable,
+        requestingExecutable: PlannedExecutable? = nil,
         root: DeliveryRoot = .caller,
         descendantScope: DescendantScope,
         destination: DestinationClass,
@@ -159,6 +166,7 @@ public struct DeliveryPlan: Codable, Sendable, Equatable {
     ) {
         self.mechanism = mechanism
         self.executable = executable
+        self.requestingExecutable = requestingExecutable
         self.root = root
         self.descendantScope = descendantScope
         self.destination = destination

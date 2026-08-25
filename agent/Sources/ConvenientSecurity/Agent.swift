@@ -152,14 +152,31 @@ public actor Agent {
                 )
             }
             if case let .directParent(pid, _) = deliveryPlan.root {
-                let claimedPath = URL(fileURLWithPath: deliveryPlan.executable.canonicalPath)
+                let requester = deliveryPlan.requestingExecutable ?? deliveryPlan.executable
+                let claimedPath = URL(fileURLWithPath: requester.canonicalPath)
                     .standardizedFileURL.resolvingSymlinksInPath().path
                 guard ProcessAncestry.executablePath(of: pid) == claimedPath else {
                     return .failed(
                         .invalidRequest,
-                        message: "the planned executable does not match the verified parent",
+                        message: "the planned requester does not match the verified parent",
                         requestID: requestID
                     )
+                }
+                // A separate requester identity is a signed-launcher assertion,
+                // but csecd still recomputes its path, signature metadata, and
+                // writable-path assurance. Recheck the live image afterwards
+                // so an intervening parent exec cannot race the inspection.
+                if deliveryPlan.requestingExecutable != nil {
+                    guard let inspected = try? ExecutableInspection.plannedExecutable(
+                        command: claimedPath
+                    ), inspected == requester,
+                    ProcessAncestry.executablePath(of: pid) == claimedPath else {
+                        return .failed(
+                            .invalidRequest,
+                            message: "the planned requester identity could not be verified",
+                            requestID: requestID
+                        )
+                    }
                 }
             }
             if deliveryPlan.mechanism == .credentialProtocol {
@@ -630,8 +647,17 @@ public actor Agent {
     ) -> CallerInfo {
         var displayed = caller
         let executableName = URL(fileURLWithPath: plan.executable.canonicalPath).lastPathComponent
-        displayed.description = "\(caller.description) for \(executableName) "
-            + "[\(plan.executable.assurance.rawValue)] (grant root pid \(rootPID))"
+        if case .directParent = plan.root {
+            let requester = plan.requestingExecutable ?? plan.executable
+            // Derive the label from the independently checked executable path,
+            // not the process's mutable display name.
+            let requesterName = URL(fileURLWithPath: requester.canonicalPath).lastPathComponent
+            displayed.description = "\(requesterName) [\(requester.assurance.rawValue)] "
+                + "(pid \(rootPID)) via \(caller.description)"
+        } else {
+            displayed.description = "\(caller.description) for \(executableName) "
+                + "[\(plan.executable.assurance.rawValue)] (grant root pid \(rootPID))"
+        }
         return displayed
     }
 
@@ -1571,15 +1597,34 @@ public actor Agent {
 
     private static func hasValidMetadata(_ plan: DeliveryPlan) -> Bool {
         let executable = plan.executable
-        return executable.canonicalPath.hasPrefix("/")
-            && executable.canonicalPath.utf8.count <= 4_096
-            && !executable.canonicalPath.utf8.contains(0)
+        return hasValidExecutableMetadata(executable)
+            && hasValidRequesterMetadata(plan)
             && !plan.operationContext.isEmpty
             && plan.operationContext.utf8.count <= 512
             && !plan.operationContext.utf8.contains(0)
             && hasValidRootScope(plan)
             && (plan.commandDigest.map(isSHA256Digest) ?? true)
             && hasValidOutputGuard(plan)
+    }
+
+    private static func hasValidRequesterMetadata(_ plan: DeliveryPlan) -> Bool {
+        switch (plan.root, plan.requestingExecutable) {
+        case (.directParent, .none):
+            // Existing direct-parent consumers use `executable` for both roles.
+            return true
+        case let (.directParent, .some(requester)):
+            return hasValidExecutableMetadata(requester)
+        case (_, .none):
+            return true
+        case (_, .some):
+            return false
+        }
+    }
+
+    private static func hasValidExecutableMetadata(_ executable: PlannedExecutable) -> Bool {
+        executable.canonicalPath.hasPrefix("/")
+            && executable.canonicalPath.utf8.count <= 4_096
+            && !executable.canonicalPath.utf8.contains(0)
             && (executable.signingIdentifier.map {
                 !$0.isEmpty && $0.utf8.count <= 512 && !$0.utf8.contains(0)
             } ?? true)

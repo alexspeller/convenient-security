@@ -561,17 +561,33 @@ func runGet(_ arguments: [String]) -> Never {
     let client = makeAgentClient()
     do {
         let plan: DeliveryPlan
+        var requestingParent: (pid: pid_t, startTime: UInt64, executablePath: String)? = nil
         if isatty(STDOUT_FILENO) == 1 {
+            let parentPID = getppid()
+            guard parentPID > 1,
+                  let parentStartTime = ProcessAncestry.startTime(of: parentPID),
+                  let parentPath = ProcessAncestry.executablePath(of: parentPID),
+                  let parentExecutable = try? ExecutableInspection.plannedExecutable(
+                    command: parentPath
+                  ) else {
+                FileHandle.standardError.write(Data(
+                    "csec get: requesting parent identity is unavailable\n".utf8
+                ))
+                exit(1)
+            }
+            requestingParent = (parentPID, parentStartTime, parentExecutable.canonicalPath)
             plan = DeliveryPlan(
                 mechanism: .rawStandardOutput,
                 executable: PlannedExecutable(
-                    canonicalPath: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path,
+                    canonicalPath: URL(fileURLWithPath: CommandLine.arguments[0])
+                        .standardizedFileURL.resolvingSymlinksInPath().path,
                     signingIdentifier: ProductCodeIdentity.launcherIdentifier,
                     teamIdentifier: ProductCodeIdentity.teamIdentifier,
                     assurance: .verifiedProduct
                 ),
-                root: .caller,
-                descendantScope: .exactProcess,
+                requestingExecutable: parentExecutable,
+                root: .directParent(pid: parentPID, startTime: parentStartTime),
+                descendantScope: .subtree,
                 destination: .humanOutput,
                 requestedTTLSeconds: ttlSeconds,
                 operationContext: reason
@@ -616,6 +632,21 @@ func runGet(_ arguments: [String]) -> Never {
             ttlSeconds: ttlSeconds,
             deliveryPlan: plan
         )
+        // The response is already in csec's heap at this point, but it must not
+        // cross stdout if the shell exited, was replaced, or csec was
+        // reparented while review/Touch ID was in progress.
+        if let requestingParent {
+            guard getppid() == requestingParent.pid,
+                  ProcessAncestry.startTime(of: requestingParent.pid)
+                    == requestingParent.startTime,
+                  ProcessAncestry.executablePath(of: requestingParent.pid)
+                    == requestingParent.executablePath else {
+                FileHandle.standardError.write(Data(
+                    "csec get: requesting parent changed during access; refusing output\n".utf8
+                ))
+                exit(1)
+            }
+        }
         for reference in references {
             guard let value = values[reference] else {
                 FileHandle.standardError.write(Data("csec: no value returned for \(reference)\n".utf8))
