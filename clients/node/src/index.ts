@@ -227,7 +227,10 @@ async function isWritable(path: string): Promise<boolean> {
     await checkFileAccess(path, fsConstants.W_OK);
     return true;
   } catch (cause) {
-    if (isNodeError(cause) && (cause.code === 'EACCES' || cause.code === 'EPERM')) {
+    if (
+      isNodeError(cause) &&
+      (cause.code === 'EACCES' || cause.code === 'EPERM' || cause.code === 'EROFS')
+    ) {
       return false;
     }
     throw cause;
