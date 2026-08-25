@@ -44,8 +44,9 @@ rest and in use — as small as macOS allows.
 
 - **Human in the loop.** The first time a process asks for a reference, the agent
   shows one trusted review window with exactly which secret, which process, and
-  why, then embeds **Touch ID** in that window. No password fallback, no
-  auto-approve switch in the shipping build.
+  why, and activates embedded **Touch ID** as soon as the window is visible. No
+  preliminary Enter press, password fallback, or auto-approve switch exists in
+  the shipping build.
 - **One touch, sensible scope.** A grant is bound to the approving process and
   its child processes (its "subtree") for a bounded lifetime, so a `rails server`
   and the migrations it spawns don't re-prompt you every few seconds — but an

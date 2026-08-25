@@ -55,9 +55,10 @@ public struct AccessPolicyApproval: Sendable {
     public let classifications: [String: RiskLevel]
     /// Separate affirmative acceptance of a weak compatibility mechanism.
     public let acceptedCompatibilityCredentialKeys: Set<String>
-    /// A trusted review can keep its window open and perform Touch ID inside it
-    /// after the agent has validated the selected policy. Injected/headless
-    /// reviewers leave this nil and use the ordinary ConsentProvider instead.
+    /// A trusted review can authenticate inside its window, freeze the exact
+    /// visible choices, and retain the evaluated context while the agent checks
+    /// those choices. Injected/headless reviewers leave this nil and use the
+    /// ordinary ConsentProvider instead.
     public let authenticationSession: (any AccessPolicyAuthenticationSession)?
 
     public init(
@@ -71,14 +72,17 @@ public struct AccessPolicyApproval: Sendable {
     }
 }
 
-/// The second half of a trusted access review. The review window first returns
-/// the user's value-free policy selections; only after the agent independently
-/// accepts those selections does it ask this session to authenticate in-place.
+/// The policy-bound completion of a trusted access review. Production may start
+/// Touch ID while the user reviews the value-free choices, but it must freeze
+/// the choices on biometric success and retain the evaluated context here. The
+/// agent calls `completeAfterPolicyApproval` only after independently accepting
+/// that snapshot; a rejection calls `cancel` and no context, value, or persistent
+/// choice leaves the session.
 ///
 /// This is a dependency-injection seam, like PolicyReviewProvider and
 /// ConsentProvider. The shipping daemon constructs only TrustedPolicyReview.
 public protocol AccessPolicyAuthenticationSession: Sendable {
-    func authenticate(localizedReason: String, policySummary: String) async -> ConsentOutcome
+    func completeAfterPolicyApproval(policySummary: String) async -> ConsentOutcome
     func cancel() async
 }
 
@@ -161,8 +165,8 @@ public struct AutoApprovePolicyReview: PolicyReviewProvider {
 
 /// AppKit review rendered by the authenticated resident agent. The selection
 /// crosses no untrusted IPC boundary: csecd owns both the controls and policy
-/// decision, then embeds Touch ID in that same trusted window before any choice
-/// is persisted or any value is released.
+/// decision, and embeds Touch ID in that same trusted window. The exact choices
+/// visible at biometric success are still checked before persistence or release.
 public struct TrustedPolicyReview: PolicyReviewProvider {
     public init() {}
 

@@ -91,16 +91,17 @@ classified as low, standard, high, or critical. Acceptance of a weak
 compatibility delivery is a separate, initially unchecked decision rather than
 part of the classification.
 
-That window creates a fresh `LAContext` and pairs it with Apple's embedded
-`LAAuthenticationView`. Pressing **Authorize with Touch ID** returns only the
-value-free selections to the agent while the window remains open. The agent
-applies the authoritative risk policy first; a denial closes the session without
-starting biometrics. An allowed decision updates the same window with the
-policy-capped duration and compact risk/delivery/scope/destination summary, then
-evaluates Touch ID without password fallback through the paired context. The
-localized reason carries the same bounded request details as a defense in depth.
-Dynamic text is bounded and control, newline, and bidirectional-formatting
-characters are neutralized.
+That window creates a fresh `LAContext`, pairs it with Apple's embedded
+`LAAuthenticationView`, and starts Touch ID as soon as the rendered panel is
+visible—there is no preliminary button or Enter-key gate. Policy controls remain
+editable while Touch ID is active. On biometric success the daemon freezes the
+exact visible choices and returns only that value-free snapshot to the agent
+while retaining the evaluated context. The agent applies the authoritative risk
+policy before persisting a choice, releasing a value, or handing out the context;
+a denial closes and invalidates the session. The localized reason carries the
+bounded requested details as defense in depth, while the trusted window is the
+authoritative display of the selected risk and delivery. Dynamic text is bounded
+and control, newline, and bidirectional-formatting characters are neutralized.
 
 Approval returns the evaluated context to the cache read so a cold cached value
 or cold native-store key can be unlocked by the same biometric action. Editing

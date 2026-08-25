@@ -2,7 +2,7 @@ import Foundation
 import LocalAuthentication
 
 /// Standalone consent gated by Touch ID. Production access review normally uses
-/// the same prompt text with an LAContext paired to its embedded authentication
+/// the same prompt format with an LAContext paired to its embedded authentication
 /// view; injected/headless review and policy mutations use this provider. Every
 /// evaluation creates a fresh context, so biometric state is never silently
 /// reused to approve another request.
@@ -68,8 +68,10 @@ public struct BiometricConsent: ConsentProvider {
         return approved ? .approved(unlock: CacheUnlock(context)) : .denied
     }
 
-    /// Bounded authentication reason: exactly what is being granted, to whom,
-    /// and for how long. It backs both standard and embedded LAContext UI.
+    /// Bounded authentication reason. Standalone consent supplies the final
+    /// policy-capped duration. Embedded review supplies the requested bound;
+    /// its trusted window carries the live selection and the agent applies the
+    /// final policy before releasing the evaluated context.
     public static func prompt(
         caller: CallerInfo,
         references: [SecretRef],

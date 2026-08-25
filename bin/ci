@@ -83,6 +83,17 @@ if [ "$csecd_event_loops" != "1" ] || [ "$csecd_detached_starts" != "1" ]; then
   echo "csecd must start its async runtime separately from the synchronous AppKit loop" >&2
   exit 1
 fi
+trusted_review="$repo_root/agent/Sources/ConvenientSecurity/TrustedAccessReviewSession.swift"
+if rg -q 'authorizeButton|authorizePressed' "$trusted_review"; then
+  echo "embedded Touch ID must not be gated by a preliminary authorize button" >&2
+  exit 1
+fi
+if ! rg -U -q \
+  'window\.makeKeyAndOrderFront\(nil\)\n\s*window\.displayIfNeeded\(\)\n\s*beginAuthentication\(\)' \
+  "$trusted_review"; then
+  echo "trusted review must activate Touch ID when its rendered window becomes visible" >&2
+  exit 1
+fi
 plutil -lint \
   "$repo_root/packaging/agent/Info.plist" \
   "$repo_root/packaging/agent/csecd.entitlements" \

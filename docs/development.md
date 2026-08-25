@@ -105,8 +105,9 @@ Before treating an artifact as protected, verify on the signed installed app:
 3. a non-product client is rejected before the agent decodes a request;
 4. former environment controls cannot change consent, endpoint, or provider;
 5. hardened runtime and required entitlements are present, and SIP is enabled;
-6. a new reference uses one trusted policy window with embedded real Touch ID,
-   without a second csec authentication sheet; and
+6. a new reference uses one trusted policy window whose embedded real Touch ID
+   is active as soon as the window is visible, without an Enter/click gate or a
+   second csec authentication sheet; and
 7. one touch permits a cold cache read, followed by a warm read with no second
    biometric prompt;
 8. the native-store spike proves a signed-but-unentitled same-UID helper cannot

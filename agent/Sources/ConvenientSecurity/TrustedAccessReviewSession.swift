@@ -5,9 +5,9 @@
   @preconcurrency import LocalAuthenticationEmbeddedUI
 
   /// One trusted window owns policy selection and the LAContext-backed Touch ID
-  /// view. It deliberately returns the selections before starting authentication,
-  /// so Agent can apply the authoritative policy table first while this window
-  /// remains on screen.
+  /// view. Authentication starts as soon as the visible window is rendered. On
+  /// success the exact visible selections are frozen and returned to Agent,
+  /// which must still accept them before this session releases its LAContext.
   @MainActor
   final class TrustedAccessReviewSession: NSObject, NSWindowDelegate,
     AccessPolicyAuthenticationSession
@@ -24,7 +24,6 @@
     private let context: LAContext
     private var state = State.ready
     private var selectionContinuation: CheckedContinuation<AccessPolicyReviewOutcome, Never>?
-    private var authenticationContinuation: CheckedContinuation<ConsentOutcome, Never>?
     private var selectors: [String: NSPopUpButton] = [:]
     private var acceptanceButtons: [String: NSButton] = [:]
     private var policyControls: [NSControl] = []
@@ -33,7 +32,6 @@
     private var window: NSPanel!
     private var authenticationView: LAAuthenticationView!
     private var statusLabel: NSTextField!
-    private var authorizeButton: NSButton!
     private var denyButton: NSButton!
 
     private init(review: AccessPolicyReview) {
@@ -49,30 +47,22 @@
       return await session.collectPolicySelection()
     }
 
-    func authenticate(localizedReason: String, policySummary: String) async -> ConsentOutcome {
+    func completeAfterPolicyApproval(policySummary: String) async -> ConsentOutcome {
       guard state == .awaitingPolicy, biometricsAvailable else {
-        await cancel()
+        finishDenied(closeWindow: true)
         return .denied
       }
 
-      state = .authenticating
+      // Touch ID already succeeded before the selection crossed the actor
+      // boundary. Only the authoritative policy decision can consume that
+      // authentication and obtain the context used for a cold Keychain read.
+      state = .finished
       statusLabel.textColor = .secondaryLabelColor
-      statusLabel.stringValue =
-        "Policy allowed: \(Self.safe(policySummary))\nTouch ID to authorize."
+      statusLabel.stringValue = "Policy allowed: \(Self.safe(policySummary))"
       statusLabel.isHidden = false
-      window.makeKeyAndOrderFront(nil)
-
-      return await withCheckedContinuation { continuation in
-        authenticationContinuation = continuation
-        context.evaluatePolicy(
-          .deviceOwnerAuthenticationWithBiometrics,
-          localizedReason: localizedReason
-        ) { [weak self] success, error in
-          DispatchQueue.main.async {
-            self?.authenticationFinished(success: success, error: error)
-          }
-        }
-      }
+      let unlock = CacheUnlock(context)
+      closeWindow()
+      return .approved(unlock: unlock)
     }
 
     func cancel() async {
@@ -135,7 +125,7 @@
 
       statusLabel = NSTextField(
         wrappingLabelWithString: biometricsAvailable
-          ? "Your selection is checked against the risk policy before Touch ID starts."
+          ? "Touch ID is active. The exact selection shown when it succeeds is checked before release."
           : "Touch ID is unavailable, so this request cannot be authorized."
       )
       statusLabel.font = .systemFont(ofSize: 12)
@@ -178,7 +168,7 @@
       title.font = .systemFont(ofSize: 22, weight: .semibold)
       let subtitle = NSTextField(
         wrappingLabelWithString:
-          "Review exactly what will be released, then authorize it with Touch ID in this window."
+          "Review exactly what will be released. Touch ID is active as soon as this window appears."
       )
       subtitle.font = .systemFont(ofSize: 13)
       subtitle.textColor = .secondaryLabelColor
@@ -288,16 +278,8 @@
 
       denyButton = NSButton(title: "Deny", target: self, action: #selector(denyPressed(_:)))
       denyButton.keyEquivalent = "\u{1b}"
-      authorizeButton = NSButton(
-        title: "Authorize with Touch ID",
-        target: self,
-        action: #selector(authorizePressed(_:))
-      )
-      authorizeButton.bezelStyle = .rounded
-      authorizeButton.keyEquivalent = "\r"
-      authorizeButton.isEnabled = biometricsAvailable
 
-      let footer = NSStackView(views: [spacer, denyButton, authorizeButton])
+      let footer = NSStackView(views: [spacer, denyButton])
       footer.orientation = .horizontal
       footer.alignment = .centerY
       footer.spacing = 10
@@ -314,31 +296,27 @@
         application.activate(ignoringOtherApps: true)
         window.center()
         window.makeKeyAndOrderFront(nil)
+        window.displayIfNeeded()
+        beginAuthentication()
       }
     }
 
-    @objc private func authorizePressed(_ sender: Any?) {
+    private func beginAuthentication() {
       guard state == .selecting, biometricsAvailable else { return }
-      guard let selection = selectedPolicy() else { return }
-
-      state = .awaitingPolicy
-      for control in policyControls {
-        control.isEnabled = false
-      }
-      authorizeButton.isEnabled = false
+      state = .authenticating
       denyButton.title = "Cancel"
       statusLabel.textColor = .secondaryLabelColor
-      statusLabel.stringValue = "Checking the selected policy…"
+      statusLabel.stringValue =
+        "Touch ID is active. Adjust the selection if needed, then touch the sensor."
 
-      let continuation = selectionContinuation
-      selectionContinuation = nil
-      continuation?.resume(
-        returning: .approved(
-          AccessPolicyApproval(
-            classifications: selection.classifications,
-            acceptedCompatibilityCredentialKeys: selection.acceptedCompatibilityCredentialKeys,
-            authenticationSession: self
-          )))
+      context.evaluatePolicy(
+        .deviceOwnerAuthenticationWithBiometrics,
+        localizedReason: Self.initialAuthenticationReason(review)
+      ) { [weak self] success, error in
+        DispatchQueue.main.async {
+          self?.authenticationFinished(success: success, error: error)
+        }
+      }
     }
 
     @objc private func denyPressed(_ sender: Any?) {
@@ -376,7 +354,7 @@
     private func authenticationFinished(success: Bool, error: (any Error)?) {
       guard state == .authenticating else { return }
       if success {
-        finishApproved()
+        authenticationApproved()
       } else {
         if let error {
           FileHandle.standardError.write(
@@ -388,13 +366,29 @@
       }
     }
 
-    private func finishApproved() {
+    private func authenticationApproved() {
       guard state == .authenticating else { return }
-      state = .finished
-      let continuation = authenticationContinuation
-      authenticationContinuation = nil
-      closeWindow()
-      continuation?.resume(returning: .approved(unlock: CacheUnlock(context)))
+      guard let selection = selectedPolicy() else {
+        finishDenied(closeWindow: true)
+        return
+      }
+
+      state = .awaitingPolicy
+      for control in policyControls {
+        control.isEnabled = false
+      }
+      statusLabel.textColor = .secondaryLabelColor
+      statusLabel.stringValue = "Touch ID accepted. Checking the exact selection…"
+
+      let continuation = selectionContinuation
+      selectionContinuation = nil
+      continuation?.resume(
+        returning: .approved(
+          AccessPolicyApproval(
+            classifications: selection.classifications,
+            acceptedCompatibilityCredentialKeys: selection.acceptedCompatibilityCredentialKeys,
+            authenticationSession: self
+          )))
     }
 
     private func finishDenied(closeWindow shouldClose: Bool) {
@@ -402,12 +396,9 @@
       state = .finished
       context.invalidate()
       let selection = selectionContinuation
-      let authentication = authenticationContinuation
       selectionContinuation = nil
-      authenticationContinuation = nil
       if shouldClose { closeWindow() }
       selection?.resume(returning: .denied)
-      authentication?.resume(returning: .denied)
     }
 
     private func closeWindow() {
@@ -433,6 +424,21 @@
 
         Classification describes the credential itself. Compatibility delivery is accepted separately. No secret values are shown in this window.
         """
+    }
+
+    private static func initialAuthenticationReason(_ review: AccessPolicyReview) -> String {
+      let plan = review.plan
+      let policySummary =
+        "use the risk selection visible in Convenient Security; delivery "
+        + "\(plan.mechanism.rawValue); scope \(plan.descendantScope.rawValue); "
+        + "destination \(plan.destination.rawValue)"
+      return BiometricConsent.prompt(
+        caller: review.caller,
+        references: review.credentials.flatMap(\.references),
+        reason: review.reason,
+        ttl: TimeInterval(plan.requestedTTLSeconds),
+        policySummary: policySummary
+      )
     }
 
     private static func rootDescription(_ root: DeliveryRoot) -> String {

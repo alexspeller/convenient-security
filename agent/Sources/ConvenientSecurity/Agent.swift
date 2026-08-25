@@ -880,9 +880,10 @@ public actor Agent {
             + "destination \(plan.destination.rawValue)\(weak)"
     }
 
-    /// Production policy review keeps its trusted window and LAContext alive
-    /// while this actor validates the selected policy. Test/headless reviewers
-    /// have no embedded session and continue through the injected consent seam.
+    /// Production policy review freezes its visible choices at biometric
+    /// success and keeps the trusted window and evaluated LAContext alive while
+    /// this actor validates that snapshot. Test/headless reviewers have no
+    /// embedded session and continue through the injected consent seam.
     private func authenticateReviewedAccess(
         approval: AccessPolicyApproval,
         caller: CallerInfo,
@@ -892,17 +893,9 @@ public actor Agent {
         policySummary: String
     ) async -> ConsentOutcome {
         if let session = approval.authenticationSession {
-            let localizedReason = BiometricConsent.prompt(
-                caller: caller,
-                references: newReferences,
-                reason: reason,
-                ttl: ttl,
-                policySummary: policySummary
-            )
             let displaySummary = policySummary
                 + "; duration \(BiometricConsent.formatDuration(ttl))"
-            return await session.authenticate(
-                localizedReason: localizedReason,
+            return await session.completeAfterPolicyApproval(
                 policySummary: displaySummary
             )
         }

@@ -83,10 +83,15 @@ actor DenyPolicyReview: PolicyReviewProvider {
 }
 
 actor EmbeddedAuthenticationCounter: AccessPolicyAuthenticationSession {
+    private var preauthenticationCount = 0
     private var authenticationCount = 0
     private var cancellationCount = 0
 
-    func authenticate(localizedReason: String, policySummary: String) async -> ConsentOutcome {
+    func recordPreauthentication() {
+        preauthenticationCount += 1
+    }
+
+    func completeAfterPolicyApproval(policySummary: String) async -> ConsentOutcome {
         authenticationCount += 1
         return .approved(unlock: CacheUnlock(LAContext()))
     }
@@ -95,6 +100,7 @@ actor EmbeddedAuthenticationCounter: AccessPolicyAuthenticationSession {
         cancellationCount += 1
     }
 
+    func preauthentications() -> Int { preauthenticationCount }
     func authentications() -> Int { authenticationCount }
     func cancellations() -> Int { cancellationCount }
 }
@@ -104,6 +110,9 @@ struct EmbeddedAuthenticationPolicyReview: PolicyReviewProvider {
     let session: EmbeddedAuthenticationCounter
 
     func reviewAccess(_ review: AccessPolicyReview) async -> AccessPolicyReviewOutcome {
+        // Model the production UI: its biometric succeeds and freezes the
+        // visible selection before the agent receives the value-free snapshot.
+        await session.recordPreauthentication()
         let classifications = Dictionary(uniqueKeysWithValues: review.credentials.compactMap {
             $0.storedLevel == .unknown ? ($0.identity.credentialKey, level) : nil
         })
@@ -465,7 +474,7 @@ do {
           && unknownResolutionCalls == 0
           && unknownConsentCalls == 0
           && unknownReviewCalls == 1,
-          "unknown risk requires trusted review before biometric or provider resolution")
+          "unknown risk requires trusted review before fallback consent or provider resolution")
 
     let highReference = try SecretRef("op://production/admin/token")
     let descriptor = CredentialGrouping.groups(for: [highReference])[0]
@@ -513,9 +522,10 @@ do {
     check(false, "direct pre-resolution policy checks succeed (\(error))")
 }
 
-// A trusted access reviewer can keep one UI session open across the value-free
-// policy decision and biometric gate. The agent must validate the selection
-// before invoking that session, and must not also invoke ConsentProvider.
+// A trusted access reviewer can preauthenticate, freeze its visible choices,
+// and keep one UI session open while the agent validates that value-free
+// snapshot. Only an allowed policy may consume the context; a rejected policy
+// must cancel it without invoking ConsentProvider or resolving a value.
 do {
     let caller = CallerInfo(
         pid: getpid(),
@@ -560,16 +570,18 @@ do {
         deliveryPlan: plan
     )
     let allowedResponse = await allowedAgent.handle(request: allowedRequest, caller: caller)
+    let embeddedPreauthenticationCalls = await embeddedAuthentication.preauthentications()
     let embeddedAuthenticationCalls = await embeddedAuthentication.authentications()
     let embeddedCancellationCalls = await embeddedAuthentication.cancellations()
     let separateConsentCalls = await separateConsent.calls()
     let allowedResolutionCalls = await allowedResolution.calls()
     check(allowedResponse.values?[allowedReference] == "embedded-review-synthetic-token"
+          && embeddedPreauthenticationCalls == 1
           && embeddedAuthenticationCalls == 1
           && embeddedCancellationCalls == 0
           && separateConsentCalls == 0
           && allowedResolutionCalls == 1,
-          "an allowed reviewed policy authenticates once and carries its unlock to resolution")
+          "an allowed preauthenticated review carries its policy-bound unlock to resolution")
 
     let deniedReference = "op://embedded-review/denied/token"
     let deniedResolution = ResolutionCounter()
@@ -598,16 +610,18 @@ do {
         deliveryPlan: plan
     )
     let deniedResponse = await deniedAgent.handle(request: deniedRequest, caller: caller)
+    let deniedPreauthenticationCalls = await deniedAuthentication.preauthentications()
     let deniedAuthenticationCalls = await deniedAuthentication.authentications()
     let deniedCancellationCalls = await deniedAuthentication.cancellations()
     let deniedConsentCalls = await deniedConsent.calls()
     let deniedResolutionCalls = await deniedResolution.calls()
     check(deniedResponse.failure?.code == .policyDenied
+          && deniedPreauthenticationCalls == 1
           && deniedAuthenticationCalls == 0
           && deniedCancellationCalls == 1
           && deniedConsentCalls == 0
           && deniedResolutionCalls == 0,
-          "a rejected policy closes its embedded session before biometric or resolution")
+          "a rejected preauthenticated selection invalidates its session before resolution")
 } catch {
     check(false, "embedded policy authentication checks succeed (\(error))")
 }
