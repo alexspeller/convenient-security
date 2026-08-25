@@ -1,0 +1,67 @@
+#!/bin/bash
+set -eu
+
+if [ "$#" -ne 3 ]; then
+  echo "usage: reload-launch-daemon LAUNCHCTL LABEL PLIST" >&2
+  exit 64
+fi
+
+launchctl_bin="$1"
+label="$2"
+plist="$3"
+
+[ -x "$launchctl_bin" ] || {
+  echo "reload-launch-daemon: launchctl is not executable: $launchctl_bin" >&2
+  exit 1
+}
+case "$label" in
+  "" | *[!A-Za-z0-9._-]*)
+    echo "reload-launch-daemon: invalid service label" >&2
+    exit 1
+    ;;
+esac
+case "$plist" in
+  /*) ;;
+  *)
+    echo "reload-launch-daemon: plist path must be absolute" >&2
+    exit 1
+    ;;
+esac
+
+service="system/$label"
+maximum_attempts=100
+retry_delay=0.05
+
+# bootout is asynchronous with respect to final job removal. In particular, a
+# KeepAlive service can still be in launchd's removal transaction after bootout
+# returns, and an immediate bootstrap then fails with EINPROGRESS (reported by
+# launchctl as error 5). Wait until the old job is no longer addressable.
+"$launchctl_bin" bootout "$service" >/dev/null 2>&1 || true
+attempt=0
+while "$launchctl_bin" print "$service" >/dev/null 2>&1; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge "$maximum_attempts" ]; then
+    echo "reload-launch-daemon: timed out waiting for $service to stop" >&2
+    exit 1
+  fi
+  /bin/sleep "$retry_delay"
+done
+
+# launchd can briefly reject bootstrap even after the job disappears from
+# `print`. Retry within a tight bound, treating a concurrently loaded job as a
+# successful transition rather than issuing a second bootstrap.
+attempt=0
+while ! "$launchctl_bin" bootstrap system "$plist"; do
+  if "$launchctl_bin" print "$service" >/dev/null 2>&1; then
+    break
+  fi
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge "$maximum_attempts" ]; then
+    echo "reload-launch-daemon: timed out loading $service" >&2
+    exit 1
+  fi
+  /bin/sleep "$retry_delay"
+done
+
+"$launchctl_bin" kickstart "$service"
+"$launchctl_bin" print "$service" >/dev/null

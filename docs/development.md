@@ -105,7 +105,8 @@ Before treating an artifact as protected, verify on the signed installed app:
 3. a non-product client is rejected before the agent decodes a request;
 4. former environment controls cannot change consent, endpoint, or provider;
 5. hardened runtime and required entitlements are present, and SIP is enabled;
-6. real Touch ID gates a new reference; and
+6. a new reference uses one trusted policy window with embedded real Touch ID,
+   without a second csec authentication sheet; and
 7. one touch permits a cold cache read, followed by a warm read with no second
    biometric prompt;
 8. the native-store spike proves a signed-but-unentitled same-UID helper cannot
@@ -125,9 +126,14 @@ Before treating an artifact as protected, verify on the signed installed app:
    `/Library/Application Support/ConvenientSecurity/bin/csec` with every path
    component root-owned and non-user-writable, and Ruby reaches the installed
    agent through it; and
-12. provisioning/notarization consume the real App Store Connect key through
-   `/dev/fd/3`, leave no key file or private-key environment entry, and fail on
-   a deliberately invalid signature/ticket check; and
+12. provisioning consumes the real App Store Connect key through `/dev/fd/3`;
+   notarization uses only a short-lived `0600` key file beneath an atomically
+   created `0700` directory because `notarytool --key` requires a filesystem
+   path; both leave no private-key environment entry, notarization removes its
+   exact temporary path after success, ordinary failure, and handled signals,
+   and the pipeline fails on a deliberately invalid signature/ticket check
+   (without claiming cleanup after `SIGKILL`, process crash, or machine loss);
+   and
 13. interactive `csec exec` preserves input, terminal resize, Ctrl-C/Ctrl-Z,
     colors, and the target's exit status while replacing a synthetic output
     marker on both stdout and stderr; and

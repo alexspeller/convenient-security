@@ -86,7 +86,7 @@ mode, mount, or lifecycle assertion to make a row pass.
 | Generic consumers | Supported regular-file consumers exercise metadata, independent reopen, seek, `mmap`, fork/exec, and close/reopen patterns without plaintext in argv/environment/output | **PENDING** |
 | GitHub CLI | Supported `gh` versions use only protected `hosts.yml`; ambient token/config/keyring authority is rejected pre-resolution; `auth`/`extension` paths are refused; no token enters logs/caches | **PENDING** |
 | Ecosystem compatibility | Installed supported versions that cannot use `/dev/fd` (candidate libpq, kubectl, AWS, Google, or other tools) pass their real access patterns, or are documented unsupported | **PENDING** |
-| Upgrade/failure recovery | Package upgrade verifies the new payload before bootout, replaces/restarts cleanly, preserves no stale file session, and a failed verification leaves no untrusted service running | **PENDING** |
+| Upgrade/failure recovery | Package upgrade verifies the new payload before bootout, replaces/restarts cleanly, preserves no stale file session, and a failed verification leaves no untrusted service running | **PENDING** — deterministic CI covers asynchronous bootout plus transient bootstrap rejection; signed physical upgrade and failure-injection evidence remain required |
 
 ## Acceptance record
 

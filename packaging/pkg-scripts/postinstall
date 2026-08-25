@@ -59,22 +59,20 @@ done
 /usr/bin/plutil -lint "$root_plist" >/dev/null
 
 product_requirement='anchor apple generic and certificate leaf[subject.OU] = "8RS6GD89Y7"'
-/usr/bin/codesign --verify --strict -R \
-  "$product_requirement and identifier \"com.alexspeller.convenient-security.csec\"" \
+/usr/bin/codesign --verify --strict \
+  -R="$product_requirement and identifier \"com.alexspeller.convenient-security.csec\"" \
   "$bridge_root/bin/csec"
-/usr/bin/codesign --verify --deep --strict -R \
-  "$product_requirement and identifier \"com.alexspeller.convenient-security\"" \
+/usr/bin/codesign --verify --deep --strict \
+  -R="$product_requirement and identifier \"com.alexspeller.convenient-security\"" \
   "$app"
-/usr/bin/codesign --verify --strict -R \
-  "$product_requirement and identifier \"$root_label\"" \
+/usr/bin/codesign --verify --strict \
+  -R="$product_requirement and identifier \"$root_label\"" \
   "$root_helper"
 
-# Upgrade atomically from the service manager's perspective: stop any prior
-# instance only after all new paths and signatures pass, then bootstrap the
-# fixed root-owned plist. RunAtLoad and KeepAlive keep the narrow service live.
-/bin/launchctl bootout "system/$root_label" >/dev/null 2>&1 || true
-/bin/launchctl bootstrap system "$root_plist"
-/bin/launchctl kickstart -k "system/$root_label"
-/bin/launchctl print "system/$root_label" >/dev/null
+# Upgrade from the service manager's perspective only after every new path and
+# signature passes. bootout completes asynchronously, so the bounded helper
+# waits out launchd's removal transaction before loading the fixed plist.
+script_directory="$(cd "$(dirname "$0")" && pwd)"
+"$script_directory/reload-launch-daemon" /bin/launchctl "$root_label" "$root_plist"
 
 exit 0

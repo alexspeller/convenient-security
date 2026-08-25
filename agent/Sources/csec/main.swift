@@ -605,6 +605,11 @@ func runGet(_ arguments: [String]) -> Never {
                 operationContext: "raw pipe to an unverified recipient: \(reason)"
             )
         }
+        if isatty(STDERR_FILENO) == 1 {
+            FileHandle.standardError.write(Data(
+                "csec: waiting for the Convenient Security review window and Touch ID…\n".utf8
+            ))
+        }
         let values = try client.access(
             references: references,
             reason: reason,

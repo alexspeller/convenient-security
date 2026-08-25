@@ -55,14 +55,31 @@ public struct AccessPolicyApproval: Sendable {
     public let classifications: [String: RiskLevel]
     /// Separate affirmative acceptance of a weak compatibility mechanism.
     public let acceptedCompatibilityCredentialKeys: Set<String>
+    /// A trusted review can keep its window open and perform Touch ID inside it
+    /// after the agent has validated the selected policy. Injected/headless
+    /// reviewers leave this nil and use the ordinary ConsentProvider instead.
+    public let authenticationSession: (any AccessPolicyAuthenticationSession)?
 
     public init(
         classifications: [String: RiskLevel],
-        acceptedCompatibilityCredentialKeys: Set<String>
+        acceptedCompatibilityCredentialKeys: Set<String>,
+        authenticationSession: (any AccessPolicyAuthenticationSession)? = nil
     ) {
         self.classifications = classifications
         self.acceptedCompatibilityCredentialKeys = acceptedCompatibilityCredentialKeys
+        self.authenticationSession = authenticationSession
     }
+}
+
+/// The second half of a trusted access review. The review window first returns
+/// the user's value-free policy selections; only after the agent independently
+/// accepts those selections does it ask this session to authenticate in-place.
+///
+/// This is a dependency-injection seam, like PolicyReviewProvider and
+/// ConsentProvider. The shipping daemon constructs only TrustedPolicyReview.
+public protocol AccessPolicyAuthenticationSession: Sendable {
+    func authenticate(localizedReason: String, policySummary: String) async -> ConsentOutcome
+    func cancel() async
 }
 
 public enum AccessPolicyReviewOutcome: Sendable {
@@ -144,13 +161,14 @@ public struct AutoApprovePolicyReview: PolicyReviewProvider {
 
 /// AppKit review rendered by the authenticated resident agent. The selection
 /// crosses no untrusted IPC boundary: csecd owns both the controls and policy
-/// decision, and Touch ID still gates persistence and release afterwards.
+/// decision, then embeds Touch ID in that same trusted window before any choice
+/// is persisted or any value is released.
 public struct TrustedPolicyReview: PolicyReviewProvider {
     public init() {}
 
     public func reviewAccess(_ review: AccessPolicyReview) async -> AccessPolicyReviewOutcome {
-        #if canImport(AppKit)
-        return await MainActor.run { Self.present(review) }
+        #if canImport(AppKit) && canImport(LocalAuthenticationEmbeddedUI)
+        return await TrustedAccessReviewSession.present(review)
         #else
         return .denied
         #endif
@@ -165,135 +183,6 @@ public struct TrustedPolicyReview: PolicyReviewProvider {
     }
 
     #if canImport(AppKit)
-    @MainActor
-    private static func present(_ review: AccessPolicyReview) -> AccessPolicyReviewOutcome {
-        let application = NSApplication.shared
-        application.setActivationPolicy(.accessory)
-
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "Review secret access"
-        alert.informativeText = summary(review)
-        alert.addButton(withTitle: "Continue to Touch ID")
-        alert.addButton(withTitle: "Deny")
-        alert.window.title = "Convenient Security"
-        alert.window.isRestorable = false
-
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
-
-        var selectors: [String: NSPopUpButton] = [:]
-        var acceptanceButtons: [String: NSButton] = [:]
-        for credential in review.credentials {
-            let references = credential.references.map { "• \($0.safeInlineURI)" }
-                .joined(separator: "\n")
-            let label = NSTextField(wrappingLabelWithString: references)
-            label.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-            label.maximumNumberOfLines = 8
-            label.preferredMaxLayoutWidth = 650
-            stack.addArrangedSubview(label)
-
-            if credential.storedLevel == .unknown {
-                let row = NSStackView()
-                row.orientation = .horizontal
-                row.spacing = 8
-                row.addArrangedSubview(NSTextField(labelWithString: "Risk level:"))
-                let selector = NSPopUpButton()
-                selector.addItems(withTitles: ["Low", "Standard", "High", "Critical"])
-                selector.selectItem(withTitle: "Standard")
-                row.addArrangedSubview(selector)
-                stack.addArrangedSubview(row)
-                selectors[credential.identity.credentialKey] = selector
-            } else {
-                let status = NSTextField(labelWithString: "Risk: \(credential.storedLevel.rawValue)")
-                status.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-                stack.addArrangedSubview(status)
-            }
-
-            if credential.scopeExpanded {
-                let scope = NSTextField(wrappingLabelWithString:
-                    "This request adds fields to the stored credential scope."
-                )
-                scope.textColor = .systemOrange
-                stack.addArrangedSubview(scope)
-            }
-
-            if credential.compatibilityReviewOffered {
-                let checkbox = NSButton(checkboxWithTitle:
-                    "Accept \(review.plan.mechanism.rawValue) compatibility delivery for 30 days",
-                    target: nil,
-                    action: nil
-                )
-                checkbox.state = credential.compatibilityAccepted ? .on : .off
-                checkbox.isEnabled = !credential.compatibilityAccepted
-                stack.addArrangedSubview(checkbox)
-                acceptanceButtons[credential.identity.credentialKey] = checkbox
-            }
-
-            stack.addArrangedSubview(NSBox())
-        }
-
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 680, height: 360))
-        scroll.hasVerticalScroller = true
-        scroll.autohidesScrollers = true
-        scroll.borderType = .bezelBorder
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        scroll.documentView = stack
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
-            stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-        ])
-        alert.accessoryView = scroll
-        application.activate(ignoringOtherApps: true)
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return .denied }
-
-        var classifications: [String: RiskLevel] = [:]
-        for (credentialKey, selector) in selectors {
-            let raw = selector.titleOfSelectedItem?.lowercased() ?? ""
-            guard let level = RiskLevel(rawValue: raw), level != .unknown else {
-                return .denied
-            }
-            classifications[credentialKey] = level
-        }
-        let accepted = Set(acceptanceButtons.compactMap { key, button in
-            button.state == .on ? key : nil
-        })
-        return .approved(AccessPolicyApproval(
-            classifications: classifications,
-            acceptedCompatibilityCredentialKeys: accepted
-        ))
-    }
-
-    @MainActor
-    private static func summary(_ review: AccessPolicyReview) -> String {
-        let executable = URL(fileURLWithPath: review.plan.executable.canonicalPath).lastPathComponent
-        return """
-        Requester: \(safe(review.caller.description))
-        Consumer: \(safe(executable)) (\(review.plan.executable.assurance.rawValue))
-        Delivery: \(review.plan.mechanism.rawValue), \(review.plan.descendantScope.rawValue)
-        Grant root: \(rootDescription(review.plan.root))
-        Destination: \(review.plan.destination.rawValue)
-        Requested duration: \(BiometricConsent.formatDuration(TimeInterval(review.plan.requestedTTLSeconds)))
-        Purpose: \(safe(review.reason))
-
-        Classification describes the credential itself. Compatibility delivery is accepted separately. No secret values are shown in this window.
-        """
-    }
-
-    private static func rootDescription(_ root: DeliveryRoot) -> String {
-        switch root {
-        case .caller: return "requesting launcher"
-        case .directParent: return "verified direct parent"
-        case .registeredSession: return "registered kernel-verified session"
-        }
-    }
-
     @MainActor
     private static func presentRiskChange(_ review: RiskChangeReview) -> Bool {
         let application = NSApplication.shared

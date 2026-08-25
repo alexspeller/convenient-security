@@ -23,15 +23,24 @@ actor ResolutionCounter {
 struct StaticProvider: SecretProvider {
     let values: [String: String]
     let counter: ResolutionCounter?
+    let requiresUnlock: Bool
 
-    init(values: [String: String], counter: ResolutionCounter? = nil) {
+    init(
+        values: [String: String],
+        counter: ResolutionCounter? = nil,
+        requiresUnlock: Bool = false
+    ) {
         self.values = values
         self.counter = counter
+        self.requiresUnlock = requiresUnlock
     }
 
     var schemes: Set<String> { ["op"] }
     func resolve(_ ref: SecretRef, unlock: CacheUnlock?) async throws -> ResolvedSecret {
         await counter?.record()
+        guard !requiresUnlock || unlock != nil else {
+            throw ProviderError.notAuthenticated
+        }
         guard let value = values[ref.uri] else { throw ProviderError.referenceNotFound(ref.uri) }
         return ResolvedSecret(value: value, cacheHint: .noCache)
     }
@@ -71,6 +80,41 @@ actor DenyPolicyReview: PolicyReviewProvider {
     }
     func reviewRiskChange(_ review: RiskChangeReview) async -> Bool { false }
     func calls() -> Int { count }
+}
+
+actor EmbeddedAuthenticationCounter: AccessPolicyAuthenticationSession {
+    private var authenticationCount = 0
+    private var cancellationCount = 0
+
+    func authenticate(localizedReason: String, policySummary: String) async -> ConsentOutcome {
+        authenticationCount += 1
+        return .approved(unlock: CacheUnlock(LAContext()))
+    }
+
+    func cancel() async {
+        cancellationCount += 1
+    }
+
+    func authentications() -> Int { authenticationCount }
+    func cancellations() -> Int { cancellationCount }
+}
+
+struct EmbeddedAuthenticationPolicyReview: PolicyReviewProvider {
+    let level: RiskLevel
+    let session: EmbeddedAuthenticationCounter
+
+    func reviewAccess(_ review: AccessPolicyReview) async -> AccessPolicyReviewOutcome {
+        let classifications = Dictionary(uniqueKeysWithValues: review.credentials.compactMap {
+            $0.storedLevel == .unknown ? ($0.identity.credentialKey, level) : nil
+        })
+        return .approved(AccessPolicyApproval(
+            classifications: classifications,
+            acceptedCompatibilityCredentialKeys: [],
+            authenticationSession: session
+        ))
+    }
+
+    func reviewRiskChange(_ review: RiskChangeReview) async -> Bool { false }
 }
 
 actor RequestCapture {
@@ -467,6 +511,105 @@ do {
           "a hand-written high-risk environment request is denied before review, biometric, cache, or provider")
 } catch {
     check(false, "direct pre-resolution policy checks succeed (\(error))")
+}
+
+// A trusted access reviewer can keep one UI session open across the value-free
+// policy decision and biometric gate. The agent must validate the selection
+// before invoking that session, and must not also invoke ConsentProvider.
+do {
+    let caller = CallerInfo(
+        pid: getpid(),
+        startTime: ProcessAncestry.startTime(of: getpid()) ?? 0,
+        description: "embedded authentication test"
+    )
+    let plan = DeliveryPlan(
+        mechanism: .directHeap,
+        executable: PlannedExecutable(canonicalPath: "/bin/sh", assurance: .unverified),
+        root: .caller,
+        descendantScope: .subtree,
+        destination: .localDevelopment,
+        requestedTTLSeconds: 3600,
+        operationContext: "embedded authentication test"
+    )
+
+    let allowedReference = "op://embedded-review/allowed/token"
+    let allowedResolution = ResolutionCounter()
+    let allowedResolver = SecretResolver(cache: NullSecretCache())
+    await allowedResolver.register(StaticProvider(
+        values: [allowedReference: "embedded-review-synthetic-token"],
+        counter: allowedResolution,
+        requiresUnlock: true
+    ))
+    let embeddedAuthentication = EmbeddedAuthenticationCounter()
+    let separateConsent = ConsentCounter()
+    let allowedAgent = Agent(
+        resolver: allowedResolver,
+        grants: GrantTable(),
+        consent: separateConsent,
+        riskJudgments: RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend()),
+        policyReview: EmbeddedAuthenticationPolicyReview(
+            level: .low,
+            session: embeddedAuthentication
+        ),
+        allowUnverifiedPlansForTesting: true
+    )
+    let allowedRequest = try AccessRequest(
+        references: [allowedReference],
+        reason: "use the combined policy and biometric window",
+        ttlSeconds: 3600,
+        deliveryPlan: plan
+    )
+    let allowedResponse = await allowedAgent.handle(request: allowedRequest, caller: caller)
+    let embeddedAuthenticationCalls = await embeddedAuthentication.authentications()
+    let embeddedCancellationCalls = await embeddedAuthentication.cancellations()
+    let separateConsentCalls = await separateConsent.calls()
+    let allowedResolutionCalls = await allowedResolution.calls()
+    check(allowedResponse.values?[allowedReference] == "embedded-review-synthetic-token"
+          && embeddedAuthenticationCalls == 1
+          && embeddedCancellationCalls == 0
+          && separateConsentCalls == 0
+          && allowedResolutionCalls == 1,
+          "an allowed reviewed policy authenticates once and carries its unlock to resolution")
+
+    let deniedReference = "op://embedded-review/denied/token"
+    let deniedResolution = ResolutionCounter()
+    let deniedResolver = SecretResolver(cache: NullSecretCache())
+    await deniedResolver.register(StaticProvider(
+        values: [deniedReference: "must-not-resolve"],
+        counter: deniedResolution
+    ))
+    let deniedAuthentication = EmbeddedAuthenticationCounter()
+    let deniedConsent = ConsentCounter()
+    let deniedAgent = Agent(
+        resolver: deniedResolver,
+        grants: GrantTable(),
+        consent: deniedConsent,
+        riskJudgments: RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend()),
+        policyReview: EmbeddedAuthenticationPolicyReview(
+            level: .high,
+            session: deniedAuthentication
+        ),
+        allowUnverifiedPlansForTesting: true
+    )
+    let deniedRequest = try AccessRequest(
+        references: [deniedReference],
+        reason: "deny before embedded authentication",
+        ttlSeconds: 3600,
+        deliveryPlan: plan
+    )
+    let deniedResponse = await deniedAgent.handle(request: deniedRequest, caller: caller)
+    let deniedAuthenticationCalls = await deniedAuthentication.authentications()
+    let deniedCancellationCalls = await deniedAuthentication.cancellations()
+    let deniedConsentCalls = await deniedConsent.calls()
+    let deniedResolutionCalls = await deniedResolution.calls()
+    check(deniedResponse.failure?.code == .policyDenied
+          && deniedAuthenticationCalls == 0
+          && deniedCancellationCalls == 1
+          && deniedConsentCalls == 0
+          && deniedResolutionCalls == 0,
+          "a rejected policy closes its embedded session before biometric or resolution")
+} catch {
+    check(false, "embedded policy authentication checks succeed (\(error))")
 }
 
 do {

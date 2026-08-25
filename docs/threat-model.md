@@ -68,8 +68,9 @@ reference into a logical credential, loads only opaque value-free judgment
 metadata, and evaluates the complete delivery plan. Unknown credentials require
 classification in a daemon-owned window. Weak compatibility acceptance is a
 separate decision. The selected risk, delivery, scope, destination, consumer
-assurance, and policy-capped duration are summarized again in the OS Touch ID
-prompt before any new choice is persisted.
+assurance, and policy-capped duration are summarized in that same window. The
+agent validates the selections before starting its embedded system Touch ID view
+and before any new choice is persisted.
 
 Every grant is bound to the delivery-plan digest and the exact effective-risk,
 policy-version, policy-decision, and output-policy snapshot. A raised or

@@ -1,10 +1,11 @@
 import Foundation
 import LocalAuthentication
 
-/// Consent gated by Touch ID. Each newly-requested set of references triggers a
-/// fresh biometric prompt listing exactly what is being granted, to whom, and
-/// for how long. A fresh `LAContext` per request guarantees a real prompt every
-/// time — biometric state is never reused to silently approve.
+/// Standalone consent gated by Touch ID. Production access review normally uses
+/// the same prompt text with an LAContext paired to its embedded authentication
+/// view; injected/headless review and policy mutations use this provider. Every
+/// evaluation creates a fresh context, so biometric state is never silently
+/// reused to approve another request.
 ///
 /// Fails closed: if biometrics are unavailable or locked out, or the user
 /// cancels, consent is denied. This is the real per-secret human gate that
@@ -67,8 +68,8 @@ public struct BiometricConsent: ConsentProvider {
         return approved ? .approved(unlock: CacheUnlock(context)) : .denied
     }
 
-    /// The text shown in the Touch ID sheet: exactly what is being granted, to
-    /// whom, and for how long.
+    /// Bounded authentication reason: exactly what is being granted, to whom,
+    /// and for how long. It backs both standard and embedded LAContext UI.
     public static func prompt(
         caller: CallerInfo,
         references: [SecretRef],

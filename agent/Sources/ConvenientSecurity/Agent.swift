@@ -364,6 +364,7 @@ public actor Agent {
                     guard let selected = approval.classifications[
                         states[index].identity.credentialKey
                     ], selected != .unknown else {
+                        await approval.authenticationSession?.cancel()
                         return .failed(
                             .policyDenied,
                             message: "an explicit risk classification is required",
@@ -410,11 +411,13 @@ public actor Agent {
             }
 
             if let denied = states.first(where: { !$0.decision.allowed }) {
+                await approval.authenticationSession?.cancel()
                 return policyDenied(denied.decision, plan: plan, requestID: request.requestID)
             }
 
             let grantedTTL = states.map(\.decision.grantedTTLSeconds).min() ?? 0
             guard grantedTTL > 0 else {
+                await approval.authenticationSession?.cancel()
                 return .failed(
                     .policyDenied,
                     message: "risk policy did not grant a positive duration",
@@ -422,12 +425,14 @@ public actor Agent {
                 )
             }
             let newReferences = refs.filter { newReferenceURIs.contains($0.uri) }
-            let outcome = await consent.requestConsent(
+            let policySummary = biometricPolicySummary(states, plan: plan)
+            let outcome = await authenticateReviewedAccess(
+                approval: approval,
                 caller: displayedCaller(caller, plan: plan, rootPID: rootPID),
                 newReferences: newReferences,
                 reason: request.reason,
                 ttl: TimeInterval(grantedTTL),
-                policySummary: biometricPolicySummary(states, plan: plan)
+                policySummary: policySummary
             )
             guard case let .approved(approvedUnlock) = outcome else {
                 return .failed(
@@ -875,6 +880,41 @@ public actor Agent {
             + "destination \(plan.destination.rawValue)\(weak)"
     }
 
+    /// Production policy review keeps its trusted window and LAContext alive
+    /// while this actor validates the selected policy. Test/headless reviewers
+    /// have no embedded session and continue through the injected consent seam.
+    private func authenticateReviewedAccess(
+        approval: AccessPolicyApproval,
+        caller: CallerInfo,
+        newReferences: [SecretRef],
+        reason: String,
+        ttl: TimeInterval,
+        policySummary: String
+    ) async -> ConsentOutcome {
+        if let session = approval.authenticationSession {
+            let localizedReason = BiometricConsent.prompt(
+                caller: caller,
+                references: newReferences,
+                reason: reason,
+                ttl: ttl,
+                policySummary: policySummary
+            )
+            let displaySummary = policySummary
+                + "; duration \(BiometricConsent.formatDuration(ttl))"
+            return await session.authenticate(
+                localizedReason: localizedReason,
+                policySummary: displaySummary
+            )
+        }
+        return await consent.requestConsent(
+            caller: caller,
+            newReferences: newReferences,
+            reason: reason,
+            ttl: ttl,
+            policySummary: policySummary
+        )
+    }
+
     public func beginOutputRedaction(
         request: BeginOutputRedactionRequest,
         caller: CallerInfo
@@ -1125,6 +1165,7 @@ public actor Agent {
             if storedLevel == .unknown {
                 guard let selected = approval.classifications[context.identity.credentialKey],
                       selected != .unknown else {
+                    await approval.authenticationSession?.cancel()
                     return .failed(
                         .policyDenied,
                         message: "an explicit native-store risk classification is required",
@@ -1168,6 +1209,7 @@ public actor Agent {
                 ))
             }
             guard decision.allowed, decision.grantedTTLSeconds > 0 else {
+                await approval.authenticationSession?.cancel()
                 return policyDenied(decision, plan: plan, requestID: request.requestID)
             }
 
@@ -1175,7 +1217,8 @@ public actor Agent {
                 + "delivery \(plan.mechanism.rawValue); scope exact_process; "
                 + "destination local_development"
                 + (plan.mechanism.isWeakCompatibility ? "; weak compatibility accepted" : "")
-            let outcome = await consent.requestConsent(
+            let outcome = await authenticateReviewedAccess(
+                approval: approval,
                 caller: caller,
                 newReferences: [consentReference],
                 reason: plan.operationContext,

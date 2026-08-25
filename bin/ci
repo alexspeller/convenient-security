@@ -8,12 +8,81 @@ export CLANG_MODULE_CACHE_PATH="$swift_scratch/clang"
 export SWIFTPM_MODULECACHE_OVERRIDE="$swift_scratch/swiftpm"
 
 bash -n \
+  "$repo_root/packaging/bin/build-and-install.sh" \
   "$repo_root/packaging/bin/build-agent.sh" \
   "$repo_root/packaging/bin/build-pkg.sh" \
   "$repo_root/packaging/bin/build-spike.sh" \
   "$repo_root/packaging/bin/notarize.sh" \
   "$repo_root/packaging/bin/provision.sh" \
-  "$repo_root/packaging/pkg-scripts/postinstall"
+  "$repo_root/packaging/pkg-scripts/postinstall" \
+  "$repo_root/packaging/pkg-scripts/reload-launch-daemon" \
+  "$repo_root/packaging/tests/fake-launchctl.sh"
+
+install_plan="$("$repo_root/packaging/bin/build-and-install.sh" --dry-run --refresh-profile)"
+for expected_step in \
+  "packaging/bin/provision.sh" \
+  "packaging/bin/build-agent.sh" \
+  "packaging/bin/notarize.sh" \
+  "packaging/bin/build-pkg.sh" \
+  "/usr/bin/sudo /usr/sbin/installer" \
+  "/Applications/ConvenientSecurity.app/Contents/MacOS/csec install" \
+  "/Applications/ConvenientSecurity.app/Contents/MacOS/csec root-status"; do
+  if [[ "$install_plan" != *"$expected_step"* ]]; then
+    echo "build-and-install dry run omitted: $expected_step" >&2
+    exit 1
+  fi
+done
+if [[ "$install_plan" == *"sudo /Applications/ConvenientSecurity.app/Contents/MacOS/csec install"* ]]; then
+  echo "build-and-install must not register the per-user agent with sudo" >&2
+  exit 1
+fi
+postinstall_requirement_checks="$(
+  rg -F -c -- '-R="$product_requirement and identifier' \
+    "$repo_root/packaging/pkg-scripts/postinstall" || true
+)"
+if [ "$postinstall_requirement_checks" != "3" ]; then
+  echo "postinstall must pass each codesign test requirement as one -R=<requirement> argument" >&2
+  exit 1
+fi
+if ! rg -F -q 'reload-launch-daemon" /bin/launchctl' \
+  "$repo_root/packaging/pkg-scripts/postinstall"; then
+  echo "postinstall must use the bounded LaunchDaemon reload helper" >&2
+  exit 1
+fi
+
+# Reproduce the launchd upgrade race deterministically: bootout returns while
+# the old job is still visible, then the first bootstrap is rejected even after
+# print stops finding it. The reload must wait, retry, and kickstart once.
+(
+  launchd_test_root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/csec-launchd-test.XXXXXX")"
+  trap '/bin/rm -rf "$launchd_test_root"' EXIT
+  echo loaded >"$launchd_test_root/state"
+  export CSEC_FAKE_LAUNCHCTL_STATE="$launchd_test_root"
+  "$repo_root/packaging/pkg-scripts/reload-launch-daemon" \
+    "$repo_root/packaging/tests/fake-launchctl.sh" \
+    com.alexspeller.convenient-security.synthetic \
+    /tmp/com.alexspeller.convenient-security.synthetic.plist
+  [ "$(/bin/cat "$launchd_test_root/state")" = "loaded" ]
+  [ "$(/bin/cat "$launchd_test_root/bootstrap-attempts")" = "2" ]
+  [ "$(/bin/cat "$launchd_test_root/kickstarts")" = "1" ]
+)
+
+# Policy review hops from the socket handler to MainActor. A top-level await
+# makes Swift run this entry point as one async main-actor job; blocking that job
+# in NSApplication.run() then prevents every review window from appearing.
+csecd_entrypoint="$repo_root/agent/Sources/csecd/main.swift"
+if rg -q '^await\b' "$csecd_entrypoint"; then
+  echo "csecd main.swift must stay synchronous; move async startup into AgentRuntime.swift" >&2
+  exit 1
+fi
+csecd_event_loops="$(rg -c '^application\.run\(\)$' "$csecd_entrypoint" || true)"
+csecd_detached_starts="$(
+  rg -F -c 'Task.detached(priority: .userInitiated)' "$csecd_entrypoint" || true
+)"
+if [ "$csecd_event_loops" != "1" ] || [ "$csecd_detached_starts" != "1" ]; then
+  echo "csecd must start its async runtime separately from the synchronous AppKit loop" >&2
+  exit 1
+fi
 plutil -lint \
   "$repo_root/packaging/agent/Info.plist" \
   "$repo_root/packaging/agent/csecd.entitlements" \
@@ -47,13 +116,41 @@ cmp "$repo_root/LICENSE.md" "$repo_root/clients/ruby/LICENSE.md"
   '
 )
 
-# Prove the private-key handoff used by provision/notarize survives exec while
-# remaining outside argv/environment/disk. The marker is synthetic test data.
+# Prove the inherited private-key handoff used by provisioning survives exec
+# while remaining outside argv/environment/disk. The marker is synthetic test data.
 fd_marker="csec-synthetic-inherited-fd"
 exec 9< <(printf %s "$fd_marker")
 ruby -e 'abort "inherited fd handoff failed" unless File.binread(ARGV.fetch(0)) == ARGV.fetch(1)' \
   /dev/fd/9 "$fd_marker"
 exec 9<&-
+
+# notarytool requires a filesystem path for --key. Prove its narrowly scoped
+# staging helper uses private modes, preserves exact bytes, cleans on success,
+# and removes a partial file when the producer fails. No real key or network is
+# involved.
+(
+  source "$repo_root/packaging/bin/notarize.sh"
+  notary_test_root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/csec-notary-test.XXXXXX")"
+  trap '/bin/rm -rf "$notary_test_root"' EXIT
+  export TMPDIR="$notary_test_root"
+  notary_marker="csec-synthetic-notary-key"
+
+  stage_notary_key_from_command /usr/bin/printf %s "$notary_marker"
+  [ "$(/usr/bin/stat -f %Lp "$notary_key_directory")" = "700" ]
+  [ "$(/usr/bin/stat -f %Lp "$notary_key_file")" = "600" ]
+  [ "$(/bin/cat "$notary_key_file")" = "$notary_marker" ]
+  staged_key_directory="$notary_key_directory"
+  staged_key_file="$notary_key_file"
+  cleanup_notary_key
+  [ ! -e "$staged_key_file" ]
+  [ ! -e "$staged_key_directory" ]
+
+  if stage_notary_key_from_command /bin/sh -c 'printf partial; exit 1'; then
+    echo "notary key staging accepted a failed producer" >&2
+    exit 1
+  fi
+  [ -z "$(/usr/bin/find "$notary_test_root" -mindepth 1 -print -quit)" ]
+)
 
 swift build --package-path "$repo_root/agent"
 "$repo_root/agent/.build/debug/cs-selftest"
@@ -66,6 +163,18 @@ CSEC_SOCKET="/tmp/csec-release-must-ignore.sock" \
 OP_CLI_PATH="/bin/false" \
 CSEC_ROOT_SOCKET="/tmp/csec-root-release-must-ignore.sock" \
   "$repo_root/agent/.build/release/cs-selftest"
+
+# The shipping access-review window must use Apple's context-bound embedded UI;
+# merely importing LocalAuthentication would regress to a second system alert.
+shipping_agent="$repo_root/agent/.build/release/csecd"
+if ! otool -L "$shipping_agent" | rg -q 'LocalAuthenticationEmbeddedUI'; then
+  echo "release csecd does not link the embedded LocalAuthentication UI" >&2
+  exit 1
+fi
+if ! nm -u "$shipping_agent" | rg -q '_OBJC_CLASS_\$_LAAuthenticationView'; then
+  echo "release csecd does not reference LAAuthenticationView" >&2
+  exit 1
+fi
 
 # The privileged daemon is intentionally built from dedicated minimal modules.
 # A target dependency on the full user agent would silently pull UI, biometric,

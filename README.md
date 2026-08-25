@@ -43,8 +43,9 @@ value a human didn't just approve, and it keeps the footprint of each secret —
 rest and in use — as small as macOS allows.
 
 - **Human in the loop.** The first time a process asks for a reference, the agent
-  prompts for **Touch ID**, showing you exactly which secret, which process, and
-  why. No password fallback, no auto-approve switch in the shipping build.
+  shows one trusted review window with exactly which secret, which process, and
+  why, then embeds **Touch ID** in that window. No password fallback, no
+  auto-approve switch in the shipping build.
 - **One touch, sensible scope.** A grant is bound to the approving process and
   its child processes (its "subtree") for a bounded lifetime, so a `rails server`
   and the migrations it spawns don't re-prompt you every few seconds — but an
@@ -439,10 +440,16 @@ also require the signed `.pkg`; copying the app alone does not install or load
 the root helper:
 
 ```sh
-packaging/bin/build-agent.sh                                        # build + sign app and root helper
-packaging/bin/build-pkg.sh                                          # package root-owned components
-/Applications/ConvenientSecurity.app/Contents/MacOS/csec install    # register the LaunchAgent
+packaging/bin/build-and-install.sh    # build, notarize, package, install, register, and verify
 ```
+
+The command reuses the existing provisioning profile, fetching one through the
+configured 1Password-backed release tooling when it is missing. Pass
+`--refresh-profile` to fetch a new profile or `--dry-run` to inspect the full
+plan without signing, network access, installation, or service changes. It
+invokes `sudo` only for Apple's package installer; LaunchAgent registration
+runs as the login user. The individual release steps remain documented in
+[`packaging/README.md`](packaging/README.md).
 
 A signed agent prints `at-rest cache on` and persists resolved values in the
 Secure-Enclave-gated Keychain. Signing, notarization, and the root-owned bridge

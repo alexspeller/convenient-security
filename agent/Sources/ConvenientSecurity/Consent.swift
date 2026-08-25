@@ -43,9 +43,10 @@ public enum ConsentOutcome: Sendable {
     }
 }
 
-/// Presents consent for newly-requested references and returns the decision.
-/// The production implementation puts bounded request details in the localized
-/// reason of a fresh Touch ID evaluation; see DESIGN.md (Consent).
+/// Presents consent and returns the decision. Production access review normally
+/// authenticates through its embedded session; this seam remains the fallback
+/// for injected/headless reviewers and the authenticator for policy mutations.
+/// Bounded request details are still placed in the LAContext localized reason.
 public protocol ConsentProvider: Sendable {
     func requestConsent(
         caller: CallerInfo,

@@ -72,7 +72,7 @@ Four structural rules, each load-bearing:
 | **Developer ID Installer** cert | same CSR flow, pick *Developer ID Installer* in the portal | Signs the `.pkg`. **Different cert** from the Application one. Account-Holder only. |
 | App ID `com.alexspeller.convenient-security` | developer.apple.com → Identifiers → register manually | `produce` can't (no API-key support). The access group is its default `application-identifier`. |
 | App Store Connect **API key** (Team, Admin role) | portal → Users and Access → Integrations → App Store Connect API → Team key | Drives provisioning *and* notarization. A **Team** key (not Individual). |
-| API key in 1Password | item with fields `key_id`, `issuer_id`, `key` (the `.p8` PEM) | Referenced from `packaging/.env`; private-key bytes are read just-in-time through an inherited pipe, never env/argv/disk. |
+| API key in 1Password | item with fields `key_id`, `issuer_id`, `key` (the `.p8` PEM) | Referenced from `packaging/.env`; private-key bytes are read just in time, never placed in env or passed as key data in argv, and use the constrained transports described below. |
 | Release Ruby tooling | Ruby >= 3.2.0, RubyGems >= 3.4.1, and Bundler 4.0.15 | The exact Bundler version is recorded in `Gemfile.lock`; system Ruby 2.6 cannot run this release-only bundle. |
 | `packaging/.env` (gitignored) | `OP_ACCOUNT=my.1password.com`<br>`OP_ASC_ITEM="op://<Vault>/<Item Title>"` | Keeps personal 1Password paths out of git. See `.env.example`. |
 
@@ -95,6 +95,26 @@ Authority G2 and it expires on 17 September 2031. Re-check Apple's official page
 instead of bypassing the hash check if Apple replaces it.
 
 ## The pipeline
+
+For a complete build and local installation, use the single-command wrapper:
+
+```sh
+packaging/bin/build-and-install.sh
+```
+
+It reuses `packaging/build/convenient-security.mobileprovision` when present,
+fetches it through `provision.sh` when absent, then builds and signs every
+binary, notarizes the app, builds and notarizes the full package, installs it
+with Apple's `installer`, registers or restarts the per-user LaunchAgent, and
+verifies that the installed payloads match the build and that the root helper
+is reachable. Use `--refresh-profile` to force a profile refresh and `--dry-run`
+to print the complete plan without changing anything. Run the wrapper as the
+login user: only the package installation is elevated; running the LaunchAgent
+registration under `sudo` would register it for the wrong user.
+
+The wrapper reads `packaging/.env` and defaults the two signing identity names
+to the Stateful Ltd identities below. The underlying individual steps remain
+available for release diagnosis or artifact-only builds.
 
 Each step is one script. Two env vars name the signing identities (the scripts
 read the API key from 1Password themselves):
@@ -138,12 +158,21 @@ restricted entitlement and must be unable to query the item. Use `RUN_SPIKE=0`
 to build + sign without the interactive Touch ID run.
 
 The provisioning and notarization wrappers launch `op` with an allowlisted
-environment and pass the App Store Connect private key to Fastlane/notarytool as
-`/dev/fd/3`. The environment contains only the non-secret key/issuer IDs and fd
-marker. The locked Fastlane 2.237.0 action accepts `key_filepath` and reads it
+environment. Provisioning passes the App Store Connect private key to Fastlane
+as `/dev/fd/3`; its environment contains only the non-secret key/issuer IDs and
+fd marker. The locked Fastlane 2.237.0 action accepts `key_filepath` and reads it
 with `File.binread`
 ([upstream source](https://github.com/fastlane/fastlane/blob/2.237.0/fastlane/lib/fastlane/actions/app_store_connect_api_key.rb)).
 The wrapper explicitly asks Bundler to preserve inherited descriptors.
+
+`notarytool --key` requires a filesystem path and does not reliably accept that
+descriptor path. Immediately before each submission, `notarize.sh` therefore
+streams the key into `AuthKey.p8` beneath an atomically created `0700` temporary
+directory with file mode `0600`. It removes the file and directory immediately
+after `notarytool` returns and from its exit and handled-signal paths. The key is
+never stored in an environment variable, included as key data in argv, or
+printed. A process crash or `SIGKILL` can prevent trap cleanup, and filesystem
+copies, swap, backup, or snapshots remain outside the script's control.
 Signature, Gatekeeper, and stapler verification failures are fatal; the scripts
 never print a success message after a failed release check.
 
@@ -152,7 +181,10 @@ never print a success message after a failed release check.
 From the signed `.pkg` (double-click, or `installer -pkg … -target /`), the app
 lands in `/Applications`. Its postinstall script checks root ownership/modes,
 the exact Team/identifier requirements of app, bridge, and helper, and the root
-plist before bootstrapping and kickstarting the system LaunchDaemon. Then,
+plist before replacing the system LaunchDaemon. On upgrade it waits for
+launchd's asynchronous `bootout` transaction to finish and retries transient
+`bootstrap` rejection within a bounded interval before kickstarting the new
+job. Then,
 **run the CLI from inside the bundle** so `SMAppService` can find the per-user
 LaunchAgent plist:
 

@@ -29,11 +29,23 @@ root_plist="$here/root/LaunchDaemons/$root_label.plist"
 [ -d "$app" ] || { echo "build-pkg: $app not found — run build-agent.sh first" >&2; exit 1; }
 [ -f "$root_helper" ] || { echo "build-pkg: $root_helper not found — run build-agent.sh first" >&2; exit 1; }
 [ -f "$root_plist" ] || { echo "build-pkg: $root_plist not found" >&2; exit 1; }
+[ -x "$scripts/postinstall" ] || { echo "build-pkg: executable postinstall script not found" >&2; exit 1; }
+[ -x "$scripts/reload-launch-daemon" ] || { echo "build-pkg: executable LaunchDaemon reload helper not found" >&2; exit 1; }
 
 # Never wrap a stale or damaged app in a valid installer signature.
 codesign --verify --deep --strict --verbose=2 "$app" 2>&1
 codesign --verify --strict --verbose=2 "$app/Contents/MacOS/csec" 2>&1
 codesign --verify --strict --verbose=2 "$root_helper" 2>&1
+product_requirement='anchor apple generic and certificate leaf[subject.OU] = "8RS6GD89Y7"'
+codesign --verify --deep --strict \
+  -R="$product_requirement and identifier \"com.alexspeller.convenient-security\"" \
+  "$app"
+codesign --verify --strict \
+  -R="$product_requirement and identifier \"com.alexspeller.convenient-security.csec\"" \
+  "$app/Contents/MacOS/csec"
+codesign --verify --strict \
+  -R="$product_requirement and identifier \"$root_label\"" \
+  "$root_helper"
 
 version="$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")"
 echo "--- building signed pkg for ConvenientSecurity.app $version ---"
@@ -71,7 +83,10 @@ pkgutil --check-signature "$pkg" 2>&1
 cat <<EOF
 
 Built + signed: $pkg
+EOF
 
+if [ "${CSEC_BUILD_AND_INSTALL_PIPELINE:-0}" != "1" ]; then
+  cat <<EOF
 Next:
   1. Notarize + staple it:
        packaging/bin/notarize.sh "$pkg"
@@ -81,3 +96,4 @@ Next:
      the user then runs:
        /Applications/ConvenientSecurity.app/Contents/MacOS/csec install
 EOF
+fi

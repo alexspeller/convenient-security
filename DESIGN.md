@@ -83,7 +83,7 @@ of the trusted consumer boundary.
 
 ## Policy review and consent
 
-Before Touch ID, the production daemon owns an AppKit policy-review window. It
+The production daemon owns one AppKit policy-and-authentication window. It
 contains no values: it shows the logical credential references, stored risk,
 delivery mechanism, actual planned executable, consumer assurance, destination,
 scope, and requested duration. A newly observed logical credential must be
@@ -91,12 +91,16 @@ classified as low, standard, high, or critical. Acceptance of a weak
 compatibility delivery is a separate, initially unchecked decision rather than
 part of the classification.
 
-After an allowed review, the daemon creates a fresh `LAContext` and evaluates
-Touch ID without password fallback. The localized reason shown by macOS includes
-the requesting process description, exact new references, caller-supplied
-purpose, policy-capped duration, and a compact risk/delivery/scope/destination
-summary. Dynamic text is bounded and control, newline, and bidirectional-
-formatting characters are neutralized.
+That window creates a fresh `LAContext` and pairs it with Apple's embedded
+`LAAuthenticationView`. Pressing **Authorize with Touch ID** returns only the
+value-free selections to the agent while the window remains open. The agent
+applies the authoritative risk policy first; a denial closes the session without
+starting biometrics. An allowed decision updates the same window with the
+policy-capped duration and compact risk/delivery/scope/destination summary, then
+evaluates Touch ID without password fallback through the paired context. The
+localized reason carries the same bounded request details as a defense in depth.
+Dynamic text is bounded and control, newline, and bidirectional-formatting
+characters are neutralized.
 
 Approval returns the evaluated context to the cache read so a cold cached value
 or cold native-store key can be unlocked by the same biometric action. Editing
@@ -105,7 +109,9 @@ Touch ID and displays that every key in the named store will be exposed to the
 editor. It does not create a reusable secret grant. Denial, unavailable
 biometrics, or lockout fails closed. The shipping daemon has no runtime
 auto-approval switch; automatic consent exists only in separate test
-executables and injected test dependencies.
+executables and injected test dependencies. A provider may still require its own
+independent authorization—for example, the 1Password app can display a separate
+account-access request—which csecd cannot merge into its window.
 
 ## Delivery
 

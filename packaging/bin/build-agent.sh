@@ -85,7 +85,10 @@ cat <<EOF
 Built + signed:
   $app
   $root_helper
+EOF
 
+if [ "${CSEC_BUILD_AND_INSTALL_PIPELINE:-0}" != "1" ]; then
+  cat <<EOF
 Next (needs you, at the keyboard):
   1. Install it where SMAppService trusts it:
        cp -R "$app" /Applications/
@@ -98,3 +101,4 @@ Next (needs you, at the keyboard):
 The standalone root helper is installed only by build-pkg.sh; copying the app
 alone intentionally does not enable protected regular-file delivery.
 EOF
+fi
