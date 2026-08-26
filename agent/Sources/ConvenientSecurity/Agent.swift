@@ -1519,6 +1519,28 @@ public actor Agent {
         return Response(capabilities: ProtocolCapabilities(features: features))
     }
 
+    /// Batched host remediation: run the audit, present the fixable set as a
+    /// single deselectable checklist under one Touch ID, then apply the selected
+    /// changes (`.auto` in-process, `.autoPrivileged` via the agent-role root
+    /// helper). Implemented by `HostRemediationCoordinator` + the trusted review.
+    public func runHostRemediation(
+        request: HostRemediationRequest,
+        caller: CallerInfo
+    ) async -> Response {
+        guard isVerifiedLauncher(caller) else {
+            return .failed(
+                .consentDenied,
+                message: "host remediation requires the verified csec launcher",
+                requestID: request.requestID
+            )
+        }
+        let summary = await HostRemediationCoordinator.run(
+            request: request,
+            review: policyReview
+        )
+        return Response(requestID: request.requestID, hostRemediation: summary)
+    }
+
     /// Register the authenticated launcher's current process incarnation. A
     /// descendant can later name the opaque ID, but access succeeds only when
     /// a fresh kernel ancestry walk reaches this exact PID/start-time pair.

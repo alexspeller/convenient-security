@@ -458,13 +458,20 @@ public enum RootHelperRequest: Codable, Sendable {
     case signal(requestID: String, nonce: String, planDigest: String, signal: Int32)
     case cancel(requestID: String, nonce: String, planDigest: String)
     case health(requestID: String)
+    /// Value-free privileged host read for the posture audit (agent role only).
+    case hostRead(requestID: String, query: HostRootRead)
+    /// Reversible, digest-bound privileged host mutation (agent role only).
+    case hostApply(requestID: String, change: HostRootChange, digest: String)
 
     private enum CodingKeys: String, CodingKey {
         case version, type, requestID, plan, planDigest, nonce, payloads, expiresAt, signal
+        case hostQuery, hostChange, hostDigest
     }
 
     private enum Kind: String, Codable {
         case prepare, approve, start, status, signal, cancel, health
+        case hostRead = "host_read"
+        case hostApply = "host_apply"
     }
 
     public init(from decoder: Decoder) throws {
@@ -516,6 +523,17 @@ public enum RootHelperRequest: Codable, Sendable {
             )
         case .health:
             self = .health(requestID: requestID)
+        case .hostRead:
+            self = .hostRead(
+                requestID: requestID,
+                query: try container.decode(HostRootRead.self, forKey: .hostQuery)
+            )
+        case .hostApply:
+            self = .hostApply(
+                requestID: requestID,
+                change: try container.decode(HostRootChange.self, forKey: .hostChange),
+                digest: try container.decode(String.self, forKey: .hostDigest)
+            )
         }
     }
 
@@ -559,6 +577,15 @@ public enum RootHelperRequest: Codable, Sendable {
         case let .health(requestID):
             try container.encode(Kind.health, forKey: .type)
             try container.encode(requestID, forKey: .requestID)
+        case let .hostRead(requestID, query):
+            try container.encode(Kind.hostRead, forKey: .type)
+            try container.encode(requestID, forKey: .requestID)
+            try container.encode(query, forKey: .hostQuery)
+        case let .hostApply(requestID, change, digest):
+            try container.encode(Kind.hostApply, forKey: .type)
+            try container.encode(requestID, forKey: .requestID)
+            try container.encode(change, forKey: .hostChange)
+            try container.encode(digest, forKey: .hostDigest)
         }
     }
 }
@@ -587,6 +614,8 @@ public struct RootHelperResponse: Codable, Sendable {
     public let childStartTime: UInt64?
     public let waitStatus: Int32?
     public let failure: RootHelperWireFailure?
+    /// Value-free result of a `hostRead`/`hostApply` request; nil for launches.
+    public let hostResult: HostHelperResult?
 
     public init(
         requestID: String,
@@ -596,7 +625,8 @@ public struct RootHelperResponse: Codable, Sendable {
         childPID: pid_t? = nil,
         childStartTime: UInt64? = nil,
         waitStatus: Int32? = nil,
-        failure: RootHelperWireFailure? = nil
+        failure: RootHelperWireFailure? = nil,
+        hostResult: HostHelperResult? = nil
     ) {
         self.version = RootHelperWireProtocol.version
         self.requestID = requestID
@@ -607,6 +637,7 @@ public struct RootHelperResponse: Codable, Sendable {
         self.childStartTime = childStartTime
         self.waitStatus = waitStatus
         self.failure = failure
+        self.hostResult = hostResult
     }
 
     public static func failed(

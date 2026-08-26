@@ -402,6 +402,196 @@ do {
     check(false, "native encrypted-store checks succeed (\(error))")
 }
 
+print("\n# NativeBlobStore (per-blob envelopes + pinned index)")
+do {
+    check((try? NativeBlobReference(try SecretRef("csecfile://project/env_home")))?.key == "env_home",
+          "csecfile references parse into store/key")
+    checkThrows("a csec:// reference is not a blob reference") {
+        _ = try NativeBlobReference(try SecretRef("csec://project/env_home"))
+    }
+    checkThrows("a nested blob key is rejected") {
+        _ = try NativeBlobReference(try SecretRef("csecfile://project/dir/key"))
+    }
+
+    let keyBackend = InMemoryNativeStoreKeyBackend()
+    let fileBackend = InMemoryNativeStoreFileBackend()
+    let blobs = NativeBlobStore(keyBackend: keyBackend, fileBackend: fileBackend)
+    let store = try NativeStoreName("projectblobs")
+
+    // Arbitrary-shell .envrc bytes plus a binary payload (NULs, high bytes) to
+    // prove full-fidelity, format-agnostic storage.
+    let envrc = "export FOO=bar\nPATH_add ./bin\nuse_flake\n"
+    let envrcData = Data(envrc.utf8)
+    let binaryData = Data([0x00, 0x01, 0xff, 0xfe, 0x0a, 0x00, 0x7f, 0x80])
+
+    do {
+        _ = try await blobs.putBlobs(
+            store: store,
+            requests: [.init(key: "envrc", data: envrcData, mode: 0o600, path: ".envrc")],
+            unlock: nil
+        )
+        check(false, "a blob write without biometric context is rejected")
+    } catch NativeStoreError.authenticationRequired {
+        check(true, "a blob write without biometric context is rejected")
+    }
+
+    let firstGeneration = try await blobs.putBlobs(
+        store: store,
+        requests: [
+            .init(key: "envrc", data: envrcData, mode: 0o600, path: ".envrc"),
+            .init(key: "keyfile", data: binaryData, mode: 0o400, path: "config/master.key"),
+        ],
+        unlock: nativeUnlock
+    )
+    check(firstGeneration == 1, "the first batch commits one authenticated generation")
+
+    let firstSnapshot = await fileBackend.snapshot()
+    check(firstSnapshot.count == 3,
+          "two blobs plus one index back the store as separate ciphertext files")
+    check(firstSnapshot.values.allSatisfy { $0.range(of: envrcData) == nil && $0.range(of: binaryData) == nil },
+          "no blob ciphertext contains plaintext bytes")
+
+    let loadedEnvrc = try await blobs.loadBlob(
+        try NativeBlobReference(store: store, key: "envrc"), unlock: nativeUnlock)
+    check(loadedEnvrc.data == envrcData && loadedEnvrc.mode == 0o600 && loadedEnvrc.path == ".envrc",
+          "an .envrc blob round-trips with its exact bytes, mode, and path")
+    let loadedBinary = try await blobs.loadBlob(
+        try NativeBlobReference(store: store, key: "keyfile"), unlock: nativeUnlock)
+    check(loadedBinary.data == binaryData && loadedBinary.mode == 0o400,
+          "a binary blob round-trips byte-for-byte")
+
+    let listing = try await blobs.list(store: store, unlock: nativeUnlock)
+    check(Set(listing.keys) == ["envrc", "keyfile"] && listing["keyfile"]?.size == binaryData.count,
+          "the metadata-only listing exposes keys/size/path without values")
+
+    // Capture the generation-1 index so a rollback replay can be attempted.
+    let firstIndexName = firstSnapshot.keys.first { $0.hasSuffix(".index.csec") }!
+    let firstIndexCiphertext = firstSnapshot[firstIndexName]!
+
+    // Replacing one blob advances the generation and swaps immutable files.
+    let secondGeneration = try await blobs.putBlobs(
+        store: store,
+        requests: [.init(key: "envrc", data: Data("export FOO=rotated\n".utf8), mode: 0o600, path: ".envrc")],
+        unlock: nativeUnlock
+    )
+    check(secondGeneration == 2, "replacing a blob advances the authenticated generation")
+    let secondSnapshot = await fileBackend.snapshot()
+    check(secondSnapshot.count == 3 && !secondSnapshot.keys.contains(firstIndexName),
+          "a replace removes the superseded index and blob file")
+    check(try await blobs.loadBlob(try NativeBlobReference(store: store, key: "envrc"), unlock: nativeUnlock)
+            .data == Data("export FOO=rotated\n".utf8),
+          "the rotated blob is served after replacement")
+
+    // Restart: a fresh store instance over the same backends still serves.
+    let afterRestart = NativeBlobStore(keyBackend: keyBackend, fileBackend: fileBackend)
+    do {
+        _ = try await afterRestart.loadBlob(try NativeBlobReference(store: store, key: "keyfile"), unlock: nil)
+        check(false, "a restarted blob store cannot cold-decrypt without biometric context")
+    } catch NativeStoreError.authenticationRequired {
+        check(true, "a restarted blob store cannot cold-decrypt without biometric context")
+    }
+    check(try await afterRestart.loadBlob(try NativeBlobReference(store: store, key: "keyfile"), unlock: nativeUnlock)
+            .data == binaryData,
+          "a biometric context unlocks durable blobs after restart")
+
+    // Tamper: flip a byte in a blob ciphertext -> integrity failure, never a value.
+    let liveSnapshot = await fileBackend.snapshot()
+    let blobFileName = liveSnapshot.keys.first { $0.hasSuffix(".blob.csec") }!
+    var tamperedBlob = liveSnapshot[blobFileName]!
+    tamperedBlob[tamperedBlob.index(before: tamperedBlob.endIndex)] ^= 0x01
+    await fileBackend.replace(named: blobFileName, data: tamperedBlob)
+    var tamperedKey = "envrc"
+    // Determine which key the tampered blob belongs to by trying both.
+    for candidate in ["envrc", "keyfile"] {
+        if (try? await afterRestart.loadBlob(try NativeBlobReference(store: store, key: candidate), unlock: nativeUnlock)) == nil {
+            tamperedKey = candidate
+        }
+    }
+    do {
+        _ = try await afterRestart.loadBlob(try NativeBlobReference(store: store, key: tamperedKey), unlock: nativeUnlock)
+        check(false, "blob ciphertext modification is rejected before any bytes are returned")
+    } catch NativeStoreError.integrityFailure {
+        check(true, "blob ciphertext modification is rejected before any bytes are returned")
+    }
+
+    // Rollback: replace the active index with the older valid generation-1 index;
+    // the keychain record pins the current digest/generation, so it fails closed.
+    let activeIndexName = liveSnapshot.keys.first { $0.hasSuffix(".index.csec") }!
+    await fileBackend.replace(named: activeIndexName, data: firstIndexCiphertext)
+    let rollbackStore = NativeBlobStore(keyBackend: keyBackend, fileBackend: fileBackend)
+    do {
+        _ = try await rollbackStore.loadBlob(try NativeBlobReference(store: store, key: "keyfile"), unlock: nativeUnlock)
+        check(false, "an older valid index cannot be replayed as the active generation")
+    } catch NativeStoreError.integrityFailure {
+        check(true, "an older valid index cannot be replayed as the active generation")
+    }
+} catch {
+    check(false, "native blob-store checks succeed (\(error))")
+}
+
+// A production filesystem backend with a raised cap round-trips a blob larger
+// than the 1 MiB whole-document store limit, proving per-blob sizing.
+do {
+    let testDirectory = NSTemporaryDirectory()
+        + "csec-blob-files-\(UUID().uuidString.lowercased())"
+    defer { try? FileManager.default.removeItem(atPath: testDirectory) }
+    let files = try SecureNativeStoreFileBackend(
+        directoryPath: testDirectory,
+        maximumCiphertextBytes: NativeBlobIndex.maximumIndexBytes + 1024
+    )
+    let blobs = NativeBlobStore(keyBackend: InMemoryNativeStoreKeyBackend(), fileBackend: files)
+    let store = try NativeStoreName("bigblobs")
+    let large = Data((0..<(1_500_000)).map { UInt8($0 & 0xff) })
+    _ = try await blobs.putBlobs(
+        store: store,
+        requests: [.init(key: "cert", data: large, mode: 0o444, path: "certs/server.pem")],
+        unlock: nativeUnlock
+    )
+    check(try await blobs.loadBlob(try NativeBlobReference(store: store, key: "cert"), unlock: nativeUnlock).data == large,
+          "a >1 MiB blob round-trips through the production ciphertext backend")
+} catch {
+    check(false, "large-blob filesystem backend check succeeds (\(error))")
+}
+
+print("\n# ProtectedFileSidecar (untrusted *.csec pointer)")
+do {
+    let ref = try NativeBlobReference(store: try NativeStoreName("project"), key: "env_home")
+    let encoded = try ProtectedFileSidecar(reference: ref).encoded()
+    check(try ProtectedFileSidecar(data: encoded).reference == ref,
+          "a sidecar round-trips its csecfile reference")
+    let derivedDotEnvrc = try ProtectedFileSidecar.targetName(forSidecarNamed: ".envrc.csec")
+    let derivedConfig = try ProtectedFileSidecar.targetName(forSidecarNamed: "config.json.csec")
+    check(derivedDotEnvrc == ".envrc" && derivedConfig == "config.json",
+          "the target file name is derived from the sidecar name")
+    for bad in [".csec", "foo", "..csec", "a/b.csec"] {
+        checkThrows("a non-target sidecar name '\(bad)' is rejected") {
+            _ = try ProtectedFileSidecar.targetName(forSidecarNamed: bad)
+        }
+    }
+    func rejects(_ label: String, _ json: String) {
+        checkThrows(label) { _ = try ProtectedFileSidecar(data: Data(json.utf8)) }
+    }
+    let good = "convenient-security/protected-file"
+    rejects("an unknown key is rejected",
+            #"{"csec":"\#(good)","version":1,"reference":"csecfile://project/env_home","x":1}"#)
+    rejects("a wrong magic is rejected",
+            #"{"csec":"evil","version":1,"reference":"csecfile://project/env_home"}"#)
+    rejects("an unsupported version is rejected",
+            #"{"csec":"\#(good)","version":2,"reference":"csecfile://project/env_home"}"#)
+    rejects("a non-file (csec://) reference is rejected",
+            #"{"csec":"\#(good)","version":1,"reference":"csec://project/env_home"}"#)
+    rejects("a 1Password reference is rejected",
+            #"{"csec":"\#(good)","version":1,"reference":"op://vault/item/field"}"#)
+    checkThrows("an opaque ciphertext file is not a sidecar") {
+        _ = try ProtectedFileSidecar(data: Data("CSECBLB1".utf8) + Data((0..<64).map { UInt8($0) }))
+    }
+    checkThrows("an oversize sidecar is rejected") {
+        _ = try ProtectedFileSidecar(data: Data(count: ProtectedFileSidecar.maximumBytes + 1))
+    }
+} catch {
+    check(false, "protected-file sidecar checks succeed (\(error))")
+}
+
 do {
     let testDirectory = NSTemporaryDirectory()
         + "csec-native-files-\(UUID().uuidString.lowercased())"
@@ -2728,6 +2918,20 @@ do {
 } catch {
     check(false, "KeychainSecretCache checks threw unexpectedly: \(error)")
 }
+
+// Host posture audit — core guarantees + per-domain check coverage.
+await hostAuditCoreTests()
+await hostAuditTests_A()
+await hostAuditTests_B()
+await hostAuditTests_C()
+await hostAuditTests_D()
+await hostAuditTests_E()
+await hostAuditTests_F()
+await hostAuditTests_G()
+await hostAuditTests_H()
+await hostAuditTests_I()
+await hostAuditTests_J()
+await hostAuditTests_K()
 
 if failures == 0 {
     print("\nAll checks passed.")

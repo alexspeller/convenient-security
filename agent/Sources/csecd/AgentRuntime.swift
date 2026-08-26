@@ -206,6 +206,18 @@ func startAgentServer() async {
           requestID: approval.requestID
         )
       }
+    case .hostAudit(let request):
+      // Read-only, value-free posture audit. The socket already requires a
+      // verified launcher peer; csecd runs the engine with its own privileged
+      // (agent-role) root-helper channel and Full Disk Access. This is the
+      // interactive path, so it also records the accepted baseline.
+      let report = await HostAuditService.runInteractive(
+        scanFilesystem: request.scanFilesystem,
+        generatedAtHint: ISO8601DateFormatter().string(from: Date())
+      )
+      return Response(requestID: request.requestID, hostAuditReport: report)
+    case .hostRemediate(let request):
+      return await agent.runHostRemediation(request: request, caller: caller)
     }
   }
 
@@ -251,4 +263,7 @@ func startAgentServer() async {
       exit(1)
     }
   }
+
+  // Periodic value-free re-audit + regression notifications (Decision 6).
+  PeriodicHostAudit.start()
 }

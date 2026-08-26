@@ -260,6 +260,10 @@ func runSetup(_ arguments: [String]) -> Never {
         print("- restart each coding agent, inspect its hook UI, and trust the exact new hook before relying on coverage")
     }
     print("csec setup: apply complete")
+    // Decision 1: setup always finishes with a host posture pass. Report-only so
+    // setup never triggers a second Touch-ID review; run `csec audit` to remediate.
+    print("\n---")
+    performHostAudit(scanFilesystem: false, reportOnly: true, json: false, quietWhenUnavailable: true)
     exit(0)
 }
 

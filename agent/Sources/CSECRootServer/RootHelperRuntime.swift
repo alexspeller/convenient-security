@@ -636,6 +636,45 @@ public actor RootLaunchCoordinator {
         }
     }
 
+    // MARK: Host posture audit — value-free privileged reads + reversible applies
+
+    /// Run one allow-listed, read-only host query as root and return its bounded
+    /// output for the verified agent to parse value-free. `query` selects a fixed
+    /// command in `HostOpsExecutor`; no caller string is ever executed.
+    public func hostRead(query: HostRootRead, peer: PeerIdentity) throws -> RootHelperResponse {
+        let result: HostHelperResult
+        switch mode {
+        case .production:
+            guard geteuid() == 0 else { throw RootHelperRuntimeError.rootRequired }
+            result = HostOpsExecutor.read(query)
+        case .syntheticTesting:
+            result = HostOpsExecutor.syntheticRead(query)
+        }
+        return RootHelperResponse(requestID: "", hostResult: result)
+    }
+
+    /// Apply one reversible, allow-listed privileged change. The caller-supplied
+    /// digest must equal this exact change's independently-recomputed digest, so
+    /// a tampered or unreviewed change fails closed before any mutation.
+    public func hostApply(
+        change: HostRootChange,
+        digest: String,
+        peer: PeerIdentity
+    ) throws -> RootHelperResponse {
+        guard let expected = try? change.digest(), expected == digest else {
+            throw RootHelperRuntimeError.invalidTransition
+        }
+        let result: HostHelperResult
+        switch mode {
+        case .production:
+            guard geteuid() == 0 else { throw RootHelperRuntimeError.rootRequired }
+            result = HostOpsExecutor.apply(change)
+        case .syntheticTesting:
+            result = HostHelperResult(exitCode: 0, applied: true)
+        }
+        return RootHelperResponse(requestID: "", hostResult: result)
+    }
+
     public func approve(
         nonce: String,
         planDigest: String,

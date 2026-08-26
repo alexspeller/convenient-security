@@ -168,6 +168,34 @@ public struct RootHelperClient: Sendable {
         )
     }
 
+    /// Run one allow-listed, value-free privileged host read (posture audit).
+    /// Only the resident agent's code identity is accepted by the helper.
+    public func hostRead(_ query: HostRootRead) throws -> HostHelperResult {
+        let requestID = UUID().uuidString.lowercased()
+        let response = try send(
+            .hostRead(requestID: requestID, query: query),
+            requestID: requestID
+        )
+        guard let result = response.hostResult else {
+            throw ProtectedFileDeliveryError.unavailableRootHelper
+        }
+        return result
+    }
+
+    /// Apply one reversible, allow-listed privileged change, digest-bound to the
+    /// exact change (which the helper independently recomputes and verifies).
+    public func hostApply(_ change: HostRootChange, digest: String) throws -> HostHelperResult {
+        let requestID = UUID().uuidString.lowercased()
+        let response = try send(
+            .hostApply(requestID: requestID, change: change, digest: digest),
+            requestID: requestID
+        )
+        guard let result = response.hostResult else {
+            throw ProtectedFileDeliveryError.unavailableRootHelper
+        }
+        return result
+    }
+
     private func connect() throws -> Int32 {
         let fd = path.withCString { cs_connect_unix($0) }
         guard fd >= 0 else { throw ProtectedFileDeliveryError.unavailableRootHelper }

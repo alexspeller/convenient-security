@@ -69,6 +69,18 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
             message: "the standalone fake agent has no root-helper rendezvous",
             requestID: approval.requestID
         )
+    case let .hostAudit(request):
+        return .failed(
+            .deliveryNotSupported,
+            message: "the standalone fake agent does not run the host posture audit",
+            requestID: request.requestID
+        )
+    case let .hostRemediate(request):
+        return .failed(
+            .deliveryNotSupported,
+            message: "the standalone fake agent does not run host remediation",
+            requestID: request.requestID
+        )
     }
 }
 

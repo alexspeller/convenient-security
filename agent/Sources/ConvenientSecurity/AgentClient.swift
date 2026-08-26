@@ -186,6 +186,35 @@ public struct AgentClient {
         return inspection
     }
 
+    /// Ask csecd to run the value-free host posture audit and return the report.
+    /// The privileged reads, TCC/FDA enumeration, and any parsing happen inside
+    /// csecd; only the value-free `HostAuditReport` crosses back to the launcher.
+    public func hostAudit(scanFilesystem: Bool = false) throws -> HostAuditReport {
+        let request = HostAuditRequest(scanFilesystem: scanFilesystem)
+        let response = try send(.hostAudit(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let report = response.hostAuditReport else {
+            throw ClientError.transportFailed
+        }
+        return report
+    }
+
+    /// Ask csecd to present the batched remediation review (one Touch ID) and
+    /// apply the selected fixes. Returns the value-free applied/skipped/failed
+    /// summary; csecd owns the review window and the privileged applies.
+    public func hostRemediate(
+        selectedKeys: [String] = [],
+        scanFilesystem: Bool = false
+    ) throws -> HostRemediationSummary {
+        let request = HostRemediationRequest(selectedKeys: selectedKeys, scanFilesystem: scanFilesystem)
+        let response = try send(.hostRemediate(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let summary = response.hostRemediation else {
+            throw ClientError.transportFailed
+        }
+        return summary
+    }
+
     /// Ask csecd to review/resolve a protected-file launch and send the rendered
     /// bytes directly to csec-rootd. A successful response contains only a
     /// boolean; file plaintext is never decoded by this client process.

@@ -198,6 +198,15 @@ public struct RiskChangeReview: Sendable {
 public protocol PolicyReviewProvider: Sendable {
     func reviewAccess(_ review: AccessPolicyReview) async -> AccessPolicyReviewOutcome
     func reviewRiskChange(_ review: RiskChangeReview) async -> Bool
+    /// Present the batched host-remediation checklist (one review, one Touch ID).
+    /// Defaulted so existing reviewers need no change.
+    func reviewHostRemediation(_ review: HostRemediationReview) async -> HostRemediationOutcome
+}
+
+public extension PolicyReviewProvider {
+    func reviewHostRemediation(_ review: HostRemediationReview) async -> HostRemediationOutcome {
+        .denied
+    }
 }
 
 /// Test-only reviewer. It is constructor-injected and is not selectable through
@@ -234,6 +243,13 @@ public struct AutoApprovePolicyReview: PolicyReviewProvider {
         ))
         return true
     }
+
+    public func reviewHostRemediation(_ review: HostRemediationReview) async -> HostRemediationOutcome {
+        FileHandle.standardError.write(Data(
+            "⚠️  AutoApprovePolicyReview: approving host remediation WITHOUT a human. DEV ONLY.\n".utf8
+        ))
+        return .approved(selectedKeys: review.items.map(\.key))
+    }
 }
 
 /// AppKit review rendered by the authenticated resident agent. The selection
@@ -256,6 +272,14 @@ public struct TrustedPolicyReview: PolicyReviewProvider {
         return await MainActor.run { Self.presentRiskChange(review) }
         #else
         return false
+        #endif
+    }
+
+    public func reviewHostRemediation(_ review: HostRemediationReview) async -> HostRemediationOutcome {
+        #if canImport(AppKit)
+        return await HostRemediationReviewSession.present(review)
+        #else
+        return .denied
         #endif
     }
 

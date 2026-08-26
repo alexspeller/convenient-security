@@ -491,6 +491,56 @@ These are egress safeguards, not a cure-all: they cover supervised stdout/stderr
 and Bash tool calls, not file writes, network sends, or non-Bash tool paths. See
 [`DESIGN.md`](DESIGN.md#output-redaction-and-ai-hooks) for the exact guarantees.
 
+## Audit host posture
+
+csec protects your secret *values*, but the same-user malware it fights can still
+win by other means — inheriting an app's Full Disk Access grant, hijacking a
+writable `PATH`, MITMing your TLS through a rogue root CA, or persisting via a
+`LaunchAgent`. `csec audit` checks whether the Mac underneath is configured so
+that those attacks can't trivially succeed:
+
+```sh
+csec audit                 # report host posture, then offer the batched fixes
+csec audit --report-only   # read-only: report only, propose nothing
+csec audit --json          # stable JSON (finding ids are the contract); implies --report-only
+csec audit --scan-filesystem   # also run the bounded SUID / world-writable sweep (off by default)
+```
+
+The audit runs **inside the resident agent** (`csecd`); the `csec` launcher is a
+thin client. csecd holds Full Disk Access — requested at setup, worth it under the
+"more secure, conveniently" ethos — to enumerate which apps hold privacy (TCC)
+grants, and it drives the signed root helper for the privileged reads and the
+reversible fixes. It runs ~65 checks across platform integrity, Gatekeeper,
+network exposure, privacy grants, persistence, developer attack surface,
+accounts, and csec's own coverage; the on-thesis (★) controls that shrink csec's
+adversary's blast radius lead the report. The full catalog, with a stable id per
+check, is in [`docs/host-audit-catalog.md`](docs/host-audit-catalog.md).
+
+Reporting and remediation are one flow. After the report, csec collects the
+safe, reversible fixes into a **single review under one Touch ID** — a checklist
+you can deselect items from, applied atomically per target. Two more-secure
+states that need a real choice or state transition get **guided interactive
+helpers** instead: FileVault, which keeps the recovery key local and never
+silently escrows it to iCloud, and Santa binary allow-listing, which links to the
+official signed package and describes a MONITOR-mode starting posture (never
+LOCKDOWN). Items that would risk breaking a legitimate setup — revoking a TCC
+grant, removing a config profile or custom root CA — are surfaced with evidence
+and a link, never auto-applied.
+
+Because `csecd` is already resident, it re-audits on a daily timer against an
+accepted baseline at
+`~/Library/Application Support/ConvenientSecurity/host-audit-baseline.json`. It
+stays quiet unless a previously-good control **regresses** (firewall turned off,
+a new app granted Full Disk Access) — a high-signal event that can mean malware
+disabling defenses. On a regression it **notifies only**; it never mutates
+anything in the background, and you re-run `csec audit` to review and re-apply.
+`csec setup` runs the audit (report-only) automatically when onboarding
+completes.
+
+The whole audit is value-free: every finding and evidence string is metadata only
+— counts, kinds, enum state — never a credential value, CA name, path, or command
+output.
+
 ## Installing the real agent
 
 The at-rest cache and native store require the signed, notarized, provisioned

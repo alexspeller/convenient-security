@@ -94,6 +94,7 @@ func usage() -> Never {
                  [--store <store>
                   --import DEST=env:NAME|DEST=dotenv:PATH:NAME]…
                  [--replace-secret] [--no-audit-prompt]
+      csec audit [--report-only] [--json] [--scan-filesystem]
       csec install | uninstall | status
       csec root-status
 
@@ -178,6 +179,8 @@ case "risk":
     runRisk(Array(arguments.dropFirst()))
 case "setup":
     runSetup(Array(arguments.dropFirst()))
+case "audit":
+    runAudit(Array(arguments.dropFirst()))
 case "install":
     runInstall()
 case "uninstall":

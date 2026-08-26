@@ -175,6 +175,14 @@ public final class RootHelperServer: @unchecked Sendable {
                 )
             case .health:
                 partial = RootHelperResponse(requestID: "", state: .prepared)
+            case let .hostRead(_, query):
+                partial = try await coordinator.hostRead(query: query, peer: originalPeer)
+            case let .hostApply(_, change, digest):
+                partial = try await coordinator.hostApply(
+                    change: change,
+                    digest: digest,
+                    peer: originalPeer
+                )
             }
             response = partial.withRequestID(requestID)
         } catch {
@@ -215,8 +223,14 @@ public final class RootHelperServer: @unchecked Sendable {
     }
 
     private static func requiredRole(for request: RootHelperRequest) -> ProductCodeRole {
-        if case .approve = request { return .agent }
-        return .launcher
+        switch request {
+        case .approve, .hostRead, .hostApply:
+            // The audit's privileged reads and reversible applies are driven only
+            // by the resident agent (csecd), never the launcher.
+            return .agent
+        default:
+            return .launcher
+        }
     }
 }
 
@@ -225,7 +239,8 @@ private extension RootHelperRequest {
         switch self {
         case let .prepare(id, _, _), let .approve(id, _, _, _, _),
              let .start(id, _, _), let .status(id, _, _),
-             let .signal(id, _, _, _), let .cancel(id, _, _), let .health(id):
+             let .signal(id, _, _, _), let .cancel(id, _, _), let .health(id),
+             let .hostRead(id, _), let .hostApply(id, _, _):
             return id
         }
     }
@@ -241,7 +256,8 @@ private extension RootHelperResponse {
             childPID: childPID,
             childStartTime: childStartTime,
             waitStatus: waitStatus,
-            failure: failure
+            failure: failure,
+            hostResult: hostResult
         )
     }
 }

@@ -246,6 +246,14 @@ the bundle context.
   biometric ACLs are verified by `packaging/spike`. Hardened runtime is enabled
   via `codesign --options runtime`. Never change the team prefix or group after
   native stores exist—it makes their ciphertext unrecoverable.
+- **Full Disk Access for the privacy audit**: `csec audit` enumerates the
+  SIP-protected TCC databases (privacy grants), which needs `csecd` to hold
+  **Full Disk Access**. FDA is a *user-granted TCC permission*, **not an
+  entitlement** — `csecd.entitlements` is unchanged — but macOS only lets the user
+  grant it to a launchable signed `.app`, so it is granted after install from
+  System Settings → Privacy & Security → Full Disk Access. Without the grant the
+  audit's privacy section degrades to `unknown` + Settings deep-links rather than
+  failing or silently passing.
 - **Signing order** (`build-agent.sh`): sign `csec` (secondary, no entitlements),
   sign standalone `csec-rootd` with identifier
   `com.alexspeller.convenient-security.rootd` and no entitlements, then sign the
@@ -267,6 +275,15 @@ the bundle context.
   signature, requirement, and plist checks. The helper serves the fixed
   `/private/var/run/convenient-security/rootd.sock`, verifies product audit
   tokens on every short connection, and mounts only the fixed bounded tmpfs.
+- **Host-audit privileged ops in `csec-rootd`**: the signed root helper now also
+  serves two additional closed-enum operations for the host posture audit —
+  `hostRead` (value-free privileged reads) and `hostApply` (reversible,
+  digest-bound mutations) — both callable only by the verified agent role. This
+  is a helper-code change, so the root helper must be **re-signed and
+  re-notarized**, but it adds **no new dangerous entitlements** (still no
+  `get-task-allow`, DYLD, JIT, or debugger entitlements), which preserves
+  `StartupSecurityReport.productionReady`. The operations are a fixed allow-list
+  with no generic "run as root," keeping the helper's audited surface minimal.
 - **Socket path**: derived from `confstr(_CS_DARWIN_USER_TEMP_DIR)` (keyed on the
   uid), *not* `$TMPDIR` — so the launchd-spawned `csecd` and a shell-spawned `csec`
   always agree on `…/convenient-security-<uid>/agent.sock` regardless of the

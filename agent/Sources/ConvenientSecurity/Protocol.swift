@@ -355,6 +355,8 @@ public enum Request: Sendable {
     case cancelNativeStoreEdit(CancelNativeStoreEditRequest)
     case risk(RiskOperationRequest)
     case approveProtectedLaunch(ProtectedLaunchApprovalRequest)
+    case hostAudit(HostAuditRequest)
+    case hostRemediate(HostRemediationRequest)
 }
 
 extension Request: Codable {
@@ -365,6 +367,7 @@ extension Request: Codable {
         case store, editSessionID, document, mode, externalEditorPath
         case operation, reference, level
         case protectedLaunchApproval
+        case scanFilesystem, selectedKeys
     }
 
     public init(from decoder: Decoder) throws {
@@ -465,6 +468,17 @@ extension Request: Codable {
                 )
             }
             self = .approveProtectedLaunch(approval)
+        case "host_audit":
+            self = .hostAudit(HostAuditRequest(
+                scanFilesystem: try container.decodeIfPresent(Bool.self, forKey: .scanFilesystem) ?? false,
+                requestUUID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
+        case "host_remediate":
+            self = .hostRemediate(HostRemediationRequest(
+                selectedKeys: try container.decodeIfPresent([String].self, forKey: .selectedKeys) ?? [],
+                scanFilesystem: try container.decodeIfPresent(Bool.self, forKey: .scanFilesystem) ?? false,
+                requestUUID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: container, debugDescription: "unknown request type"
@@ -544,6 +558,17 @@ extension Request: Codable {
             try container.encode(WireProtocol.version, forKey: .version)
             try container.encode(request.requestID, forKey: .requestID)
             try container.encode(request, forKey: .protectedLaunchApproval)
+        case let .hostAudit(request):
+            try container.encode("host_audit", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.scanFilesystem, forKey: .scanFilesystem)
+        case let .hostRemediate(request):
+            try container.encode("host_remediate", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.selectedKeys, forKey: .selectedKeys)
+            try container.encode(request.scanFilesystem, forKey: .scanFilesystem)
         }
     }
 
@@ -582,6 +607,8 @@ public struct Response: Codable, Sendable {
     public let riskInspection: RiskInspection?
     public let protectedLaunchApproved: Bool?
     public let accessExpiresAt: Date?
+    public let hostAuditReport: HostAuditReport?
+    public let hostRemediation: HostRemediationSummary?
     public let failure: ProtocolFailure?
     public let error: String?
 
@@ -604,6 +631,8 @@ public struct Response: Codable, Sendable {
         riskInspection: RiskInspection? = nil,
         protectedLaunchApproved: Bool? = nil,
         accessExpiresAt: Date? = nil,
+        hostAuditReport: HostAuditReport? = nil,
+        hostRemediation: HostRemediationSummary? = nil,
         failure: ProtocolFailure? = nil,
         error: String? = nil
     ) {
@@ -625,6 +654,8 @@ public struct Response: Codable, Sendable {
         self.riskInspection = riskInspection
         self.protectedLaunchApproved = protectedLaunchApproved
         self.accessExpiresAt = accessExpiresAt
+        self.hostAuditReport = hostAuditReport
+        self.hostRemediation = hostRemediation
         self.failure = failure
         self.error = error
     }

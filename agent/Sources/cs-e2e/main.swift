@@ -301,6 +301,10 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
     case let .risk(risk):
         return await agent.handleRiskOperation(request: risk, caller: caller)
+    case let .hostAudit(request):
+        return Response(requestID: request.requestID, hostAuditReport: nil)
+    case let .hostRemediate(request):
+        return await agent.runHostRemediation(request: request, caller: caller)
     case let .approveProtectedLaunch(approval):
         guard approval.validate(caller: caller) else {
             return .failed(

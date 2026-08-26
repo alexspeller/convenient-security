@@ -20,18 +20,42 @@ It does not protect a value from root, from code already executing inside an
 authorized consumer, from a consumer the user deliberately launches, or from a
 user who approves a misleading request.
 
+## Design ethos
+
+Convenient Security optimizes for **"more secure, conveniently"** — not minimal
+privilege for its own sake, and not maximal hardening. Same-user malware is not a
+fully solvable problem; the goal is to block the large majority of *automated,
+opportunistic* supply-chain attacks (trojaned dependencies, postinstall scripts,
+compromised extensions and CLIs going after easy, widespread targets) at a UX
+cost low enough that the tool stays switched on. A control that blocks ~80% of
+real attacks and is left enabled beats a "perfect" one that gets disabled. csec
+will acquire a capability — for example Full Disk Access, to audit which apps
+hold TCC grants — when doing so measurably improves the user's security
+automatically; there is no goal of minimizing csec's own privilege footprint, and
+the threat model is not a bespoke attacker studying csec's internals. Features are
+judged on (security delivered × likelihood the user leaves it on), and the
+preferred shape is a small number of commands that each do as much as possible
+automatically after a single confirmation. The host posture audit built on this
+principle is catalogued in [`docs/host-audit-catalog.md`](docs/host-audit-catalog.md).
+
 ## Components
 
 - **`csecd`** is the resident Swift agent. It authenticates socket peers, obtains
   Touch ID consent, owns the grant table, resolves references through provider
-  adapters, manages the keychain cache, and holds the active-value registry used
-  for output redaction.
+  adapters, manages the keychain cache, holds the active-value registry used
+  for output redaction, and owns the host-posture audit engine (§Host posture
+  audit) — running it under Full Disk Access and driving the root helper for its
+  privileged reads and reversible fixes.
 - **`csec`** is the signed CLI, bridge, launcher, output supervisor, and AI
-  command broker. Its commands are listed by `csec help`.
+  command broker. Its commands are listed by `csec help`; they include `csec
+  setup` (onboarding) and `csec audit`, a thin client that asks `csecd` to run
+  the host posture audit and render its value-free report.
 - **`csec-rootd`** is a separately signed, root-owned LaunchDaemon used only to
-  create bounded tmpfs files and launch/supervise a normal-UID process with a
-  one-time capability GID. Its Swift targets do not link the provider, Keychain,
-  Touch ID, AppKit, ServiceManagement, or agent implementation.
+  create bounded tmpfs files, launch/supervise a normal-UID process with a
+  one-time capability GID, and serve the closed-enum host-audit `hostRead`/
+  `hostApply` operations (§Host posture audit). Its Swift targets do not link the
+  provider, Keychain, Touch ID, AppKit, ServiceManagement, or agent
+  implementation.
 - **`OnePasswordAdapter`** invokes a verified installation of the official
   1Password CLI with an allowlisted environment.
 - **`NativeEncryptedFileProvider`** owns `csec://` parsing, strict JSON,
@@ -391,6 +415,69 @@ managed settings, establish competing-hook semantics, or exhaustively discover
 local/provider/CI state. Each target update is atomic and repeatable, but a run
 covering multiple agent files plus a store is not a cross-target transaction;
 partial completion is reported explicitly.
+
+## Host posture audit
+
+`csec audit` runs a curated, severity-ordered host posture audit of the Mac
+underneath csec — the secrets audit answers "where are my plaintext credentials,"
+and this answers "is the host configured so that same-user malware can't trivially
+win anyway." It evaluates roughly 65 stable-id checks (`HA-<domain><nn>`) across
+platform and kernel integrity, Gatekeeper and malware defenses, network exposure,
+privacy/TCC grants, persistence, developer attack surface, accounts, and csec's
+own coverage. On-thesis (★) controls — the ones that shrink the blast radius of
+csec's same-UID adversary — lead the report. The full catalog is in
+[`docs/host-audit-catalog.md`](docs/host-audit-catalog.md) and the implementation
+in [`docs/host-audit-implementation-plan.md`](docs/host-audit-implementation-plan.md).
+
+The audit engine lives in `csecd`, not the launcher. `csec audit` is a thin
+client: it asks the resident agent to run the value-free audit over the mutually
+authenticated socket and renders the returned `HostAuditReport`. `csecd` holds
+**Full Disk Access** (requested at setup per the "more secure, conveniently"
+ethos) to enumerate the SIP-protected TCC databases for the privacy section, and
+drives the signed root helper for the privileged reads and reversible mutations.
+The launcher's flags are `--report-only` (read-only, no proposal — for CI or an
+AI-agent consumer), `--json` (the report as stable JSON, ids being the contract;
+implies read-only), and `--scan-filesystem` (opt into the bounded HA-F10
+SUID/world-writable sweep, off by default because it is expensive and logs its
+bound so partial coverage never reads as a pass).
+
+Privileged host operations are a **closed allow-list**, not a generic "run this as
+root." Two new `csec-rootd` request cases, `hostRead` and `hostApply`, each carry
+a closed enum (`HostRootRead` / `HostRootChange`) that maps inside the root server
+to exactly one fixed, audited command or syscall. Both require the verified
+**agent** role — only `csecd` may call them — and `hostApply` is **digest-bound**
+to its own value-free change representation, which the helper independently
+recomputes and requires to match before applying, exactly as the existing
+`exec-file` approve path binds to a plan digest. The helper links no provider,
+Keychain, or Touch ID dependency, so this preserves its minimal surface and adds
+no dangerous entitlements.
+
+Reporting and remediation are one flow. After the report, the safe, reversible
+`.auto`/`.autoPrivileged` fixes are collected into a **single batched review under
+one Touch ID** — a deselectable checklist rendered by a sibling of the trusted
+access-review window — and applied atomically per target, each change
+digest-bound; there is no implicit cross-target transaction. Two more-secure
+states that need a real choice or state transition get **guided interactive
+helpers** instead: FileVault (HA-G03), which keeps the recovery key local and
+never silently escrows it to iCloud, and Santa (HA-B08), which links to the
+official signed package and describes a MONITOR-mode starting posture and never
+sets LOCKDOWN. TCC-grant revocation, config-profile and root-CA removal, and
+similar judgment calls are advise-only. `csec setup` runs the audit report-only
+on completion so onboarding always ends with a host posture pass.
+
+Because `csecd` is resident, it also re-audits on a daily dispatch timer against
+an accepted baseline at
+`~/Library/Application Support/ConvenientSecurity/host-audit-baseline.json`. It
+diffs each run and posts a `UNUserNotification` **only on a `pass → fail`
+regression** of a previously-accepted control — a high-signal event that can mean
+malware disabling defenses. It is notify-only: nothing is mutated in the
+background, and the user re-runs `csec audit` to review and re-apply. The baseline
+advances only through that interactive path, so unreviewed drift keeps surfacing.
+
+The whole audit is value-free like the rest of csec: every finding, evidence
+string, log line, and notification is metadata only — counts, kinds, enum state,
+stable check ids — never a credential value, CA name, path, or command output.
+An `X`/`F`-unavailable check reports `unknown`, never a pass.
 
 ## Resolution and cache
 
