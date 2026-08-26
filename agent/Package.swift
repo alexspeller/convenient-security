@@ -64,6 +64,10 @@ let package = Package(
             name: "cs-fake-rootd",
             dependencies: ["CSECRootProtocol", "CSECRootServer"]
         ),
+        // Dev-only screenshot harness: renders the trusted review window with
+        // synthetic value-free reviews and writes a PNG for design iteration.
+        // Auto-approves nothing and resolves nothing; not a production surface.
+        .executableTarget(name: "cs-review-preview", dependencies: ["ConvenientSecurity"]),
         // Synthetic regression fixture: rewrites its original argv area the way
         // modern Ruby process-title support does, with no real environment.
         .executableTarget(name: "cs-process-title-fixture"),

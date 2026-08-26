@@ -20,6 +20,10 @@
       case finished
     }
 
+    private static let contentWidth: CGFloat = 640
+    private static let horizontalMargin: CGFloat = 28
+    private static var innerWidth: CGFloat { contentWidth - horizontalMargin * 2 }
+
     private let review: AccessPolicyReview
     private let context: LAContext
     private var state = State.ready
@@ -86,10 +90,11 @@
       }
     }
 
+    // MARK: - Window construction
+
     private func configureWindow() {
-      let contentWidth: CGFloat = 760
       window = NSPanel(
-        contentRect: NSRect(x: 0, y: 0, width: contentWidth, height: 820),
+        contentRect: NSRect(x: 0, y: 0, width: Self.contentWidth, height: 400),
         styleMask: [.titled, .closable],
         backing: .buffered,
         defer: false
@@ -111,14 +116,482 @@
       root.translatesAutoresizingMaskIntoConstraints = false
       contentView.addSubview(root)
 
-      let header = makeHeader()
-      let summary = NSTextField(wrappingLabelWithString: Self.summary(review))
-      summary.font = .systemFont(ofSize: 13)
-      summary.textColor = .labelColor
-      summary.maximumNumberOfLines = 12
-      summary.preferredMaxLayoutWidth = contentWidth - 48
+      root.addArrangedSubview(makeHeader())
 
-      let credentials = makeCredentialList(width: contentWidth - 48)
+      if let warning = DeliveryReviewCopy.warning(for: review) {
+        let tint: NSColor =
+          review.plan.recipientAssurance == .ordinaryPersistentFile ? .systemRed : .systemOrange
+        root.addArrangedSubview(
+          Self.makeBanner(text: warning, tint: tint, width: Self.innerWidth))
+      }
+
+      root.addArrangedSubview(Self.makeSectionLabel("Credentials to be released"))
+      root.setCustomSpacing(6, after: root.arrangedSubviews.last!)
+      let credentialCards = makeCredentialCards(width: Self.innerWidth)
+      root.addArrangedSubview(credentialCards)
+
+      root.addArrangedSubview(Self.makeSectionLabel("Request"))
+      root.setCustomSpacing(6, after: root.arrangedSubviews.last!)
+      root.addArrangedSubview(makeDetailsGrid())
+
+      let footnote = NSTextField(
+        wrappingLabelWithString:
+          "Risk classification describes the credential itself; a weaker compatibility "
+          + "delivery is accepted separately. No secret values are shown in this window."
+      )
+      footnote.font = .systemFont(ofSize: 11)
+      footnote.textColor = .tertiaryLabelColor
+      footnote.maximumNumberOfLines = 3
+      footnote.preferredMaxLayoutWidth = Self.innerWidth
+      root.addArrangedSubview(footnote)
+
+      let separator = NSBox()
+      separator.boxType = .separator
+      root.addArrangedSubview(separator)
+
+      root.addArrangedSubview(makeAuthenticationArea())
+      root.addArrangedSubview(makeFooter())
+
+      NSLayoutConstraint.activate([
+        root.leadingAnchor.constraint(
+          equalTo: contentView.leadingAnchor, constant: Self.horizontalMargin),
+        root.trailingAnchor.constraint(
+          equalTo: contentView.trailingAnchor, constant: -Self.horizontalMargin),
+        root.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 22),
+        root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -18),
+        root.widthAnchor.constraint(equalToConstant: Self.innerWidth),
+        credentialCards.widthAnchor.constraint(equalTo: root.widthAnchor),
+        separator.widthAnchor.constraint(equalTo: root.widthAnchor),
+      ])
+
+      contentView.layoutSubtreeIfNeeded()
+      window.setContentSize(contentView.fittingSize)
+    }
+
+    private func makeHeader() -> NSView {
+      let icon = NSImageView()
+      icon.image = NSImage(
+        systemSymbolName: "lock.shield.fill",
+        accessibilityDescription: "Convenient Security"
+      )
+      icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 30, weight: .medium)
+        .applying(.init(hierarchicalColor: .controlAccentColor))
+      icon.setContentHuggingPriority(.required, for: .horizontal)
+      NSLayoutConstraint.activate([
+        icon.widthAnchor.constraint(equalToConstant: 44),
+        icon.heightAnchor.constraint(equalToConstant: 44),
+      ])
+
+      let title = NSTextField(labelWithString: "Secret Access Requested")
+      title.font = .systemFont(ofSize: 19, weight: .semibold)
+
+      let purpose = NSTextField(
+        wrappingLabelWithString: "“\(Self.safe(review.reason))”")
+      purpose.font = .systemFont(ofSize: 13)
+      purpose.textColor = .labelColor
+      purpose.maximumNumberOfLines = 3
+      purpose.preferredMaxLayoutWidth = Self.innerWidth - 58
+
+      let labels = NSStackView(views: [title, purpose])
+      labels.orientation = .vertical
+      labels.alignment = .leading
+      labels.spacing = 3
+
+      let header = NSStackView(views: [icon, labels])
+      header.orientation = .horizontal
+      header.alignment = .centerY
+      header.spacing = 14
+      return header
+    }
+
+    private static func makeSectionLabel(_ text: String) -> NSTextField {
+      let label = NSTextField(labelWithString: text.uppercased())
+      label.font = .systemFont(ofSize: 11, weight: .semibold)
+      label.textColor = .secondaryLabelColor
+      return label
+    }
+
+    private static func makeBanner(text: String, tint: NSColor, width: CGFloat) -> NSView {
+      let icon = NSImageView()
+      icon.image = NSImage(
+        systemSymbolName: "exclamationmark.triangle.fill",
+        accessibilityDescription: "Warning"
+      )
+      icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+      icon.contentTintColor = tint
+      icon.setContentHuggingPriority(.required, for: .horizontal)
+      icon.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+      let label = NSTextField(wrappingLabelWithString: text)
+      label.font = .systemFont(ofSize: 12, weight: .semibold)
+      label.textColor = tint
+      label.maximumNumberOfLines = 14
+      label.preferredMaxLayoutWidth = width - 60
+
+      let content = NSStackView(views: [icon, label])
+      content.orientation = .horizontal
+      content.alignment = .top
+      content.spacing = 10
+
+      return Self.card(
+        wrapping: content,
+        fill: tint.withAlphaComponent(0.09),
+        border: tint.withAlphaComponent(0.35),
+        width: width
+      )
+    }
+
+    /// A rounded, filled container that pads `content`. NSBox is used because
+    /// its fill/border colors stay appearance-aware, unlike raw layer colors.
+    private static func paddedBox(
+      content: NSView,
+      cornerRadius: CGFloat,
+      fill: NSColor,
+      border: NSColor?,
+      horizontalPadding: CGFloat,
+      verticalPadding: CGFloat,
+      width: CGFloat? = nil
+    ) -> NSView {
+      let box = NSBox()
+      box.boxType = .custom
+      box.titlePosition = .noTitle
+      box.cornerRadius = cornerRadius
+      box.fillColor = fill
+      box.borderColor = border ?? .clear
+      box.borderWidth = border == nil ? 0 : 1
+      box.contentViewMargins = .zero
+      box.translatesAutoresizingMaskIntoConstraints = false
+
+      let host: NSView
+      if let existing = box.contentView {
+        host = existing
+      } else {
+        host = NSView()
+        box.contentView = host
+      }
+      content.translatesAutoresizingMaskIntoConstraints = false
+      host.addSubview(content)
+      NSLayoutConstraint.activate([
+        content.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: horizontalPadding),
+        content.trailingAnchor.constraint(
+          equalTo: host.trailingAnchor, constant: -horizontalPadding),
+        content.topAnchor.constraint(equalTo: host.topAnchor, constant: verticalPadding),
+        content.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -verticalPadding),
+      ])
+      if let width {
+        box.widthAnchor.constraint(equalToConstant: width).isActive = true
+      }
+      return box
+    }
+
+    private static func card(
+      wrapping content: NSView,
+      fill: NSColor,
+      border: NSColor,
+      width: CGFloat?
+    ) -> NSView {
+      paddedBox(
+        content: content,
+        cornerRadius: 9,
+        fill: fill,
+        border: border,
+        horizontalPadding: 12,
+        verticalPadding: 10,
+        width: width
+      )
+    }
+
+    private static func badge(_ text: String, tint: NSColor) -> NSView {
+      let label = NSTextField(labelWithString: text.uppercased())
+      label.font = .systemFont(ofSize: 10, weight: .bold)
+      label.textColor = tint
+      let box = paddedBox(
+        content: label,
+        cornerRadius: 8.5,
+        fill: tint.withAlphaComponent(0.14),
+        border: nil,
+        horizontalPadding: 8,
+        verticalPadding: 2.5
+      )
+      box.setContentHuggingPriority(.required, for: .horizontal)
+      box.setContentCompressionResistancePriority(.required, for: .horizontal)
+      return box
+    }
+
+    private static func riskTint(_ level: RiskLevel) -> NSColor {
+      switch level {
+      case .low: return .systemGreen
+      case .standard: return .systemBlue
+      case .high, .unknown: return .systemOrange
+      case .critical: return .systemRed
+      }
+    }
+
+    private static func assuranceTint(_ assurance: ConsumerAssurance) -> NSColor {
+      switch assurance {
+      case .verifiedProduct, .independentlyProtected: return .systemGreen
+      case .sealed: return .systemBlue
+      case .userWritable, .unverified: return .systemOrange
+      }
+    }
+
+    // MARK: - Credentials
+
+    private func makeCredentialCards(width: CGFloat) -> NSView {
+      let cards = NSStackView()
+      cards.orientation = .vertical
+      cards.alignment = .leading
+      cards.spacing = 10
+      cards.translatesAutoresizingMaskIntoConstraints = false
+
+      for credential in review.credentials {
+        let card = makeCredentialCard(credential, width: width)
+        cards.addArrangedSubview(card)
+      }
+
+      cards.layoutSubtreeIfNeeded()
+      let maximumHeight: CGFloat = 340
+      guard cards.fittingSize.height > maximumHeight else { return cards }
+
+      let scroll = NSScrollView()
+      scroll.hasVerticalScroller = true
+      scroll.autohidesScrollers = true
+      scroll.borderType = .noBorder
+      scroll.drawsBackground = false
+      scroll.documentView = cards
+      scroll.heightAnchor.constraint(equalToConstant: maximumHeight).isActive = true
+      NSLayoutConstraint.activate([
+        cards.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+        cards.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+        cards.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+        cards.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+      ])
+      return scroll
+    }
+
+    private func makeCredentialCard(
+      _ credential: PolicyReviewCredential, width: CGFloat
+    ) -> NSView {
+      let innerWidth = width - 24
+      let stack = NSStackView()
+      stack.orientation = .vertical
+      stack.alignment = .leading
+      stack.spacing = 7
+
+      let group = ReviewDisplay.referenceGroup(for: credential.references)
+
+      let keyIcon = NSImageView()
+      keyIcon.image = NSImage(systemSymbolName: "key.fill", accessibilityDescription: nil)
+      keyIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+      keyIcon.contentTintColor = .secondaryLabelColor
+      keyIcon.setContentHuggingPriority(.required, for: .horizontal)
+
+      let titleText = group.title ?? "Requested references"
+      let title = NSTextField(labelWithString: titleText)
+      title.font = .systemFont(ofSize: 14, weight: .semibold)
+      title.lineBreakMode = .byTruncatingTail
+
+      let spacer = NSView()
+      spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+      let headerRow = NSStackView(views: [keyIcon, title, spacer])
+      headerRow.orientation = .horizontal
+      headerRow.alignment = .centerY
+      headerRow.spacing = 7
+      if credential.storedLevel != .unknown {
+        headerRow.addArrangedSubview(
+          Self.badge(
+            "\(ReviewDisplay.riskLabel(credential.storedLevel)) risk",
+            tint: Self.riskTint(credential.storedLevel)
+          ))
+      }
+      stack.addArrangedSubview(headerRow)
+      headerRow.widthAnchor.constraint(equalToConstant: innerWidth).isActive = true
+
+      if let subtitle = group.subtitle {
+        let subtitleLabel = NSTextField(labelWithString: subtitle)
+        subtitleLabel.font = .systemFont(ofSize: 12)
+        subtitleLabel.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(subtitleLabel)
+      }
+
+      if !group.fields.isEmpty {
+        let pills = NSStackView()
+        pills.orientation = .horizontal
+        pills.spacing = 6
+        let joined = group.fields.joined(separator: " ").count
+        if joined <= 64 {
+          for field in group.fields {
+            pills.addArrangedSubview(Self.fieldPill(field))
+          }
+          stack.addArrangedSubview(pills)
+        } else {
+          for field in group.fields {
+            let row = NSTextField(labelWithString: field)
+            row.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            stack.addArrangedSubview(row)
+          }
+        }
+      }
+
+      for uri in group.rawReferences {
+        let row = NSTextField(wrappingLabelWithString: uri)
+        row.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        row.maximumNumberOfLines = 3
+        row.preferredMaxLayoutWidth = innerWidth
+        stack.addArrangedSubview(row)
+      }
+
+      if credential.storedLevel == .unknown {
+        let prompt = NSTextField(labelWithString: "Classify this credential’s risk:")
+        prompt.font = .systemFont(ofSize: 13)
+        let selector = NSPopUpButton()
+        selector.addItems(withTitles: ["Low", "Standard", "High", "Critical"])
+        selector.selectItem(withTitle: "Standard")
+        let row = NSStackView(views: [prompt, selector])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        stack.addArrangedSubview(row)
+        selectors[credential.identity.credentialKey] = selector
+        policyControls.append(selector)
+      }
+
+      if credential.scopeExpanded {
+        let scope = NSTextField(
+          wrappingLabelWithString:
+            "This request adds fields to the stored credential scope.")
+        scope.font = .systemFont(ofSize: 12, weight: .semibold)
+        scope.textColor = .systemOrange
+        scope.preferredMaxLayoutWidth = innerWidth
+        stack.addArrangedSubview(scope)
+      }
+
+      if credential.compatibilityReviewOffered {
+        let checkbox = NSButton(
+          checkboxWithTitle: DeliveryReviewCopy.compatibilityAcceptanceLabel(
+            for: review.plan,
+            storedLevel: credential.storedLevel
+          ),
+          target: nil,
+          action: nil
+        )
+        checkbox.font = .systemFont(ofSize: 13)
+        checkbox.state = credential.compatibilityAccepted ? .on : .off
+        checkbox.isEnabled = !credential.compatibilityAccepted
+        stack.addArrangedSubview(checkbox)
+        acceptanceButtons[credential.identity.credentialKey] = checkbox
+        policyControls.append(checkbox)
+      }
+
+      return Self.card(
+        wrapping: stack,
+        fill: NSColor.labelColor.withAlphaComponent(0.045),
+        border: NSColor.separatorColor,
+        width: width
+      )
+    }
+
+    private static func fieldPill(_ text: String) -> NSView {
+      let label = NSTextField(labelWithString: text)
+      label.font = .monospacedSystemFont(ofSize: 11.5, weight: .medium)
+      label.textColor = .labelColor
+      return paddedBox(
+        content: label,
+        cornerRadius: 5,
+        fill: NSColor.labelColor.withAlphaComponent(0.07),
+        border: nil,
+        horizontalPadding: 7,
+        verticalPadding: 3
+      )
+    }
+
+    // MARK: - Request details
+
+    private func makeDetailsGrid() -> NSView {
+      let plan = review.plan
+      let executableName = URL(fileURLWithPath: plan.executable.canonicalPath).lastPathComponent
+
+      let emitterText = NSMutableAttributedString(
+        string: Self.safe(executableName),
+        attributes: [
+          .font: NSFont.systemFont(ofSize: 13),
+          .foregroundColor: NSColor.labelColor,
+        ]
+      )
+      emitterText.append(
+        NSAttributedString(
+          string: "  \(ReviewDisplay.assurance(plan.executable.assurance).uppercased())",
+          attributes: [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .bold),
+            .foregroundColor: Self.assuranceTint(plan.executable.assurance),
+          ]
+        ))
+      let emitterValue = NSTextField(labelWithAttributedString: emitterText)
+      emitterValue.lineBreakMode = .byTruncatingTail
+      emitterValue.toolTip = Self.safe(plan.executable.canonicalPath)
+
+      let rows: [(String, NSView)] = [
+        ("Requested by", Self.gridValue(Self.safe(review.caller.description))),
+        ("Emitted by", emitterValue),
+        ("Delivered to", Self.gridValue(DeliveryReviewCopy.recipientDescription(for: plan))),
+        (
+          "Delivery",
+          Self.gridValue(
+            "\(ReviewDisplay.mechanism(plan.mechanism)) · \(ReviewDisplay.scope(plan.descendantScope))"
+          )
+        ),
+        ("Grant root", Self.gridValue(ReviewDisplay.root(plan.root))),
+        ("Destination", Self.gridValue(ReviewDisplay.destination(plan.destination))),
+        (
+          "Requested duration",
+          Self.gridValue(ReviewDisplay.duration(seconds: plan.requestedTTLSeconds))
+        ),
+      ]
+
+      let grid = NSGridView(
+        views: rows.map { [Self.gridLabel($0.0), $0.1] })
+      grid.columnSpacing = 14
+      grid.rowSpacing = 6
+      grid.rowAlignment = .none
+      grid.column(at: 0).xPlacement = .trailing
+      grid.translatesAutoresizingMaskIntoConstraints = false
+      return grid
+    }
+
+    private static func gridLabel(_ text: String) -> NSTextField {
+      let label = NSTextField(labelWithString: text)
+      label.font = .systemFont(ofSize: 13)
+      label.textColor = .secondaryLabelColor
+      return label
+    }
+
+    /// Values render on one line when they fit and wrap (never truncate) when
+    /// they do not: this is the authoritative display, and an over-long
+    /// attacker-influenced string must not push its verification tags out of
+    /// view. A one-line label is measured explicitly because a wrapping label
+    /// inside NSGridView reserves wrapped height even for short text.
+    private static func gridValue(_ text: String) -> NSTextField {
+      let font = NSFont.systemFont(ofSize: 13)
+      let availableWidth = innerWidth - 124
+      let measured = (text as NSString).size(withAttributes: [.font: font]).width
+      if measured <= availableWidth {
+        let label = NSTextField(labelWithString: text)
+        label.font = font
+        label.textColor = .labelColor
+        return label
+      }
+      let label = NSTextField(wrappingLabelWithString: text)
+      label.font = font
+      label.textColor = .labelColor
+      label.maximumNumberOfLines = 4
+      label.preferredMaxLayoutWidth = availableWidth
+      return label
+    }
+
+    // MARK: - Authentication area and footer
+
+    private func makeAuthenticationArea() -> NSView {
       authenticationView = LAAuthenticationView(context: context, controlSize: .large)
       authenticationView.setContentHuggingPriority(.required, for: .horizontal)
       authenticationView.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -130,158 +603,16 @@
       )
       statusLabel.font = .systemFont(ofSize: 12)
       statusLabel.textColor = biometricsAvailable ? .secondaryLabelColor : .systemRed
+      statusLabel.alignment = .center
       statusLabel.maximumNumberOfLines = 3
-      statusLabel.preferredMaxLayoutWidth = 440
+      statusLabel.preferredMaxLayoutWidth = Self.innerWidth - 80
 
-      let authenticationRow = NSStackView()
-      authenticationRow.orientation = .horizontal
-      authenticationRow.alignment = .centerY
-      authenticationRow.spacing = 14
-      authenticationRow.addArrangedSubview(authenticationView)
-      authenticationRow.addArrangedSubview(statusLabel)
-
-      let footer = makeFooter()
-      var arrangedViews: [NSView] = [header, summary]
-      if let warning = DeliveryReviewCopy.warning(for: review) {
-        let warningLabel = NSTextField(wrappingLabelWithString: warning)
-        warningLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        warningLabel.textColor = review.plan.recipientAssurance == .ordinaryPersistentFile
-          ? .systemRed : .systemOrange
-        warningLabel.maximumNumberOfLines = 8
-        warningLabel.preferredMaxLayoutWidth = contentWidth - 48
-        arrangedViews.append(warningLabel)
-      }
-      arrangedViews.append(contentsOf: [credentials, authenticationRow, footer])
-      for view in arrangedViews {
-        root.addArrangedSubview(view)
-      }
-
-      NSLayoutConstraint.activate([
-        root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
-        root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
-        root.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 24),
-        root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -20),
-        credentials.widthAnchor.constraint(equalTo: root.widthAnchor),
-        authenticationRow.widthAnchor.constraint(equalTo: root.widthAnchor),
-        footer.widthAnchor.constraint(equalTo: root.widthAnchor),
-      ])
-    }
-
-    private func makeHeader() -> NSView {
-      let icon = NSImageView(image: NSApplication.shared.applicationIconImage)
-      icon.imageScaling = .scaleProportionallyUpOrDown
-      NSLayoutConstraint.activate([
-        icon.widthAnchor.constraint(equalToConstant: 56),
-        icon.heightAnchor.constraint(equalToConstant: 56),
-      ])
-
-      let title = NSTextField(labelWithString: "Convenient Security Access Requested")
-      title.font = .systemFont(ofSize: 22, weight: .semibold)
-      let subtitle = NSTextField(
-        wrappingLabelWithString:
-          "Review exactly what will be released. Touch ID is active as soon as this window appears."
-      )
-      subtitle.font = .systemFont(ofSize: 13)
-      subtitle.textColor = .secondaryLabelColor
-      subtitle.maximumNumberOfLines = 2
-
-      let labels = NSStackView(views: [title, subtitle])
-      labels.orientation = .vertical
-      labels.alignment = .leading
-      labels.spacing = 4
-
-      let header = NSStackView(views: [icon, labels])
-      header.orientation = .horizontal
-      header.alignment = .centerY
-      header.spacing = 14
-      return header
-    }
-
-    private func makeCredentialList(width: CGFloat) -> NSScrollView {
-      let stack = NSStackView()
-      stack.orientation = .vertical
-      stack.alignment = .leading
-      stack.spacing = 10
-      stack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
-      stack.translatesAutoresizingMaskIntoConstraints = false
-
-      for (index, credential) in review.credentials.enumerated() {
-        let references = credential.references.map { "• \($0.safeInlineURI)" }
-          .joined(separator: "\n")
-        let label = NSTextField(wrappingLabelWithString: references)
-        label.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        label.maximumNumberOfLines = 8
-        label.preferredMaxLayoutWidth = width - 48
-        stack.addArrangedSubview(label)
-
-        if credential.storedLevel == .unknown {
-          let row = NSStackView()
-          row.orientation = .horizontal
-          row.spacing = 8
-          row.addArrangedSubview(NSTextField(labelWithString: "Risk level:"))
-          let selector = NSPopUpButton()
-          selector.addItems(withTitles: ["Low", "Standard", "High", "Critical"])
-          selector.selectItem(withTitle: "Standard")
-          row.addArrangedSubview(selector)
-          stack.addArrangedSubview(row)
-          selectors[credential.identity.credentialKey] = selector
-          policyControls.append(selector)
-        } else {
-          let status = NSTextField(
-            labelWithString: "Risk: \(credential.storedLevel.rawValue)"
-          )
-          status.font = .systemFont(ofSize: 12, weight: .semibold)
-          stack.addArrangedSubview(status)
-        }
-
-        if credential.scopeExpanded {
-          let scope = NSTextField(
-            wrappingLabelWithString:
-              "This request adds fields to the stored credential scope."
-          )
-          scope.textColor = .systemOrange
-          stack.addArrangedSubview(scope)
-        }
-
-        if credential.compatibilityReviewOffered {
-          let checkbox = NSButton(
-            checkboxWithTitle: DeliveryReviewCopy.compatibilityAcceptanceLabel(
-              for: review.plan,
-              storedLevel: credential.storedLevel
-            ),
-            target: nil,
-            action: nil
-          )
-          checkbox.state = credential.compatibilityAccepted ? .on : .off
-          checkbox.isEnabled = !credential.compatibilityAccepted
-          stack.addArrangedSubview(checkbox)
-          acceptanceButtons[credential.identity.credentialKey] = checkbox
-          policyControls.append(checkbox)
-        }
-
-        if index < review.credentials.count - 1 {
-          let separator = NSBox()
-          separator.boxType = .separator
-          stack.addArrangedSubview(separator)
-          separator.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive =
-            true
-        }
-      }
-
-      let scroll = NSScrollView()
-      scroll.hasVerticalScroller = true
-      scroll.autohidesScrollers = true
-      scroll.borderType = .bezelBorder
-      scroll.documentView = stack
-      scroll.heightAnchor.constraint(equalToConstant: 280).isActive = true
-      NSLayoutConstraint.activate([
-        stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-        stack.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
-        stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
-        stack.bottomAnchor.constraint(equalTo: scroll.contentView.bottomAnchor),
-        stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-      ])
-      return scroll
+      let area = NSStackView(views: [authenticationView, statusLabel])
+      area.orientation = .vertical
+      area.alignment = .centerX
+      area.spacing = 8
+      area.widthAnchor.constraint(equalToConstant: Self.innerWidth).isActive = true
+      return area
     }
 
     private func makeFooter() -> NSView {
@@ -291,13 +622,17 @@
 
       denyButton = NSButton(title: "Deny", target: self, action: #selector(denyPressed(_:)))
       denyButton.keyEquivalent = "\u{1b}"
+      denyButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 84).isActive = true
 
       let footer = NSStackView(views: [spacer, denyButton])
       footer.orientation = .horizontal
       footer.alignment = .centerY
       footer.spacing = 10
+      footer.widthAnchor.constraint(equalToConstant: Self.innerWidth).isActive = true
       return footer
     }
+
+    // MARK: - Selection and authentication flow
 
     private func collectPolicySelection() async -> AccessPolicyReviewOutcome {
       guard state == .ready else { return .denied }
@@ -424,22 +759,6 @@
       finishDenied(closeWindow: false)
     }
 
-    private static func summary(_ review: AccessPolicyReview) -> String {
-      let executable = URL(fileURLWithPath: review.plan.executable.canonicalPath).lastPathComponent
-      return """
-        Requester / grant owner: \(safe(review.caller.description))
-        Emitter: \(safe(executable)) (\(review.plan.executable.assurance.rawValue))
-        Recipient: \(safe(DeliveryReviewCopy.recipientDescription(for: review.plan)))
-        Delivery: \(review.plan.mechanism.rawValue), \(review.plan.descendantScope.rawValue)
-        Grant root: \(rootDescription(review.plan.root))
-        Destination: \(review.plan.destination.rawValue)
-        Requested duration: \(BiometricConsent.formatDuration(TimeInterval(review.plan.requestedTTLSeconds)))
-        Purpose: \(safe(review.reason))
-
-        Classification describes the credential itself. Compatibility delivery is accepted separately. No secret values are shown in this window.
-        """
-    }
-
     private static func initialAuthenticationReason(_ review: AccessPolicyReview) -> String {
       let plan = review.plan
       let policySummary =
@@ -455,29 +774,8 @@
       )
     }
 
-    private static func rootDescription(_ root: DeliveryRoot) -> String {
-      switch root {
-      case .caller: return "requesting launcher"
-      case .directParent: return "verified direct parent"
-      case .registeredSession: return "registered kernel-verified session"
-      }
-    }
-
     private static func safe(_ value: String) -> String {
-      let bidiControls: Set<UInt32> = [
-        0x061c, 0x200e, 0x200f,
-        0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
-        0x2066, 0x2067, 0x2068, 0x2069,
-      ]
-      return value.unicodeScalars.map { scalar in
-        if CharacterSet.controlCharacters.contains(scalar)
-          || CharacterSet.newlines.contains(scalar)
-          || bidiControls.contains(scalar.value)
-        {
-          return "�"
-        }
-        return String(scalar)
-      }.joined()
+      ReviewDisplay.sanitized(value)
     }
   }
 #endif

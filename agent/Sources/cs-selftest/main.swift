@@ -1571,6 +1571,69 @@ check(DeliveryReviewCopy.recipientDescription(for: shellPipePlan)
       && pipeWarning.contains("generic Unix pipelines do not reveal or authenticate"),
       "pipe review distinguishes the shell grant owner, csec emitter, and unverified reader")
 
+print("\n# ReviewDisplay (trusted-window presentation copy)")
+
+let groupedOp = ReviewDisplay.referenceGroup(for: [
+    try! SecretRef("op://Employee/Dexory Slack User Token/password"),
+    try! SecretRef("op://Employee/Dexory Slack User Token/web token"),
+])
+check(groupedOp.title == "Dexory Slack User Token"
+      && groupedOp.subtitle == "1Password · vault “Employee”"
+      && groupedOp.fields == ["password", "web token"]
+      && groupedOp.rawReferences.isEmpty,
+      "same-item 1Password references group into item, vault, and field list")
+
+let mixedVaults = ReviewDisplay.referenceGroup(for: [
+    try! SecretRef("op://Employee/Item A/password"),
+    try! SecretRef("op://Infrastructure/Item B/password"),
+])
+check(mixedVaults.title == nil
+      && mixedVaults.rawReferences == [
+          "op://Employee/Item A/password",
+          "op://Infrastructure/Item B/password",
+      ],
+      "cross-item 1Password references fall back to complete canonical URIs")
+
+let sectionedOp = ReviewDisplay.referenceGroup(for: [
+    try! SecretRef("op://Employee/Item/section/field")
+])
+check(sectionedOp.title == nil
+      && sectionedOp.rawReferences == ["op://Employee/Item/section/field"],
+      "sectioned 1Password references are shown as complete URIs, never partially grouped")
+
+let mixedSchemes = ReviewDisplay.referenceGroup(for: [
+    try! SecretRef("op://Employee/Item/field"),
+    try! SecretRef("csec://dev/DATABASE_URL"),
+])
+check(mixedSchemes.title == nil && mixedSchemes.rawReferences.count == 2,
+      "mixed-provider references fall back to complete canonical URIs")
+
+let nativeGroup = ReviewDisplay.referenceGroup(for: [
+    try! SecretRef("csec://dexory-dev/DATABASE_URL"),
+    try! SecretRef("csec://dexory-dev/*"),
+])
+check(nativeGroup.title == "dexory-dev"
+      && nativeGroup.subtitle == "Native encrypted store"
+      && nativeGroup.fields == ["DATABASE_URL", "all keys (edit access)"],
+      "native-store references group by store and label edit access")
+
+let bidiGroup = ReviewDisplay.referenceGroup(for: [
+    try! SecretRef("op://Emp\u{202e}loyee/Item/fie\u{0007}ld")
+])
+check(bidiGroup.title == "Item"
+      && bidiGroup.subtitle?.contains("\u{202e}") == false
+      && bidiGroup.fields == ["fie�ld"],
+      "grouped reference components neutralize bidi and control characters")
+check(ReviewDisplay.sanitized("a\u{202e}b\nc") == "a�b�c",
+      "sanitized neutralizes bidi overrides and newlines")
+
+check(ReviewDisplay.duration(seconds: 45) == "45 seconds"
+      && ReviewDisplay.duration(seconds: 300) == "5 minutes"
+      && ReviewDisplay.duration(seconds: 3600) == "1 hour"
+      && ReviewDisplay.duration(seconds: 5400) == "1 hour 30 minutes"
+      && ReviewDisplay.duration(seconds: 90) == "1 minute 30 seconds",
+      "requested durations render in plain units")
+
 let aiSubtreePlan = DeliveryPlan(
     mechanism: .directHeap,
     executable: baseExecutable,
