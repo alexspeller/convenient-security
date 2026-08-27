@@ -163,6 +163,26 @@ public struct AgentClient {
         return NativeStoreEditCommit(generation: generation, secretCount: secretCount)
     }
 
+    /// Import whole-file values into the file/blob tier of the session's store,
+    /// committed against an already-authorized edit session (one consent covers
+    /// the batch). Returns the new blob-tier generation and the number imported.
+    public func commitNativeStoreBlobs(
+        sessionID: String,
+        blobs: [ProtectedBlobImport]
+    ) throws -> NativeStoreEditCommit {
+        let request = CommitNativeStoreBlobsRequest(editSessionID: sessionID, blobs: blobs)
+        let response = try send(.commitNativeStoreBlobs(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let generation = response.generation,
+              generation > 0,
+              let secretCount = response.secretCount,
+              secretCount >= 0,
+              secretCount == blobs.count else {
+            throw ClientError.transportFailed
+        }
+        return NativeStoreEditCommit(generation: generation, secretCount: secretCount)
+    }
+
     public func cancelNativeStoreEdit(sessionID: String) {
         let request = CancelNativeStoreEditRequest(editSessionID: sessionID)
         _ = try? send(.cancelNativeStoreEdit(request))

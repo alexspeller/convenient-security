@@ -173,6 +173,8 @@ func startAgentServer() async {
       return await agent.beginNativeStoreEdit(request: begin, caller: caller)
     case .commitNativeStoreEdit(let commit):
       return await agent.commitNativeStoreEdit(request: commit, caller: caller)
+    case .commitNativeStoreBlobs(let commit):
+      return await agent.commitNativeStoreBlobs(request: commit, caller: caller)
     case .cancelNativeStoreEdit(let cancel):
       return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
     case .risk(let risk):

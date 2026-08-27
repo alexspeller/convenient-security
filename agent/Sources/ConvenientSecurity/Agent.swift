@@ -60,6 +60,11 @@ public actor Agent {
     private static let maximumRedactionSessions = 32
     private static let redactionSessionIdleSeconds: TimeInterval = 5 * 60
     private static let maximumRegisteredSessions = 64
+    // Whole-file import batch bounds. A single csec exec/import call carries the
+    // files' bytes over the socket; hundreds of small dotenv files or a handful
+    // of large ones fit, and larger sets are imported in successive batches.
+    private static let maximumImportBlobs = 256
+    private static let maximumImportTotalBytes = 16 * 1024 * 1024
 
     private let resolver: SecretResolver
     private let grants: GrantTable
@@ -1416,6 +1421,94 @@ public actor Agent {
             let result = try await nativeStore.commitEdit(
                 sessionID: request.editSessionID,
                 document: request.document,
+                callerPID: caller.pid,
+                callerStartTime: caller.startTime
+            )
+            nativeEditAuthorizations[request.editSessionID] = nil
+            return Response(
+                requestID: request.requestID,
+                generation: result.generation,
+                secretCount: result.secretCount
+            )
+        } catch {
+            return nativeStoreFailure(error, requestID: request.requestID)
+        }
+    }
+
+    public func commitNativeStoreBlobs(
+        request: CommitNativeStoreBlobsRequest,
+        caller: CallerInfo
+    ) async -> Response {
+        guard UUID(uuidString: request.requestID) != nil,
+              UUID(uuidString: request.editSessionID) != nil,
+              !request.blobs.isEmpty,
+              request.blobs.count <= Self.maximumImportBlobs,
+              caller.startTime > 0,
+              isVerifiedLauncher(caller),
+              let nativeStore,
+              let authorization = nativeEditAuthorizations[request.editSessionID],
+              authorization.callerPID == caller.pid,
+              authorization.callerStartTime == caller.startTime else {
+            return .failed(
+                .invalidRequest,
+                message: "the native-store blob import request is invalid",
+                requestID: request.requestID
+            )
+        }
+        var totalBytes = 0
+        var keys = Set<String>()
+        for blob in request.blobs {
+            totalBytes += blob.data.count
+            guard keys.insert(blob.key).inserted else {
+                return .failed(
+                    .invalidRequest,
+                    message: "the blob import batch contains a duplicate key",
+                    requestID: request.requestID
+                )
+            }
+        }
+        guard totalBytes <= Self.maximumImportTotalBytes else {
+            return .failed(
+                .invalidRequest,
+                message: "the blob import batch exceeds the per-request size limit",
+                requestID: request.requestID
+            )
+        }
+        do {
+            guard Date() < authorization.expiresAt,
+                  try await nativeEditPolicyIsCurrent(authorization) else {
+                await nativeStore.cancelEdit(
+                    sessionID: request.editSessionID,
+                    callerPID: caller.pid,
+                    callerStartTime: caller.startTime
+                )
+                nativeEditAuthorizations[request.editSessionID] = nil
+                return .failed(
+                    .policyDenied,
+                    message: "native-store edit authorization changed or expired",
+                    requestID: request.requestID
+                )
+            }
+        } catch {
+            await nativeStore.cancelEdit(
+                sessionID: request.editSessionID,
+                callerPID: caller.pid,
+                callerStartTime: caller.startTime
+            )
+            nativeEditAuthorizations[request.editSessionID] = nil
+            return .failed(
+                .internalError,
+                message: "native-store risk metadata is unavailable; import cancelled",
+                requestID: request.requestID
+            )
+        }
+        do {
+            let requests = request.blobs.map {
+                NativeBlobStore.PutRequest(key: $0.key, data: $0.data, mode: $0.mode, path: $0.path)
+            }
+            let result = try await nativeStore.commitBlobs(
+                sessionID: request.editSessionID,
+                requests: requests,
                 callerPID: caller.pid,
                 callerStartTime: caller.startTime
             )

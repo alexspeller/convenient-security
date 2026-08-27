@@ -249,6 +249,37 @@ public struct CancelNativeStoreEditRequest: Codable, Sendable {
     }
 }
 
+/// One whole-file value bound for the store's file/blob tier: the value bytes,
+/// the intended POSIX mode of the materialized file, and the project-relative
+/// path the importer recorded. Never returned to a caller; only sent inward.
+public struct ProtectedBlobImport: Codable, Sendable, Equatable {
+    public let key: String
+    public let data: Data
+    public let mode: UInt16
+    public let path: String
+
+    public init(key: String, data: Data, mode: UInt16, path: String) {
+        self.key = key
+        self.data = data
+        self.mode = mode
+        self.path = path
+    }
+}
+
+/// Import a batch of whole-file values into the file/blob tier, committed against
+/// an already-authorized native-store edit session (one consent covers the batch).
+public struct CommitNativeStoreBlobsRequest: Codable, Sendable {
+    public let requestID: String
+    public let editSessionID: String
+    public let blobs: [ProtectedBlobImport]
+
+    public init(editSessionID: String, blobs: [ProtectedBlobImport], requestID: UUID = UUID()) {
+        self.requestID = requestID.uuidString.lowercased()
+        self.editSessionID = editSessionID
+        self.blobs = blobs
+    }
+}
+
 public enum RiskOperation: String, Codable, Sendable, CaseIterable {
     case inspect
     case classify
@@ -352,6 +383,7 @@ public enum Request: Sendable {
     case endOutputRedaction(EndOutputRedactionRequest)
     case beginNativeStoreEdit(BeginNativeStoreEditRequest)
     case commitNativeStoreEdit(CommitNativeStoreEditRequest)
+    case commitNativeStoreBlobs(CommitNativeStoreBlobsRequest)
     case cancelNativeStoreEdit(CancelNativeStoreEditRequest)
     case risk(RiskOperationRequest)
     case approveProtectedLaunch(ProtectedLaunchApprovalRequest)
@@ -366,7 +398,7 @@ extension Request: Codable {
         case version, type, requestID, references, reason, ttlSeconds
         case deliveryPlan, deliveryPlanDigest
         case destination, streams, includeShortValues, sessionID, stream, data, finish
-        case store, editSessionID, document, mode, externalEditorPath
+        case store, editSessionID, document, mode, externalEditorPath, blobs
         case operation, reference, level
         case protectedLaunchApproval
         case scanFilesystem, selectedKeys, jobID
@@ -442,6 +474,12 @@ extension Request: Codable {
             self = .commitNativeStoreEdit(CommitNativeStoreEditRequest(
                 editSessionID: try container.decode(String.self, forKey: .editSessionID),
                 document: try container.decode(Data.self, forKey: .document),
+                requestID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
+        case "commit_native_store_blobs":
+            self = .commitNativeStoreBlobs(CommitNativeStoreBlobsRequest(
+                editSessionID: try container.decode(String.self, forKey: .editSessionID),
+                blobs: try container.decode([ProtectedBlobImport].self, forKey: .blobs),
                 requestID: try Self.decodeUUID(container, forKey: .requestID)
             ))
         case "cancel_native_store_edit":
@@ -553,6 +591,12 @@ extension Request: Codable {
             try container.encode(request.requestID, forKey: .requestID)
             try container.encode(request.editSessionID, forKey: .editSessionID)
             try container.encode(request.document, forKey: .document)
+        case let .commitNativeStoreBlobs(request):
+            try container.encode("commit_native_store_blobs", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.editSessionID, forKey: .editSessionID)
+            try container.encode(request.blobs, forKey: .blobs)
         case let .cancelNativeStoreEdit(request):
             try container.encode("cancel_native_store_edit", forKey: .type)
             try container.encode(WireProtocol.version, forKey: .version)

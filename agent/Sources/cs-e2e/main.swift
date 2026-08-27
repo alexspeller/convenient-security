@@ -249,9 +249,14 @@ await resolver.register(StaticProvider(values: [
 ], counter: resolutionCounter))
 let nativeKeyBackend = InMemoryNativeStoreKeyBackend()
 let nativeFileBackend = InMemoryNativeStoreFileBackend()
+let nativeBlobStore = NativeBlobStore(
+    keyBackend: InMemoryNativeStoreKeyBackend(),
+    fileBackend: InMemoryNativeStoreFileBackend()
+)
 let nativeProvider = NativeEncryptedFileProvider(
     keyBackend: nativeKeyBackend,
-    fileBackend: nativeFileBackend
+    fileBackend: nativeFileBackend,
+    blobStore: nativeBlobStore
 )
 await resolver.register(nativeProvider)
 let grants = GrantTable()
@@ -297,6 +302,8 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.beginNativeStoreEdit(request: begin, caller: caller)
     case let .commitNativeStoreEdit(commit):
         return await agent.commitNativeStoreEdit(request: commit, caller: caller)
+    case let .commitNativeStoreBlobs(commit):
+        return await agent.commitNativeStoreBlobs(request: commit, caller: caller)
     case let .cancelNativeStoreEdit(cancel):
         return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
     case let .risk(risk):
@@ -1124,6 +1131,46 @@ do {
     check(mixed["op://demo/db/url"] == Data("postgres://s3cr3t".utf8)
           && mixed["csec://development/NATIVE_TOKEN"] == Data("native-synthetic-token".utf8),
           "one request resolves 1Password and native-store references together")
+
+    // Whole-file import over the wire: begin an onboarding-import session, commit a
+    // blob batch (including binary), then resolve them back as csec:// values.
+    let importEdit = try client.beginNativeStoreEdit(
+        store: "development", mode: .onboardingImport)
+    let importCommit = try client.commitNativeStoreBlobs(
+        sessionID: importEdit.sessionID,
+        blobs: [
+            ProtectedBlobImport(
+                key: "ENVRC_FILE", data: Data("export A=1\nuse_flake\n".utf8),
+                mode: 0o600, path: ".envrc"),
+            ProtectedBlobImport(
+                key: "KEYFILE", data: Data([0x00, 0x01, 0xff, 0xfe]),
+                mode: 0o400, path: "config/master.key"),
+        ]
+    )
+    check(importCommit.generation >= 1 && importCommit.secretCount == 2,
+          "a whole-file import commits its blob batch over the authenticated protocol")
+    let importedValues = try client.access(
+        references: ["csec://development/ENVRC_FILE", "csec://development/KEYFILE"],
+        reason: "imported blob e2e",
+        ttlSeconds: 3600
+    )
+    check(importedValues["csec://development/ENVRC_FILE"] == Data("export A=1\nuse_flake\n".utf8)
+          && importedValues["csec://development/KEYFILE"] == Data([0x00, 0x01, 0xff, 0xfe]),
+          "imported whole-file (incl. binary) values resolve via csec:// with full fidelity")
+
+    // Cross-tier uniqueness holds over the wire (NATIVE_TOKEN is a document key).
+    let clashEdit = try client.beginNativeStoreEdit(
+        store: "development", mode: .onboardingImport)
+    do {
+        _ = try client.commitNativeStoreBlobs(
+            sessionID: clashEdit.sessionID,
+            blobs: [ProtectedBlobImport(
+                key: "NATIVE_TOKEN", data: Data("x".utf8), mode: 0o600, path: "t")]
+        )
+        check(false, "a blob import cannot shadow an existing document key over the wire")
+    } catch AgentClient.ClientError.protocolFailure(.invalidStoreDocument, _) {
+        check(true, "a blob import cannot shadow an existing document key over the wire")
+    }
 } catch {
     check(false, "native-store protocol checks succeed (\(error))")
 }
