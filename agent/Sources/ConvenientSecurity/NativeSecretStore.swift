@@ -783,6 +783,19 @@ public actor NativeEncryptedFileProvider: SecretProvider {
         throw storeExists ? NativeStoreError.secretNotFound : NativeStoreError.storeNotFound
     }
 
+    /// The project-relative path a blob recorded at `csec protect` time, or nil if
+    /// the value is not a blob (doc tier) or the store record is not already
+    /// unlocked in this session. It passes `unlock: nil` on purpose: it reuses the
+    /// store key record cached by a just-completed `resolve`, so binding a
+    /// sidecar's location to its stored path costs no second authentication. A
+    /// reference that was never resolved this session simply reads back nil and
+    /// must be treated as unbound. Metadata only — the blob's value is never read.
+    public func recordedBlobPath(store: NativeStoreName, key: String) async -> String? {
+        guard let blobStore else { return nil }
+        let entries = try? await blobStore.list(store: store, unlock: nil)
+        return entries?[key]?.path
+    }
+
     public func beginEdit(
         store: NativeStoreName,
         callerPID: pid_t,

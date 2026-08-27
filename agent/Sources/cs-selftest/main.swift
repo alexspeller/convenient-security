@@ -624,6 +624,13 @@ do {
     check(resolved.value == envrc,
           "an imported blob resolves via csec:// with exact bytes")
 
+    // The blob-path binding for `*.csec` sidecars: after resolution unlocked the
+    // store record, the recorded protect path is readable with no second unlock.
+    check(await provider.recordedBlobPath(store: store, key: "envrc") == ".envrc",
+          "a resolved blob's recorded protect path is readable (reusing the unlocked record)")
+    check(await provider.recordedBlobPath(store: store, key: "absent") == nil,
+          "an unknown blob key has no recorded path")
+
     // A document commit may not shadow an existing blob key.
     let shadowSession = try await provider.beginEdit(
         store: store, callerPID: callerPID, callerStartTime: callerStart, unlock: nativeUnlock)
@@ -644,6 +651,8 @@ do {
         sessionID: docSession.sessionID,
         document: Data(#"{"TOKEN":"abc"}"#.utf8),
         callerPID: callerPID, callerStartTime: callerStart)
+    check(await provider.recordedBlobPath(store: store, key: "TOKEN") == nil,
+          "a document-tier value has no recorded blob path (a sidecar cannot bind to it)")
     let clashSession = try await provider.beginEdit(
         store: store, callerPID: callerPID, callerStartTime: callerStart, unlock: nativeUnlock)
     do {

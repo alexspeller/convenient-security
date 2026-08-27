@@ -382,8 +382,12 @@ public struct ProtectedLaunchPlan: Codable, Sendable, Equatable {
             case let .symlink(projectRelativePath):
                 // A sidecar file is materialized byte-for-byte, so only raw
                 // rendering is meaningful and the tmpfs file is the exact symlink
-                // target; a profile rendering here is a misconfigured binding.
+                // target; a profile rendering here is a misconfigured binding. The
+                // reference must be native `csec://` — a symlink binding is bound
+                // to its stored blob path (csecd), which only exists for a native
+                // blob, so any other scheme could not be path-bound.
                 guard case .raw = binding.rendering,
+                      (try? SecretRef(binding.reference))?.scheme == "csec",
                       Self.validProjectRelativePath(projectRelativePath),
                       symlinkTargets.insert(projectRelativePath).inserted else {
                     throw ProtectedFileDeliveryError.invalidFileBinding

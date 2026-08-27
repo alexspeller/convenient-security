@@ -200,6 +200,16 @@ func startAgentServer() async {
           requestID: approval.requestID
         )
       }
+      // Planted-sidecar defense: a symlink-delivered binding may only materialize
+      // where its blob was protected. This runs after resolution, so it reuses the
+      // already-unlocked store record and adds no second Touch ID.
+      guard await agent.protectedFilePathsAreBound(approval.launchPlan.files) else {
+        return .failed(
+          .invalidRequest,
+          message: "a protected-file sidecar does not match its stored path",
+          requestID: approval.requestID
+        )
+      }
       do {
         let payloads = try ProtectedFilePayloadRenderer.render(
           bindings: approval.launchPlan.files,

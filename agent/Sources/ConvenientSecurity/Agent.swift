@@ -648,6 +648,28 @@ public actor Agent {
         )
     }
 
+    /// Planted-sidecar defense for symlink-delivered (`*.csec`) bindings: the
+    /// value must come from a blob whose recorded `csec protect` path equals the
+    /// sidecar's own project location, so a sidecar dropped or moved by same-uid
+    /// malware cannot redirect a value to a path it was never protected at. It
+    /// reuses the store key record cached by the just-completed resolution, so it
+    /// adds no second Touch ID, and fails closed: a symlink binding whose
+    /// reference is not a native blob, or whose recorded path differs, is
+    /// rejected. Environment-delivered bindings are unaffected.
+    public func protectedFilePathsAreBound(_ bindings: [ProtectedFileBinding]) async -> Bool {
+        for binding in bindings {
+            guard let target = binding.symlinkTarget else { continue }
+            guard let nativeStore,
+                  let reference = try? NativeSecretReference(SecretRef(binding.reference)),
+                  let recordedPath = await nativeStore.recordedBlobPath(
+                      store: reference.store, key: reference.key),
+                  recordedPath == target else {
+                return false
+            }
+        }
+        return true
+    }
+
     private func policyBindingsByReference(
         _ states: [CredentialPolicyState]
     ) -> [String: PolicyGrantBinding] {

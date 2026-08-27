@@ -349,6 +349,13 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
                 requestID: approval.requestID
             )
         }
+        guard await agent.protectedFilePathsAreBound(approval.launchPlan.files) else {
+            return .failed(
+                .invalidRequest,
+                message: "a protected-file sidecar does not match its stored path",
+                requestID: approval.requestID
+            )
+        }
         do {
             try RootHelperClient(
                 path: rootSocketPath,
@@ -416,6 +423,39 @@ do {
 }
 check((await capture.snapshot()).calls == 0,
       "replacement server receives no request metadata before client rejection")
+
+// Blob-path binding: a *.csec sidecar (symlink binding) may only materialize its
+// value at the project path the blob was protected at, so a planted or moved
+// sidecar pointing the same value elsewhere is rejected before the launch.
+do {
+    let store = try NativeStoreName("e2ebind")
+    let bindUnlock = CacheUnlock(LAContext())
+    let bindPID: pid_t = 5150
+    let bindStart: UInt64 = 42
+    let edit = try await nativeProvider.beginEdit(
+        store: store, callerPID: bindPID, callerStartTime: bindStart, unlock: bindUnlock)
+    _ = try await nativeProvider.commitBlobs(
+        sessionID: edit.sessionID,
+        requests: [.init(key: "envrc", data: Data("X=1\n".utf8), mode: 0o600, path: ".envrc")],
+        callerPID: bindPID, callerStartTime: bindStart)
+    // Resolving unlocks and caches the store record that the check reuses.
+    _ = try await nativeProvider.resolve(try SecretRef("csec://e2ebind/envrc"), unlock: bindUnlock)
+
+    let matched = ProtectedFileBinding.symlink(
+        projectRelativePath: ".envrc", reference: "csec://e2ebind/envrc", index: 0)
+    let redirected = ProtectedFileBinding.symlink(
+        projectRelativePath: "config/other.key", reference: "csec://e2ebind/envrc", index: 0)
+    let envDelivered = ProtectedFileBinding.raw(
+        environmentName: "X", reference: "csec://e2ebind/envrc", index: 0)
+    check(await agent.protectedFilePathsAreBound([matched]),
+          "a sidecar at its stored protect path is accepted")
+    check(!(await agent.protectedFilePathsAreBound([redirected])),
+          "a sidecar redirected to a different path is rejected (planted-sidecar defense)")
+    check(await agent.protectedFilePathsAreBound([envDelivered]),
+          "environment-delivered bindings are not path-bound")
+} catch {
+    check(false, "blob-path binding e2e checks succeed (\(error))")
+}
 
 do {
     let capabilities = try client.capabilities()
