@@ -15,7 +15,7 @@ struct StaticProvider: SecretProvider {
     var schemes: Set<String> { ["op"] }
     func resolve(_ ref: SecretRef, unlock: CacheUnlock?) async throws -> ResolvedSecret {
         guard let value = values[ref.uri] else { throw ProviderError.referenceNotFound(ref.uri) }
-        return ResolvedSecret(value: value, cacheHint: .noCache)
+        return ResolvedSecret(value: Data(value.utf8), cacheHint: .noCache)
     }
     func authenticate() async throws {}
     func isAvailable() async -> Bool { true }

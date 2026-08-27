@@ -5,13 +5,13 @@ import Foundation
 /// registry never unlocks dormant cache or provider values to populate itself.
 struct ActiveSecretRegistry: Sendable {
     struct Snapshot: Sendable {
-        let valuesByOpaqueID: [String: String]
+        let valuesByOpaqueID: [String: Data]
         let generation: UInt64
     }
 
     private struct Entry: Sendable {
         let sequence: UInt64
-        let value: String
+        let value: Data
         var expiresAt: Date
     }
 
@@ -19,10 +19,9 @@ struct ActiveSecretRegistry: Sendable {
     private var nextSequence: UInt64 = 1
     private(set) var generation: UInt64 = 0
 
-    mutating func register(values: some Sequence<String>, expiresAt: Date) {
+    mutating func register(values: some Sequence<Data>, expiresAt: Date) {
         var changed = false
-        for value in values {
-            let bytes = Data(value.utf8)
+        for bytes in values {
             guard !bytes.isEmpty else { continue }
             if var existing = entriesByValue[bytes] {
                 if expiresAt > existing.expiresAt {
@@ -33,7 +32,7 @@ struct ActiveSecretRegistry: Sendable {
             } else {
                 entriesByValue[bytes] = Entry(
                     sequence: nextSequence,
-                    value: value,
+                    value: bytes,
                     expiresAt: expiresAt
                 )
                 nextSequence &+= 1

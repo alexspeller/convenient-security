@@ -45,13 +45,13 @@ public struct AgentClient {
         }
     }
 
-    /// Request one or more references; returns ref → value on approval.
+    /// Request one or more references; returns ref → value bytes on approval.
     public func access(
         references: [String],
         reason: String,
         ttlSeconds: Int,
         deliveryPlan: DeliveryPlan? = nil
-    ) throws -> [String: String] {
+    ) throws -> [String: Data] {
         let plan = deliveryPlan ?? .directHeap(
             executablePath: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path,
             assurance: .unverified,

@@ -678,7 +678,11 @@ func runGet(_ arguments: [String]) -> Never {
                 FileHandle.standardError.write(Data("csec: no value returned for \(reference)\n".utf8))
                 exit(1)
             }
-            print(value)
+            // A value is bytes: stream them verbatim, then a trailing newline to
+            // match a shell-friendly `get`. A text value is byte-identical to the
+            // previous line-printed form; a binary value keeps full fidelity.
+            FileHandle.standardOutput.write(value)
+            FileHandle.standardOutput.write(Data("\n".utf8))
         }
         exit(0)
     } catch {
@@ -775,7 +779,7 @@ func runExec(_ arguments: [String]) -> Never {
     }
 
     var injected: [String: String] = [:]
-    var resolvedValues: [String: String] = [:]
+    var resolvedValues: [String: Data] = [:]
     var resolvedExecutablePath: String?
     if !plan.references.isEmpty {
         do {
@@ -970,7 +974,21 @@ func runBridge() -> Never {
               ProcessAncestry.executablePath(of: parentPID) == inspectedExecutable.canonicalPath else {
             writeBridgeFailure(.unverifiedPeer, "requesting parent changed during access", status: 1)
         }
-        let response = BridgeResponse(values: values)
+        // The bridge delivers env-style secrets into a language runtime, which are
+        // NUL-free UTF-8 strings. A value that is not representable as one (a
+        // binary file) has no place in a process environment.
+        var textValues: [String: String] = [:]
+        for (reference, bytes) in values {
+            guard let text = String(data: bytes, encoding: .utf8), !text.utf8.contains(0) else {
+                writeBridgeFailure(
+                    .deliveryNotSupported,
+                    "a referenced value is not a text secret and cannot be delivered to a language runtime",
+                    status: 1
+                )
+            }
+            textValues[reference] = text
+        }
+        let response = BridgeResponse(values: textValues)
         guard let data = try? JSONEncoder().encode(response),
               writeFrame(STDOUT_FILENO, data) else { exit(1) }
         exit(0)

@@ -132,12 +132,18 @@ private func runAWSCredentials(_ arguments: [String]) -> Never {
             )
         }
 
+        // AWS credential material is text — a JSON bundle or per-role string
+        // values — so each value is decoded as UTF-8 at this boundary.
         let fields: [String: String]
-        if let itemReference, let bundle = values[itemReference] {
+        if let itemReference, let bundleBytes = values[itemReference] {
+            guard let bundle = String(data: bundleBytes, encoding: .utf8) else {
+                throw AgentClient.ClientError.transportFailed
+            }
             fields = try AWSCredentialProcess.fields(fromBundle: bundle)
         } else {
             fields = try Dictionary(uniqueKeysWithValues: roleReferences.map { role, reference in
-                guard let value = values[reference] else {
+                guard let bytes = values[reference],
+                      let value = String(data: bytes, encoding: .utf8) else {
                     throw AgentClient.ClientError.transportFailed
                 }
                 return (role, value)
@@ -253,11 +259,14 @@ private func runGitCredentials(_ arguments: [String]) -> Never {
                 commandDigest: commandDigest
             )
         }
-        guard let password = values[passwordReference] else {
+        // Git credentials are text fields in the git credential protocol.
+        guard let passwordBytes = values[passwordReference],
+              let password = String(data: passwordBytes, encoding: .utf8) else {
             throw AgentClient.ClientError.transportFailed
         }
-        let username = try usernameReference.map { reference in
-            guard let value = values[reference] else {
+        let username = try usernameReference.map { reference -> String in
+            guard let bytes = values[reference],
+                  let value = String(data: bytes, encoding: .utf8) else {
                 throw AgentClient.ClientError.transportFailed
             }
             return value
@@ -388,7 +397,12 @@ func runExecFD(_ arguments: [String]) -> Never {
             }
             let data: Data
             if let preset = declaration.preset {
-                data = try preset.render(value)
+                // A preset weaves the value into a text template (netrc, git
+                // credentials …), so the value must be a text secret.
+                guard let text = String(data: value, encoding: .utf8) else {
+                    throw SecureDeliveryError.invalidInheritedFile
+                }
+                data = try preset.render(text)
             } else {
                 data = try renderGenericInheritedFile(value)
             }
@@ -479,7 +493,7 @@ private func accessWithSecureDeliveryRoot(
     ttlSeconds: Int,
     defaultScope: DescendantScope,
     plan: (DeliveryRoot, DescendantScope) throws -> DeliveryPlan
-) throws -> [String: String] {
+) throws -> [String: Data] {
     let client = makeAgentClient()
     let selected = try secureDeliveryRoot(defaultScope: defaultScope)
     do {
@@ -500,14 +514,16 @@ private func accessWithSecureDeliveryRoot(
     }
 }
 
-private func renderGenericInheritedFile(_ value: String) throws -> Data {
-    let data = Data(value.utf8)
-    guard !data.isEmpty,
-          data.count <= InheritedFilePreset.maximumFileBytes,
-          !data.contains(0) else {
+private func renderGenericInheritedFile(_ value: Data) throws -> Data {
+    // A generic inherited file is the value's own bytes. NUL is still rejected:
+    // the descriptor is read as a text token here, and a binary blob belongs on
+    // the capability-GID file path, not stitched into a `/dev/fd` token.
+    guard !value.isEmpty,
+          value.count <= InheritedFilePreset.maximumFileBytes,
+          !value.contains(0) else {
         throw SecureDeliveryError.invalidInheritedFile
     }
-    return data
+    return value
 }
 
 private func validEnvironmentName(_ value: String) -> Bool {

@@ -1,11 +1,17 @@
 import Foundation
 
 /// A resolved secret plus a hint about how long it may be cached at rest.
+///
+/// The value is raw *bytes*, not a `String`: a reference resolves to a value and
+/// a value is bytes, whether that is a short token or a whole binary file. Text
+/// is a *delivery constraint* (an environment variable must be a NUL-free UTF-8
+/// C string), applied at the delivery boundary — never a property of the value
+/// itself. Providers that natively yield text seal it with `Data(text.utf8)`.
 public struct ResolvedSecret: Sendable {
-    public let value: String
+    public let value: Data
     public let cacheHint: CacheHint
 
-    public init(value: String, cacheHint: CacheHint) {
+    public init(value: Data, cacheHint: CacheHint) {
         self.value = value
         self.cacheHint = cacheHint
     }

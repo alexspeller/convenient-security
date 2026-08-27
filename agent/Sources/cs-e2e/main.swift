@@ -42,7 +42,7 @@ struct StaticProvider: SecretProvider {
             throw ProviderError.notAuthenticated
         }
         guard let value = values[ref.uri] else { throw ProviderError.referenceNotFound(ref.uri) }
-        return ResolvedSecret(value: value, cacheHint: .noCache)
+        return ResolvedSecret(value: Data(value.utf8), cacheHint: .noCache)
     }
     func authenticate() async throws {}
     func isAvailable() async -> Bool { true }
@@ -770,7 +770,7 @@ do {
     let embeddedCancellationCalls = await embeddedAuthentication.cancellations()
     let separateConsentCalls = await separateConsent.calls()
     let allowedResolutionCalls = await allowedResolution.calls()
-    check(allowedResponse.values?[allowedReference] == "embedded-review-synthetic-token"
+    check(allowedResponse.values?[allowedReference] == Data("embedded-review-synthetic-token".utf8)
           && embeddedPreauthenticationCalls == 1
           && embeddedAuthenticationCalls == 1
           && embeddedCancellationCalls == 0
@@ -823,10 +823,10 @@ do {
 
 do {
     let first = try client.access(references: ["op://demo/db/url"], reason: "e2e first", ttlSeconds: 3600)
-    check(first["op://demo/db/url"] == "postgres://s3cr3t", "value resolves end-to-end over the socket")
+    check(first["op://demo/db/url"] == Data("postgres://s3cr3t".utf8), "value resolves end-to-end over the socket")
 
     let second = try client.access(references: ["op://demo/db/url"], reason: "e2e second", ttlSeconds: 3600)
-    check(second["op://demo/db/url"] == "postgres://s3cr3t", "second fetch succeeds")
+    check(second["op://demo/db/url"] == Data("postgres://s3cr3t".utf8), "second fetch succeeds")
 
     let consentCalls = await consent.calls()
     check(consentCalls == 1, "consent asked once; the subtree grant covered the second fetch")
@@ -867,7 +867,7 @@ do {
         ttlSeconds: 300,
         deliveryPlan: sessionPlan
     )
-    check(values["op://session-tests/credential/token"] == "session-root-synthetic-token",
+    check(values["op://session-tests/credential/token"] == Data("session-root-synthetic-token".utf8),
           "a live registered session roots access at its exact process incarnation")
 
     let outsiderRequest = try AccessRequest(
@@ -964,7 +964,7 @@ do {
     )
     let after = await consent.calls()
     check(after - before == 1, "adding one new reference consents only for the delta (\(after - before))")
-    check(both["op://demo/db/url"] == "postgres://s3cr3t" && both["op://demo/api/key"] == "sk-demo-123",
+    check(both["op://demo/db/url"] == Data("postgres://s3cr3t".utf8) && both["op://demo/api/key"] == Data("sk-demo-123".utf8),
           "both the already-granted and the newly-granted reference resolve")
 } catch {
     check(false, "consent-delta access failed: \(error)")
@@ -980,7 +980,7 @@ do {
         reason: "create a low-risk live grant",
         ttlSeconds: 3600
     )
-    check(initial[reference] == "grant-policy-synthetic-token",
+    check(initial[reference] == Data("grant-policy-synthetic-token".utf8),
           "a low-risk reference receives an initial live grant")
 
     _ = try client.risk(.raise, reference: reference, level: .high)
@@ -1113,7 +1113,7 @@ do {
         reason: "native provider e2e",
         ttlSeconds: 3600
     )
-    check(nativeValues["csec://development/NATIVE_TOKEN"] == "native-synthetic-token",
+    check(nativeValues["csec://development/NATIVE_TOKEN"] == Data("native-synthetic-token".utf8),
           "csec:// value resolves end-to-end through the native encrypted provider")
 
     let mixed = try client.access(
@@ -1121,8 +1121,8 @@ do {
         reason: "mixed provider e2e",
         ttlSeconds: 3600
     )
-    check(mixed["op://demo/db/url"] == "postgres://s3cr3t"
-          && mixed["csec://development/NATIVE_TOKEN"] == "native-synthetic-token",
+    check(mixed["op://demo/db/url"] == Data("postgres://s3cr3t".utf8)
+          && mixed["csec://development/NATIVE_TOKEN"] == Data("native-synthetic-token".utf8),
           "one request resolves 1Password and native-store references together")
 } catch {
     check(false, "native-store protocol checks succeed (\(error))")
@@ -1908,7 +1908,7 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
               && applied.out.contains("original environment/dotenv sources were not modified")
               && !applied.out.contains(firstMarker)
               && !applied.err.contains(firstMarker)
-              && importedValues["csec://onboarding_e2e/IMPORTED_TOKEN"] == firstMarker
+              && importedValues["csec://onboarding_e2e/IMPORTED_TOKEN"] == Data(firstMarker.utf8)
               && String(data: originalSource, encoding: .utf8)?.contains(firstMarker) == true,
               "setup imports only the explicitly selected value through the authenticated native-store protocol")
 
@@ -1933,7 +1933,7 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
         check(replaced.status == 0
               && !replaced.out.contains(secondMarker)
               && !replaced.err.contains(secondMarker)
-              && replacedValues["csec://onboarding_e2e/IMPORTED_TOKEN"] == secondMarker,
+              && replacedValues["csec://onboarding_e2e/IMPORTED_TOKEN"] == Data(secondMarker.utf8),
               "--replace-secret explicitly updates only the selected native-store key")
     } catch {
         check(false, "setup CLI import checks succeed (\(error))")
@@ -2022,7 +2022,7 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
             ttlSeconds: 60
         )
         check(externalValues["csec://external_editor/EDITOR_TOKEN"]
-              == "external-editor-synthetic-token",
+              == Data("external-editor-synthetic-token".utf8),
               "--editor commits the validated document through the native provider")
         check(workspacesAfter == workspacesBefore,
               "--editor removes its randomized plaintext workspace after success")

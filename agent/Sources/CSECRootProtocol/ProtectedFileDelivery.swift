@@ -362,7 +362,7 @@ public enum ProtectedFilePayloadRenderer {
 
     public static func render(
         bindings: [ProtectedFileBinding],
-        values: [String: String]
+        values: [String: Data]
     ) throws -> [ProtectedFilePayload] {
         guard Set(values.keys) == Set(bindings.map(\.reference)) else {
             throw ProtectedFileDeliveryError.invalidFilePayload
@@ -370,15 +370,21 @@ public enum ProtectedFilePayloadRenderer {
         var payloads: [ProtectedFilePayload] = []
         var total = 0
         for binding in bindings {
-            guard let value = values[binding.reference] else {
+            guard let valueBytes = values[binding.reference] else {
                 throw ProtectedFileDeliveryError.invalidFilePayload
             }
             let data: Data
             switch binding.rendering {
             case .raw:
-                data = Data(value.utf8)
+                // A value is bytes: the file is materialized byte-for-byte, so an
+                // arbitrary (even binary) protected file round-trips with full
+                // fidelity.
+                data = valueBytes
             case let .githubHosts(host, user, gitProtocol):
-                guard !value.isEmpty,
+                // This rendering weaves the value into a YAML profile, so it must
+                // be text; a binary value here is a misconfigured binding.
+                guard let value = String(data: valueBytes, encoding: .utf8),
+                      !value.isEmpty,
                       !value.unicodeScalars.contains(where: {
                           $0.value == 0 || CharacterSet.newlines.contains($0)
                       }) else {

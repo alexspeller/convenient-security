@@ -32,8 +32,9 @@ public struct NativeStoreName: Hashable, Sendable, CustomStringConvertible {
     }
 }
 
-/// Parsed `csec://<store>/<key>` reference.
-public struct NativeSecretReference: Hashable, Sendable {
+/// Parsed `csec://<store>/<key>` reference — the single native value scheme,
+/// resolving to bytes from whichever storage tier backs the key.
+public struct NativeSecretReference: Hashable, Sendable, CustomStringConvertible {
     public let store: NativeStoreName
     public let key: String
 
@@ -50,6 +51,18 @@ public struct NativeSecretReference: Hashable, Sendable {
         }
         self.key = key
     }
+
+    public init(store: NativeStoreName, key: String) throws {
+        guard NativeStoreDocument.isValidKey(key) else {
+            throw NativeStoreError.invalidReference
+        }
+        self.store = store
+        self.key = key
+    }
+
+    public var uri: String { "csec://\(store.value)/\(key)" }
+    public var description: String { uri }
+    public var secretRef: SecretRef { try! SecretRef(uri) }
 
     public static func editConsentReference(for store: NativeStoreName) -> SecretRef {
         // Store names are already restricted to an RFC-3986-safe ASCII subset.
@@ -345,9 +358,15 @@ public protocol NativeStoreKeyBackend: Sendable {
 /// the only way to decrypt the native store.
 public struct SecurityNativeStoreKeyBackend: NativeStoreKeyBackend {
     public static let service = "com.alexspeller.convenient-security.native-store-key"
+    /// Distinct keychain service for the per-blob file store, so a blob store and
+    /// a whole-document store may share a name without their key records colliding.
+    public static let blobService = "com.alexspeller.convenient-security.native-blob-store-key"
+    private let service: String
     private let queue = DispatchQueue(label: "com.alexspeller.convenient-security.native-store-key")
 
-    public init() {}
+    public init(service: String = SecurityNativeStoreKeyBackend.service) {
+        self.service = service
+    }
 
     public func load(store: String, unlock: CacheUnlock?) async throws -> NativeStoreKeyRecord? {
         guard let unlock else { throw NativeStoreError.authenticationRequired }
@@ -418,7 +437,7 @@ public struct SecurityNativeStoreKeyBackend: NativeStoreKeyBackend {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecUseDataProtectionKeychain as String: true,
-            kSecAttrService as String: Self.service,
+            kSecAttrService as String: service,
             kSecAttrAccount as String: store,
         ]
     }
@@ -445,11 +464,16 @@ public protocol NativeStoreFileBackend: Sendable {
 /// POSIX permissions are defense in depth here; confidentiality and integrity
 /// come from AES-GCM and the biometric keychain record.
 public struct SecureNativeStoreFileBackend: NativeStoreFileBackend {
-    private static let maximumCiphertextBytes = NativeStoreDocument.maximumBytes + 1024
+    public static let defaultMaximumCiphertextBytes = NativeStoreDocument.maximumBytes + 1024
+    private let maximumCiphertextBytes: Int
     public let directoryPath: String
 
-    public init(directoryPath: String = Self.defaultDirectoryPath()) throws {
+    public init(
+        directoryPath: String = Self.defaultDirectoryPath(),
+        maximumCiphertextBytes: Int = Self.defaultMaximumCiphertextBytes
+    ) throws {
         self.directoryPath = directoryPath
+        self.maximumCiphertextBytes = maximumCiphertextBytes
         try Self.prepareDirectory(directoryPath)
     }
 
@@ -479,7 +503,7 @@ public struct SecureNativeStoreFileBackend: NativeStoreFileBackend {
               info.st_uid == getuid(),
               (info.st_mode & 0o077) == 0,
               info.st_size >= 0,
-              info.st_size <= Self.maximumCiphertextBytes else {
+              info.st_size <= maximumCiphertextBytes else {
             throw NativeStoreError.filesystemFailure
         }
 
@@ -503,7 +527,7 @@ public struct SecureNativeStoreFileBackend: NativeStoreFileBackend {
 
     public func writeAtomically(named fileName: String, data: Data) async throws {
         guard Self.isSafeFileName(fileName),
-              data.count <= Self.maximumCiphertextBytes else {
+              data.count <= maximumCiphertextBytes else {
             throw NativeStoreError.filesystemFailure
         }
         let directoryFD = try openDirectory()
@@ -695,16 +719,24 @@ public actor NativeEncryptedFileProvider: SecretProvider {
     private let keyBackend: NativeStoreKeyBackend
     private let fileBackend: NativeStoreFileBackend
     private let editTTL: TimeInterval
+    /// The file/blob tier of the same `csec://` namespace. Small hand-editable
+    /// secrets live in this provider's own document; large or binary whole-file
+    /// values live in per-value envelopes here. Which tier backs a key is a pure
+    /// storage decision — invisible at the reference. Optional so a provider with
+    /// no blob tier (tests, doc-only deployments) resolves the document alone.
+    private let blobStore: NativeBlobStore?
     private var records: [String: NativeStoreKeyRecord] = [:]
     private var editSessions: [String: EditSession] = [:]
 
     public init(
         keyBackend: NativeStoreKeyBackend,
         fileBackend: NativeStoreFileBackend,
+        blobStore: NativeBlobStore? = nil,
         editTTL: TimeInterval = 30 * 60
     ) {
         self.keyBackend = keyBackend
         self.fileBackend = fileBackend
+        self.blobStore = blobStore
         self.editTTL = editTTL
     }
 
@@ -715,17 +747,34 @@ public actor NativeEncryptedFileProvider: SecretProvider {
 
     public func resolve(_ ref: SecretRef, unlock: CacheUnlock?) async throws -> ResolvedSecret {
         let reference = try NativeSecretReference(ref)
-        guard let record = try await existingRecord(for: reference.store, unlock: unlock),
-              record.generation > 0 else {
-            throw NativeStoreError.storeNotFound
+        // A `csec://store/key` reference leads to a value; which tier stores that
+        // value is invisible here. The editable-document tier is consulted first
+        // (small hand-managed secrets take precedence), then the file/blob tier.
+        var storeExists = false
+        if let record = try await existingRecord(for: reference.store, unlock: unlock),
+           record.generation > 0 {
+            storeExists = true
+            let document = try await loadDocument(store: reference.store, record: record)
+            if let value = document.values[reference.key] {
+                // The document holds UTF-8 text; the value primitive is bytes. The
+                // encrypted file is the source of truth, so native values stay out
+                // of the generic persistent cache (no stale value after an edit).
+                return ResolvedSecret(value: Data(value.utf8), cacheHint: .noCache)
+            }
         }
-        let document = try await loadDocument(store: reference.store, record: record)
-        guard let value = document.values[reference.key] else {
-            throw NativeStoreError.secretNotFound
+        if let blobStore {
+            do {
+                let blob = try await blobStore.loadBlob(
+                    store: reference.store, key: reference.key, unlock: unlock
+                )
+                return ResolvedSecret(value: blob.data, cacheHint: .noCache)
+            } catch NativeStoreError.storeNotFound {
+                // No blob tier under this store name; fall through to not-found.
+            } catch NativeStoreError.secretNotFound {
+                storeExists = true // the store exists, only this key is absent
+            }
         }
-        // The encrypted file is the source of truth. Keeping native values out
-        // of the generic persistent cache prevents stale values after an edit.
-        return ResolvedSecret(value: value, cacheHint: .noCache)
+        throw storeExists ? NativeStoreError.secretNotFound : NativeStoreError.storeNotFound
     }
 
     public func beginEdit(
@@ -932,22 +981,16 @@ public actor NativeEncryptedFileProvider: SecretProvider {
         generation: UInt64,
         fileID: String
     ) throws -> Data {
-        guard keyData.count == 32, let fileIDData = Data(lowerHex: fileID) else {
+        guard let fileIDData = Data(lowerHex: fileID) else {
             throw NativeStoreError.integrityFailure
         }
         let header = envelopeHeader(generation: generation, fileID: fileIDData)
-        let box: AES.GCM.SealedBox
-        do {
-            box = try AES.GCM.seal(
-                plaintext,
-                using: SymmetricKey(data: keyData),
-                authenticating: authenticatedData(header: header, store: store)
-            )
-        } catch {
-            throw NativeStoreError.integrityFailure
-        }
-        guard let combined = box.combined else { throw NativeStoreError.integrityFailure }
-        return header + combined
+        return try NativeStoreEnvelope.seal(
+            plaintext: plaintext,
+            key: keyData,
+            header: header,
+            aad: authenticatedData(header: header, store: store)
+        )
     }
 
     private static func open(
@@ -957,25 +1000,16 @@ public actor NativeEncryptedFileProvider: SecretProvider {
         generation: UInt64,
         fileID: String
     ) throws -> Data {
-        let headerSize = envelopeMagic.count + 8 + 16
-        guard keyData.count == 32,
-              ciphertext.count >= headerSize + 28,
-              let fileIDData = Data(lowerHex: fileID) else {
+        guard let fileIDData = Data(lowerHex: fileID) else {
             throw NativeStoreError.integrityFailure
         }
-        let expectedHeader = envelopeHeader(generation: generation, fileID: fileIDData)
-        let header = Data(ciphertext.prefix(headerSize))
-        guard header == expectedHeader else { throw NativeStoreError.integrityFailure }
-        do {
-            let box = try AES.GCM.SealedBox(combined: ciphertext.dropFirst(headerSize))
-            return try AES.GCM.open(
-                box,
-                using: SymmetricKey(data: keyData),
-                authenticating: authenticatedData(header: header, store: store)
-            )
-        } catch {
-            throw NativeStoreError.integrityFailure
-        }
+        let header = envelopeHeader(generation: generation, fileID: fileIDData)
+        return try NativeStoreEnvelope.open(
+            ciphertext: ciphertext,
+            key: keyData,
+            header: header,
+            aad: authenticatedData(header: header, store: store)
+        )
     }
 
     private static func envelopeHeader(generation: UInt64, fileID: Data) -> Data {
@@ -1010,28 +1044,5 @@ public actor NativeEncryptedFileProvider: SecretProvider {
     }
 }
 
-private extension Data {
-    init?(lowerHex: String) {
-        guard lowerHex.count.isMultiple(of: 2) else { return nil }
-        var result = Data()
-        result.reserveCapacity(lowerHex.count / 2)
-        var index = lowerHex.startIndex
-        while index < lowerHex.endIndex {
-            let next = lowerHex.index(index, offsetBy: 2)
-            guard let byte = UInt8(lowerHex[index..<next], radix: 16) else { return nil }
-            result.append(byte)
-            index = next
-        }
-        self = result
-    }
-
-    var hexString: String {
-        map { String(format: "%02x", $0) }.joined()
-    }
-
-    mutating func appendUInt64(_ value: UInt64) {
-        for shift in stride(from: 56, through: 0, by: -8) {
-            append(UInt8((value >> UInt64(shift)) & 0xff))
-        }
-    }
-}
+// `Data(lowerHex:)`, `hexString`, and `appendUInt64` now live in
+// NativeStoreCrypto.swift as internal helpers shared with the per-blob store.

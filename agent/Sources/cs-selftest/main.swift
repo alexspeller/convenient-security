@@ -326,7 +326,7 @@ do {
 
     let ref = try SecretRef("csec://development/DATABASE_URL")
     let warm = try await provider.resolve(ref, unlock: nil)
-    check(warm.value == "native-postgres-secret" && warm.cacheHint == .noCache,
+    check(warm.value == Data("native-postgres-secret".utf8) && warm.cacheHint == .noCache,
           "a warmed provider serves an already-granted reference without persistent value caching")
 
     let afterRestart = NativeEncryptedFileProvider(
@@ -339,7 +339,7 @@ do {
     } catch NativeStoreError.authenticationRequired {
         check(true, "a restarted provider cannot cold-decrypt without biometric context")
     }
-    check(try await afterRestart.resolve(ref, unlock: nativeUnlock).value == "native-postgres-secret",
+    check(try await afterRestart.resolve(ref, unlock: nativeUnlock).value == Data("native-postgres-secret".utf8),
           "a biometric context unlocks the durable per-store key after restart")
 
     let concurrentA = try await afterRestart.beginEdit(
@@ -404,13 +404,10 @@ do {
 
 print("\n# NativeBlobStore (per-blob envelopes + pinned index)")
 do {
-    check((try? NativeBlobReference(try SecretRef("csecfile://project/env_home")))?.key == "env_home",
-          "csecfile references parse into store/key")
-    checkThrows("a csec:// reference is not a blob reference") {
-        _ = try NativeBlobReference(try SecretRef("csec://project/env_home"))
-    }
-    checkThrows("a nested blob key is rejected") {
-        _ = try NativeBlobReference(try SecretRef("csecfile://project/dir/key"))
+    check((try? NativeSecretReference(try SecretRef("csec://project/env_home")))?.key == "env_home",
+          "a csec:// reference parses into store/key for either storage tier")
+    checkThrows("a nested key is rejected") {
+        _ = try NativeSecretReference(try SecretRef("csec://project/dir/key"))
     }
 
     let keyBackend = InMemoryNativeStoreKeyBackend()
@@ -452,11 +449,11 @@ do {
           "no blob ciphertext contains plaintext bytes")
 
     let loadedEnvrc = try await blobs.loadBlob(
-        try NativeBlobReference(store: store, key: "envrc"), unlock: nativeUnlock)
+        store: store, key: "envrc", unlock: nativeUnlock)
     check(loadedEnvrc.data == envrcData && loadedEnvrc.mode == 0o600 && loadedEnvrc.path == ".envrc",
           "an .envrc blob round-trips with its exact bytes, mode, and path")
     let loadedBinary = try await blobs.loadBlob(
-        try NativeBlobReference(store: store, key: "keyfile"), unlock: nativeUnlock)
+        store: store, key: "keyfile", unlock: nativeUnlock)
     check(loadedBinary.data == binaryData && loadedBinary.mode == 0o400,
           "a binary blob round-trips byte-for-byte")
 
@@ -478,19 +475,19 @@ do {
     let secondSnapshot = await fileBackend.snapshot()
     check(secondSnapshot.count == 3 && !secondSnapshot.keys.contains(firstIndexName),
           "a replace removes the superseded index and blob file")
-    check(try await blobs.loadBlob(try NativeBlobReference(store: store, key: "envrc"), unlock: nativeUnlock)
+    check(try await blobs.loadBlob(store: store, key: "envrc", unlock: nativeUnlock)
             .data == Data("export FOO=rotated\n".utf8),
           "the rotated blob is served after replacement")
 
     // Restart: a fresh store instance over the same backends still serves.
     let afterRestart = NativeBlobStore(keyBackend: keyBackend, fileBackend: fileBackend)
     do {
-        _ = try await afterRestart.loadBlob(try NativeBlobReference(store: store, key: "keyfile"), unlock: nil)
+        _ = try await afterRestart.loadBlob(store: store, key: "keyfile", unlock: nil)
         check(false, "a restarted blob store cannot cold-decrypt without biometric context")
     } catch NativeStoreError.authenticationRequired {
         check(true, "a restarted blob store cannot cold-decrypt without biometric context")
     }
-    check(try await afterRestart.loadBlob(try NativeBlobReference(store: store, key: "keyfile"), unlock: nativeUnlock)
+    check(try await afterRestart.loadBlob(store: store, key: "keyfile", unlock: nativeUnlock)
             .data == binaryData,
           "a biometric context unlocks durable blobs after restart")
 
@@ -503,12 +500,12 @@ do {
     var tamperedKey = "envrc"
     // Determine which key the tampered blob belongs to by trying both.
     for candidate in ["envrc", "keyfile"] {
-        if (try? await afterRestart.loadBlob(try NativeBlobReference(store: store, key: candidate), unlock: nativeUnlock)) == nil {
+        if (try? await afterRestart.loadBlob(store: store, key: candidate, unlock: nativeUnlock)) == nil {
             tamperedKey = candidate
         }
     }
     do {
-        _ = try await afterRestart.loadBlob(try NativeBlobReference(store: store, key: tamperedKey), unlock: nativeUnlock)
+        _ = try await afterRestart.loadBlob(store: store, key: tamperedKey, unlock: nativeUnlock)
         check(false, "blob ciphertext modification is rejected before any bytes are returned")
     } catch NativeStoreError.integrityFailure {
         check(true, "blob ciphertext modification is rejected before any bytes are returned")
@@ -520,7 +517,7 @@ do {
     await fileBackend.replace(named: activeIndexName, data: firstIndexCiphertext)
     let rollbackStore = NativeBlobStore(keyBackend: keyBackend, fileBackend: fileBackend)
     do {
-        _ = try await rollbackStore.loadBlob(try NativeBlobReference(store: store, key: "keyfile"), unlock: nativeUnlock)
+        _ = try await rollbackStore.loadBlob(store: store, key: "keyfile", unlock: nativeUnlock)
         check(false, "an older valid index cannot be replayed as the active generation")
     } catch NativeStoreError.integrityFailure {
         check(true, "an older valid index cannot be replayed as the active generation")
@@ -547,18 +544,60 @@ do {
         requests: [.init(key: "cert", data: large, mode: 0o444, path: "certs/server.pem")],
         unlock: nativeUnlock
     )
-    check(try await blobs.loadBlob(try NativeBlobReference(store: store, key: "cert"), unlock: nativeUnlock).data == large,
+    check(try await blobs.loadBlob(store: store, key: "cert", unlock: nativeUnlock).data == large,
           "a >1 MiB blob round-trips through the production ciphertext backend")
 } catch {
     check(false, "large-blob filesystem backend check succeeds (\(error))")
 }
 
+// Unification: the `csec://` provider resolves a blob-tier value through the
+// generic SecretProvider.resolve path. A path leads to a value — the storage
+// tier is invisible at the reference, and binary bytes survive with full
+// fidelity because the value primitive is Data.
+do {
+    let blobs = NativeBlobStore(
+        keyBackend: InMemoryNativeStoreKeyBackend(),
+        fileBackend: InMemoryNativeStoreFileBackend()
+    )
+    let provider = NativeEncryptedFileProvider(
+        keyBackend: InMemoryNativeStoreKeyBackend(),
+        fileBackend: InMemoryNativeStoreFileBackend(),
+        blobStore: blobs
+    )
+    let store = try NativeStoreName("unified")
+    let binary = Data([0x00, 0x01, 0xff, 0xfe, 0x0a, 0x7f, 0x80])
+    _ = try await blobs.putBlobs(
+        store: store,
+        requests: [.init(key: "keyfile", data: binary, mode: 0o400, path: "config/master.key")],
+        unlock: nativeUnlock
+    )
+    let resolved = try await provider.resolve(
+        try SecretRef("csec://unified/keyfile"), unlock: nativeUnlock
+    )
+    check(resolved.value == binary && resolved.cacheHint == .noCache,
+          "the csec:// provider resolves a blob-tier value to its exact bytes")
+    do {
+        _ = try await provider.resolve(try SecretRef("csec://unified/absent"), unlock: nativeUnlock)
+        check(false, "a missing key in a store that exists is secretNotFound across both tiers")
+    } catch NativeStoreError.secretNotFound {
+        check(true, "a missing key in a store that exists is secretNotFound across both tiers")
+    }
+    do {
+        _ = try await provider.resolve(try SecretRef("csec://nostore/key"), unlock: nativeUnlock)
+        check(false, "an unknown store is storeNotFound across both tiers")
+    } catch NativeStoreError.storeNotFound {
+        check(true, "an unknown store is storeNotFound across both tiers")
+    }
+} catch {
+    check(false, "unified csec:// provider blob resolution succeeds (\(error))")
+}
+
 print("\n# ProtectedFileSidecar (untrusted *.csec pointer)")
 do {
-    let ref = try NativeBlobReference(store: try NativeStoreName("project"), key: "env_home")
+    let ref = try NativeSecretReference(store: try NativeStoreName("project"), key: "env_home")
     let encoded = try ProtectedFileSidecar(reference: ref).encoded()
     check(try ProtectedFileSidecar(data: encoded).reference == ref,
-          "a sidecar round-trips its csecfile reference")
+          "a sidecar round-trips its csec:// reference")
     let derivedDotEnvrc = try ProtectedFileSidecar.targetName(forSidecarNamed: ".envrc.csec")
     let derivedConfig = try ProtectedFileSidecar.targetName(forSidecarNamed: "config.json.csec")
     check(derivedDotEnvrc == ".envrc" && derivedConfig == "config.json",
@@ -573,13 +612,13 @@ do {
     }
     let good = "convenient-security/protected-file"
     rejects("an unknown key is rejected",
-            #"{"csec":"\#(good)","version":1,"reference":"csecfile://project/env_home","x":1}"#)
+            #"{"csec":"\#(good)","version":1,"reference":"csec://project/env_home","x":1}"#)
     rejects("a wrong magic is rejected",
-            #"{"csec":"evil","version":1,"reference":"csecfile://project/env_home"}"#)
+            #"{"csec":"evil","version":1,"reference":"csec://project/env_home"}"#)
     rejects("an unsupported version is rejected",
-            #"{"csec":"\#(good)","version":2,"reference":"csecfile://project/env_home"}"#)
-    rejects("a non-file (csec://) reference is rejected",
-            #"{"csec":"\#(good)","version":1,"reference":"csec://project/env_home"}"#)
+            #"{"csec":"\#(good)","version":2,"reference":"csec://project/env_home"}"#)
+    rejects("a legacy csecfile:// reference is rejected",
+            #"{"csec":"\#(good)","version":1,"reference":"csecfile://project/env_home"}"#)
     rejects("a 1Password reference is rejected",
             #"{"csec":"\#(good)","version":1,"reference":"op://vault/item/field"}"#)
     checkThrows("an opaque ciphertext file is not a sidecar") {
@@ -934,7 +973,7 @@ do {
 
     let rawPayloads = try ProtectedFilePayloadRenderer.render(
         bindings: [rawBinding],
-        values: [rawBinding.reference: "regular-file-synthetic-value"]
+        values: [rawBinding.reference: Data("regular-file-synthetic-value".utf8)]
     )
     check(rawPayloads.count == 1
           && rawPayloads[0].relativePath == "files/credential-0"
@@ -943,15 +982,15 @@ do {
     checkThrows("regular-file rendering rejects an empty payload") {
         _ = try ProtectedFilePayloadRenderer.render(
             bindings: [rawBinding],
-            values: [rawBinding.reference: ""]
+            values: [rawBinding.reference: Data("".utf8)]
         )
     }
     checkThrows("regular-file rendering rejects unbound extra values") {
         _ = try ProtectedFilePayloadRenderer.render(
             bindings: [rawBinding],
             values: [
-                rawBinding.reference: "synthetic",
-                "op://regular-file/unbound/content": "synthetic-extra",
+                rawBinding.reference: Data("synthetic".utf8),
+                "op://regular-file/unbound/content": Data("synthetic-extra".utf8),
             ]
         )
     }
@@ -966,7 +1005,7 @@ do {
     try githubPlan.validate()
     let githubPayload = try ProtectedFilePayloadRenderer.render(
         bindings: [githubBinding],
-        values: [githubBinding.reference: "synthetic-'github-token"]
+        values: [githubBinding.reference: Data("synthetic-'github-token".utf8)]
     )
     let githubText = String(data: githubPayload[0].data, encoding: .utf8) ?? ""
     check(githubPayload[0].relativePath == "github/hosts.yml"
@@ -978,7 +1017,7 @@ do {
     checkThrows("GH_CONFIG_DIR rendering rejects line injection in a token") {
         _ = try ProtectedFilePayloadRenderer.render(
             bindings: [githubBinding],
-            values: [githubBinding.reference: "synthetic\nforged: true"]
+            values: [githubBinding.reference: Data("synthetic\nforged: true".utf8)]
         )
     }
 
@@ -2139,7 +2178,7 @@ let injectPlan = ExecPlanner.Plan(assignments: ["DATABASE_URL": "op://vault/db/u
 if let env = try? ExecPlanner.resolvedEnvironment(
     base: ["PATH": "/usr/bin", "DATABASE_URL": "placeholder"],
     plan: injectPlan,
-    values: ["op://vault/db/url": "postgres://resolved"]
+    values: ["op://vault/db/url": Data("postgres://resolved".utf8)]
 ) {
     check(env["DATABASE_URL"] == "postgres://resolved", "resolved value replaces the placeholder")
     check(env["PATH"] == "/usr/bin", "unrelated variables are preserved")
@@ -2149,7 +2188,7 @@ if let env = try? ExecPlanner.resolvedEnvironment(
 
 // With an empty base it yields exactly the injected subset (the exec code path).
 check((try? ExecPlanner.resolvedEnvironment(
-    base: [:], plan: injectPlan, values: ["op://vault/db/url": "postgres://resolved"]
+    base: [:], plan: injectPlan, values: ["op://vault/db/url": Data("postgres://resolved".utf8)]
 )) == ["DATABASE_URL": "postgres://resolved"], "empty base yields only the injected variables")
 
 checkThrows("resolvedEnvironment throws when the agent returned no value") {
@@ -2167,7 +2206,7 @@ checkThrows("environment delivery rejects a protected value containing NUL") {
     _ = try ExecPlanner.resolvedEnvironment(
         base: [:],
         plan: injectPlan,
-        values: ["op://vault/db/url": "synthetic\0value"]
+        values: ["op://vault/db/url": Data("synthetic\0value".utf8)]
     )
 }
 
@@ -2250,7 +2289,7 @@ check(unmatchedFlush.data == Data("trailing-abcd".utf8) && unmatchedFlush.matche
       "an unmatched trailing prefix is forwarded intact at EOF")
 
 let encodedCatalog = OutputRedactionCatalog(
-    valuesByReference: ["op://Synthetic/Output/token": "alpha:/\"beta-token"]
+    valuesByReference: ["op://Synthetic/Output/token": Data("alpha:/\"beta-token".utf8)]
 )
 let base64Text = Data("alpha:/\"beta-token".utf8).base64EncodedData()
 let encodedRedaction = redact(patterns: encodedCatalog.patterns, chunks: [base64Text])
@@ -2272,19 +2311,19 @@ check(jsonRedaction.data == Data("[csec:secret-1]".utf8)
       "JSON-escaped output is detected")
 
 let shortCatalog = OutputRedactionCatalog(
-    valuesByReference: ["op://Synthetic/short": "tiny"]
+    valuesByReference: ["op://Synthetic/short": Data("tiny".utf8)]
 )
 check(shortCatalog.patterns.isEmpty && shortCatalog.skippedShortValueCount == 1,
       "short common values are excluded from automatic destructive matching")
 let optedInShortCatalog = OutputRedactionCatalog(
-    valuesByReference: ["op://Synthetic/short": "tiny"],
+    valuesByReference: ["op://Synthetic/short": Data("tiny".utf8)],
     includeShortValues: true
 )
 check(!optedInShortCatalog.patterns.isEmpty,
       "short-value matching requires an explicit opt-in")
 
 let referenceCatalog = OutputRedactionCatalog(
-    valuesByReference: ["op://Synthetic/Output/token": "synthetic-output-token"],
+    valuesByReference: ["op://Synthetic/Output/token": Data("synthetic-output-token".utf8)],
     labelStyle: .reference
 )
 let referenceRedaction = redact(
@@ -2295,7 +2334,7 @@ check(referenceRedaction.data == Data("op://Synthetic/Output/token".utf8),
       "reference-shaped replacement is available only through the opt-in catalog style")
 
 let unsafeReferenceCatalog = OutputRedactionCatalog(
-    valuesByReference: ["op://Synthetic/item/field\nforged\u{202e}": "synthetic-control-token"],
+    valuesByReference: ["op://Synthetic/item/field\nforged\u{202e}": Data("synthetic-control-token".utf8)],
     labelStyle: .reference
 )
 let unsafeReferenceRedaction = redact(
@@ -2309,8 +2348,8 @@ let collisionSource = "synthetic-collision-source"
 let collisionExact = Data(collisionSource.utf8).base64EncodedString()
 let collisionCatalog = OutputRedactionCatalog(
     valuesByReference: [
-        "op://Synthetic/a-derived": collisionSource,
-        "op://Synthetic/b-exact": collisionExact,
+        "op://Synthetic/a-derived": Data(collisionSource.utf8),
+        "op://Synthetic/b-exact": Data(collisionExact.utf8),
     ],
     labelStyle: .reference
 )
@@ -2868,17 +2907,17 @@ do {
     let backend = FakeKeychainBackend()
     let cache = KeychainSecretCache(backend: backend)
 
-    try await cache.put("op://vault/db/url", value: "postgres://s3cr3t", maxAge: 3600)
-    check(try await cache.get("op://vault/db/url", unlock: nil) == "postgres://s3cr3t",
+    try await cache.put("op://vault/db/url", value: Data("postgres://s3cr3t".utf8), maxAge: 3600)
+    check(try await cache.get("op://vault/db/url", unlock: nil) == Data("postgres://s3cr3t".utf8),
           "warm hit serves an in-grant fetch with no unlock (zero touches)")
     check(await backend.loadCount == 0, "a warm hit never consults the keychain backend")
 
     // A fresh cache over the same backend = the keychain surviving a restart.
     let afterRestart = KeychainSecretCache(backend: backend)
-    check(try await afterRestart.get("op://vault/db/url", unlock: unlock) == "postgres://s3cr3t",
+    check(try await afterRestart.get("op://vault/db/url", unlock: unlock) == Data("postgres://s3cr3t".utf8),
           "cold keychain read serves after a restart when the consent context is supplied")
     check(await backend.loadCount == 1, "the cold read consults the backend exactly once")
-    check(try await afterRestart.get("op://vault/db/url", unlock: nil) == "postgres://s3cr3t",
+    check(try await afterRestart.get("op://vault/db/url", unlock: nil) == Data("postgres://s3cr3t".utf8),
           "a cold hit is promoted to the warm tier and served free thereafter")
     check(await backend.loadCount == 1, "the promoted value is not re-read from the backend")
 
@@ -2893,7 +2932,7 @@ do {
     // provider), not a surprise biometric.
     let warmExpiry = FakeKeychainBackend()
     let warmExpiryCache = KeychainSecretCache(backend: warmExpiry)
-    try await warmExpiryCache.put("op://vault/short/lived", value: "STALE", maxAge: -1)
+    try await warmExpiryCache.put("op://vault/short/lived", value: Data("STALE".utf8), maxAge: -1)
     check(try await warmExpiryCache.get("op://vault/short/lived", unlock: nil) == nil,
           "an expired warm entry with no unlock is a miss, not a prompt")
     check(await warmExpiry.loadCount == 0, "expired warm + no unlock never consults the backend")
@@ -2901,7 +2940,7 @@ do {
     // A cold entry past its maxAge is dropped on read, not served.
     let coldExpiry = FakeKeychainBackend()
     let coldWriter = KeychainSecretCache(backend: coldExpiry)
-    try await coldWriter.put("op://vault/expired", value: "OLD", maxAge: -1)
+    try await coldWriter.put("op://vault/expired", value: Data("OLD".utf8), maxAge: -1)
     let coldReader = KeychainSecretCache(backend: coldExpiry)
     check(try await coldReader.get("op://vault/expired", unlock: unlock) == nil,
           "an expired cold entry is not served")
@@ -2910,7 +2949,7 @@ do {
     // invalidate clears both tiers.
     let invBackend = FakeKeychainBackend()
     let invCache = KeychainSecretCache(backend: invBackend)
-    try await invCache.put("op://vault/rotated", value: "V", maxAge: 3600)
+    try await invCache.put("op://vault/rotated", value: Data("V".utf8), maxAge: 3600)
     await invCache.invalidate("op://vault/rotated")
     check(try await invCache.get("op://vault/rotated", unlock: unlock) == nil,
           "invalidate removes the value from the warm tier")

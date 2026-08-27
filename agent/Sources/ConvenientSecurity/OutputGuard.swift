@@ -60,7 +60,7 @@ public struct OutputRedactionCatalog: Sendable {
     public let skippedEmptyValueCount: Int
 
     public init(
-        valuesByReference: [String: String],
+        valuesByReference: [String: Data],
         labelStyle: OutputRedactionLabelStyle = .opaque,
         includeShortValues: Bool = false
     ) {
@@ -70,8 +70,7 @@ public struct OutputRedactionCatalog: Sendable {
         var referenceForValue: [Data: String] = [:]
         var empty = 0
         for reference in valuesByReference.keys.sorted() {
-            guard let value = valuesByReference[reference] else { continue }
-            let bytes = Data(value.utf8)
+            guard let bytes = valuesByReference[reference] else { continue }
             guard !bytes.isEmpty else {
                 empty += 1
                 continue

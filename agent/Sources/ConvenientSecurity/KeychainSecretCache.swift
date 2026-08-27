@@ -5,7 +5,7 @@ import LocalAuthentication
 /// tier and JSON-encoded as the keychain item's data in the cold tier, so a
 /// restored value carries its own expiry across an agent restart.
 struct CacheEntry: Codable, Sendable {
-    let value: String
+    let value: Data
     let expiresAt: Date
 }
 
@@ -47,7 +47,7 @@ public actor KeychainSecretCache: SecretCache {
         self.backend = SecurityKeychainBackend(service: service)
     }
 
-    public func get(_ uri: String, unlock: CacheUnlock?) async throws -> String? {
+    public func get(_ uri: String, unlock: CacheUnlock?) async throws -> Data? {
         let now = Date()
 
         if let entry = warm[uri] {
@@ -77,7 +77,7 @@ public actor KeychainSecretCache: SecretCache {
         return entry.value
     }
 
-    public func put(_ uri: String, value: String, maxAge: TimeInterval) async throws {
+    public func put(_ uri: String, value: Data, maxAge: TimeInterval) async throws {
         let entry = CacheEntry(value: value, expiresAt: Date().addingTimeInterval(maxAge))
         warm[uri] = entry
         let data = try JSONEncoder().encode(entry)

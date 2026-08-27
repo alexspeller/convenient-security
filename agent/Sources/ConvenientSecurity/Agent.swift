@@ -621,7 +621,7 @@ public actor Agent {
         unlock: CacheUnlock?,
         activeUntil: Date?
     ) async -> Response {
-        var values: [String: String] = [:]
+        var values: [String: Data] = [:]
         for ref in refs {
             do {
                 values[ref.uri] = try await resolver.resolve(ref, unlock: unlock)

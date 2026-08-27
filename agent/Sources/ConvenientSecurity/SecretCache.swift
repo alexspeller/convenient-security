@@ -12,10 +12,10 @@ public protocol SecretCache: Sendable {
     /// only attempted when `unlock` is present — the consent context that just
     /// authorized the grant — so the cache never raises a biometric prompt the
     /// caller didn't already consent to. With no `unlock`, a warm miss is a miss.
-    func get(_ uri: String, unlock: CacheUnlock?) async throws -> String?
+    func get(_ uri: String, unlock: CacheUnlock?) async throws -> Data?
     /// Persist a value for at most `maxAge`. Writing the keychain item needs no
     /// biometric; only reading it back does.
-    func put(_ uri: String, value: String, maxAge: TimeInterval) async throws
+    func put(_ uri: String, value: Data, maxAge: TimeInterval) async throws
     /// Drop a cached value from both tiers (e.g. on rotation).
     func invalidate(_ uri: String) async
 }
@@ -24,7 +24,7 @@ public protocol SecretCache: Sendable {
 /// entitlement to the data-protection keychain. Every `get` is a miss.
 public struct NullSecretCache: SecretCache {
     public init() {}
-    public func get(_ uri: String, unlock: CacheUnlock?) async throws -> String? { nil }
-    public func put(_ uri: String, value: String, maxAge: TimeInterval) async throws {}
+    public func get(_ uri: String, unlock: CacheUnlock?) async throws -> Data? { nil }
+    public func put(_ uri: String, value: Data, maxAge: TimeInterval) async throws {}
     public func invalidate(_ uri: String) async {}
 }

@@ -613,7 +613,11 @@ extension Request: Codable {
 public struct Response: Codable, Sendable {
     public let version: Int
     public let requestID: String?
-    public let values: [String: String]?
+    /// Resolved values keyed by canonical reference URI. Bytes, not strings: a
+    /// value is bytes (a token or a whole binary file), base64-encoded on the
+    /// wire by `Data`'s own `Codable`. Delivery converts to a text environment
+    /// value only at the injection boundary, where UTF-8/no-NUL is required.
+    public let values: [String: Data]?
     public let schemes: [String]?
     public let capabilities: ProtocolCapabilities?
     public let registeredSessionID: String?
@@ -638,7 +642,7 @@ public struct Response: Codable, Sendable {
     public init(
         version: Int = WireProtocol.version,
         requestID: String? = nil,
-        values: [String: String]? = nil,
+        values: [String: Data]? = nil,
         schemes: [String]? = nil,
         capabilities: ProtocolCapabilities? = nil,
         registeredSessionID: String? = nil,

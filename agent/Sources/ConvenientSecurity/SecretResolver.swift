@@ -34,7 +34,7 @@ public actor SecretResolver {
     /// The cache is strictly an optimization: a read or write failure is logged and
     /// treated as a miss / no-op, never propagated — a keychain hiccup must not
     /// break resolution when the provider can still serve the value.
-    public func resolve(_ ref: SecretRef, unlock: CacheUnlock?) async throws -> String {
+    public func resolve(_ ref: SecretRef, unlock: CacheUnlock?) async throws -> Data {
         if let cached = await cachedValue(for: ref.uri, unlock: unlock) {
             return cached
         }
@@ -52,7 +52,7 @@ public actor SecretResolver {
         return resolved.value
     }
 
-    private func cachedValue(for uri: String, unlock: CacheUnlock?) async -> String? {
+    private func cachedValue(for uri: String, unlock: CacheUnlock?) async -> Data? {
         do {
             return try await cache.get(uri, unlock: unlock)
         } catch {

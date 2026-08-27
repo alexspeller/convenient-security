@@ -29,10 +29,13 @@ public struct OnePasswordProvider: SecretProvider {
             let message = (stderr?.isEmpty == false) ? stderr! : "op exited \(result.status)"
             throw OnePasswordError.readFailed(reference: ref.uri, status: result.status, message: message)
         }
-        guard let value = String(data: result.stdout, encoding: .utf8) else {
+        // `op read` addresses a single field, which is text; a non-UTF-8 result
+        // signals a wrong reference (e.g. a document) rather than a real value.
+        // The validated bytes are sealed verbatim — a value is bytes.
+        guard String(data: result.stdout, encoding: .utf8) != nil else {
             throw OnePasswordError.notUTF8(ref.uri)
         }
-        return ResolvedSecret(value: value, cacheHint: .cacheable(maxAge: cacheMaxAge))
+        return ResolvedSecret(value: result.stdout, cacheHint: .cacheable(maxAge: cacheMaxAge))
     }
 
     public func authenticate() async throws {

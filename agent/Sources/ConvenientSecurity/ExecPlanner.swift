@@ -101,14 +101,19 @@ public enum ExecPlanner {
     public static func resolvedEnvironment(
         base: [String: String],
         plan: Plan,
-        values: [String: String]
+        values: [String: Data]
     ) throws -> [String: String] {
         var environment = base
         for (name, reference) in plan.assignments {
-            guard let value = values[reference] else {
+            guard let bytes = values[reference] else {
                 throw PlanError.missingValue(name: name, reference: reference)
             }
-            guard !value.utf8.contains(0) else {
+            // An environment variable is a NUL-free UTF-8 C string. A value that
+            // is not representable as one — a binary file, say — is a real value
+            // that simply cannot be delivered through the environment; it must go
+            // via a materialized file instead.
+            guard let value = String(data: bytes, encoding: .utf8),
+                  !value.utf8.contains(0) else {
                 throw PlanError.valueNotEnvironmentCompatible(name: name)
             }
             environment[name] = value
