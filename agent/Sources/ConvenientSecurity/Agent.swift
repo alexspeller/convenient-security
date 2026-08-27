@@ -631,9 +631,13 @@ public actor Agent {
             do {
                 values[ref.uri] = try await resolver.resolve(ref, unlock: unlock)
             } catch {
+                // The reference URI is value-free metadata the consent window
+                // already displayed; naming it turns an opaque failure into an
+                // actionable one. The provider's own error stays out: it can
+                // carry unbounded tool output.
                 return .failed(
                     .resolutionFailed,
-                    message: "the provider could not resolve one or more references",
+                    message: "the provider could not resolve \(ref.safeInlineURI)",
                     requestID: requestID
                 )
             }

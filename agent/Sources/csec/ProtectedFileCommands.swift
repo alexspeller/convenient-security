@@ -439,6 +439,28 @@ func runSidecarExec(
     } catch {
         materialization?.removeAll()
         writeProtectedFileError("csec exec: \(error.localizedDescription)\n")
+        // A failed resolution names the reference; the launcher knows where each
+        // reference in this launch came from, which is what the user must edit.
+        if case AgentClient.ClientError.protocolFailure(.resolutionFailed, _) = error {
+            writeProtectedFileError("csec exec: this launch requested:\n")
+            for discovery in discoveries {
+                writeProtectedFileError(
+                    "  \(discovery.reference.safeInlineURI)  —  sidecar "
+                        + "\(discovery.sidecarRelativePath) (materializes "
+                        + "\(discovery.targetRelativePath))\n"
+                )
+            }
+            for assignment in environmentAssignments {
+                let safe = (try? SecretRef(assignment.reference))?.safeInlineURI
+                    ?? "<invalid reference>"
+                writeProtectedFileError(
+                    "  \(safe)  —  environment \(assignment.name)\n"
+                )
+            }
+            writeProtectedFileError(
+                "Fix or remove the source of the unresolvable reference and retry.\n"
+            )
+        }
         exit(1)
     }
 }

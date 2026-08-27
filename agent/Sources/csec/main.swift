@@ -883,6 +883,18 @@ func runExec(_ arguments: [String]) -> Never {
             injected = try ExecPlanner.resolvedEnvironment(base: [:], plan: plan, values: values)
         } catch {
             FileHandle.standardError.write(Data("csec exec: \(error.localizedDescription)\n".utf8))
+            // A failed resolution names the reference; say which environment
+            // name carries each one so the user knows what to fix or unset.
+            if case AgentClient.ClientError.protocolFailure(.resolutionFailed, _) = error {
+                FileHandle.standardError.write(Data("csec exec: this launch requested:\n".utf8))
+                for (name, reference) in plan.assignments.sorted(by: { $0.key < $1.key }) {
+                    let safe = (try? SecretRef(reference))?.safeInlineURI ?? "<invalid reference>"
+                    FileHandle.standardError.write(Data("  \(safe)  —  environment \(name)\n".utf8))
+                }
+                FileHandle.standardError.write(Data(
+                    "Fix or unset the source of the unresolvable reference and retry.\n".utf8
+                ))
+            }
             exit(1)
         }
     }

@@ -1491,6 +1491,20 @@ do {
           && warned.err.contains("warning"),
           "csec exec warns about an unparseable *.csec instead of silently skipping "
             + "(err \"\(warned.err)\")")
+
+    // A sidecar naming a reference no provider can resolve fails closed — and the
+    // error names both the failing reference and each requested reference's
+    // source, because "one or more references" gives the user nothing to fix.
+    let ghostPath = projectDir + "/ghost.env.csec"
+    try Data("op://demo/missing/value\n".utf8).write(to: URL(fileURLWithPath: ghostPath))
+    let unresolvable = runInProject(["exec", "--", "/bin/sh", "-c", "printf unreachable"])
+    try? FileManager.default.removeItem(atPath: ghostPath)
+    check(unresolvable.status == 1
+          && unresolvable.out.isEmpty
+          && unresolvable.err.contains("op://demo/missing/value")
+          && unresolvable.err.contains("ghost.env.csec"),
+          "an unresolvable sidecar reference is named together with its source file "
+            + "(status \(unresolvable.status), err \"\(unresolvable.err)\")")
 } catch {
     check(false, "csec exec sidecar materialization end-to-end succeeds (\(error))")
 }
