@@ -139,6 +139,13 @@ func usage() -> Never {
                fail-closed hooks and may import only explicitly selected plaintext
                candidates into one native encrypted store; existing hooks/keys are
                never replaced without their separate explicit replacement flags.
+    audit      Run the value-free host posture audit through csecd and render the
+               findings (severity-ordered, ★ marks controls that shrink same-user
+               malware blast radius). On a terminal the scan animates live progress;
+               piped or --json output stays plain. By default csecd then offers the
+               reversible fixes as one Touch ID review; --report-only just prints,
+               --json emits the machine-readable report, and --scan-filesystem adds
+               the bounded SUID/world-writable sweep.
     install    Register csecd as a login-item LaunchAgent so it runs in the background.
     uninstall  Unregister the csecd LaunchAgent.
     status     Show whether the csecd LaunchAgent is registered/enabled.

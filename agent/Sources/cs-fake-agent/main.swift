@@ -75,6 +75,18 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
             message: "the standalone fake agent does not run the host posture audit",
             requestID: request.requestID
         )
+    case let .hostAuditStart(request):
+        return .failed(
+            .deliveryNotSupported,
+            message: "the standalone fake agent does not run the host posture audit",
+            requestID: request.requestID
+        )
+    case let .hostAuditPoll(request):
+        return .failed(
+            .deliveryNotSupported,
+            message: "the standalone fake agent does not run the host posture audit",
+            requestID: request.requestID
+        )
     case let .hostRemediate(request):
         return .failed(
             .deliveryNotSupported,

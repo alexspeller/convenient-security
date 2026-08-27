@@ -2932,6 +2932,9 @@ await hostAuditTests_H()
 await hostAuditTests_I()
 await hostAuditTests_J()
 await hostAuditTests_K()
+await hostAuditStreamingTests()
+hostAuditStreamingSocketTests()
+hostAuditRootProtocolTests()
 
 if failures == 0 {
     print("\nAll checks passed.")

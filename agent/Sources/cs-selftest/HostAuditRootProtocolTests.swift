@@ -9,8 +9,10 @@ import Foundation
 // digest applies; and hostApply with a mismatched digest is rejected — the
 // fail-closed gate that keeps a tampered/unreviewed change from ever applying.
 func hostAuditRootProtocolTests() {
-    let base = FileManager.default.temporaryDirectory
-        .appendingPathComponent("csec-hostops-\(UUID().uuidString)", isDirectory: true)
+    // Short base under /tmp: the socket path must fit in sun_path (~104 bytes),
+    // which the long per-user /var/folders temp dir would overflow.
+    let base = URL(fileURLWithPath: "/tmp")
+        .appendingPathComponent("cs-hostops-\(UUID().uuidString)", isDirectory: true)
     let socketPath = base.appendingPathComponent("rootd.sock").path
     let mountPath = base.appendingPathComponent("files").path
     do {

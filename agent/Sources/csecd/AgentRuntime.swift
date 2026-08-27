@@ -133,6 +133,9 @@ func startAgentServer() async {
     let clientTrustPolicy: SocketPeerTrustPolicy = .requireProductLauncher
   #endif
 
+  // Tracks in-flight streaming audits so `csec audit` can poll live progress.
+  let hostAuditBoard = HostAuditProgressBoard()
+
   let server = SocketServer(path: socketPath, clientTrustPolicy: clientTrustPolicy) {
     request, caller in
     switch request {
@@ -216,6 +219,12 @@ func startAgentServer() async {
         generatedAtHint: ISO8601DateFormatter().string(from: Date())
       )
       return Response(requestID: request.requestID, hostAuditReport: report)
+    case .hostAuditStart(let request):
+      // Streaming path: kick off the same interactive audit as a background job
+      // and return the initial progress snapshot. The launcher polls for updates.
+      return await hostAuditBoard.start(request)
+    case .hostAuditPoll(let request):
+      return await hostAuditBoard.poll(request)
     case .hostRemediate(let request):
       return await agent.runHostRemediation(request: request, caller: caller)
     }

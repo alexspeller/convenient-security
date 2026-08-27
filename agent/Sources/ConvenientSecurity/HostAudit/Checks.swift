@@ -101,11 +101,24 @@ public enum HostCheckRegistry {
 public struct HostAuditEngine: Sendable {
     public init() {}
 
-    public func run(_ ctx: HostAuditContext, generatedAtHint: String? = nil) async -> HostAuditReport {
+    /// Run every registered check. `onProgress`, when supplied, is invoked with
+    /// `(completed, total, currentID, currentTitle)` immediately before each check
+    /// runs and once more (with `completed == total` and empty id/title) as the
+    /// report is finalized. The reported id/title are static catalog metadata —
+    /// the callback never sees evidence or command output.
+    public func run(
+        _ ctx: HostAuditContext,
+        generatedAtHint: String? = nil,
+        onProgress: (@Sendable (Int, Int, String, String) async -> Void)? = nil
+    ) async -> HostAuditReport {
+        let checks = HostCheckRegistry.all
+        let total = checks.count
         var findings: [HostFinding] = []
-        for check in HostCheckRegistry.all {
+        for (index, check) in checks.enumerated() {
+            await onProgress?(index, total, check.meta.id, check.meta.title)
             findings.append(await check.evaluate(ctx))
         }
+        await onProgress?(total, total, "", "")
         let ordered = HostAuditReport.ordered(findings)
         let unverifiable = ordered
             .filter { $0.status == .unknown }

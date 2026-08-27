@@ -1,6 +1,10 @@
 import Foundation
 import ConvenientSecurity
 
+#if canImport(Darwin)
+import Darwin
+#endif
+
 // `csec audit` — the host posture audit surface (docs/host-audit-catalog.md).
 //
 // The launcher is a thin client: it asks the resident agent (csecd) to run the
@@ -34,9 +38,14 @@ func runAudit(_ arguments: [String]) -> Never {
 @discardableResult
 func performHostAudit(scanFilesystem: Bool, reportOnly: Bool, json: Bool, quietWhenUnavailable: Bool = false) -> Int32 {
     let client = makeAgentClient()
+    // Animate the scan on an interactive terminal; keep machine output (piped
+    // stdout or --json) on the plain, blocking request.
+    let animate = !json && auditAnimationEnabled()
     let report: HostAuditReport
     do {
-        report = try client.hostAudit(scanFilesystem: scanFilesystem)
+        report = animate
+            ? try runAnimatedAudit(client: client, scanFilesystem: scanFilesystem)
+            : try client.hostAudit(scanFilesystem: scanFilesystem)
     } catch {
         if quietWhenUnavailable {
             print("\ncsec audit: the resident agent (csecd) is not reachable; run `csec audit` after it is running.")
@@ -67,7 +76,8 @@ func performHostAudit(scanFilesystem: Bool, reportOnly: Bool, json: Bool, quietW
         print("\n## Remediation")
         print("csecd will present \(report.batchFixable.count) reversible fix(es) as one review — a single Touch ID applies the ones you keep selected.")
         do {
-            let summary = try client.hostRemediate(scanFilesystem: scanFilesystem)
+            let summary = try remediateWithProgress(
+                client: client, scanFilesystem: scanFilesystem, animate: animate)
             renderRemediation(summary)
         } catch {
             print("- remediation review could not be presented (csecd unavailable or denied).")
@@ -82,6 +92,79 @@ func performHostAudit(scanFilesystem: Bool, reportOnly: Bool, json: Bool, quietW
     }
 
     return report.findings.contains { $0.status == .fail } ? 2 : 0
+}
+
+// MARK: - Streaming scan (animated)
+
+/// Drive the streaming audit: kick off the background job in csecd, then poll it
+/// on a fixed cadence and animate a value-free progress line until the report is
+/// ready. Degrades gracefully to the blocking audit if the resident agent does
+/// not speak the streaming verbs (an older csecd) or the stream breaks mid-run.
+private func runAnimatedAudit(client: AgentClient, scanFilesystem: Bool) throws -> HostAuditReport {
+    installAuditInterruptCursorRestore()
+    let stream: HostAuditProgressStream
+    do {
+        stream = try client.beginHostAudit(scanFilesystem: scanFilesystem)
+    } catch {
+        // No streaming support (or a transient failure) — fall back so the user
+        // still gets a report. If csecd is simply unreachable this rethrows and
+        // the caller renders the standard "is it running?" message.
+        return try client.hostAudit(scanFilesystem: scanFilesystem)
+    }
+
+    var view = AuditProgressView(start: Date())
+    view.render(stream.snapshot)
+    while !stream.isDone {
+        usleep(90_000)      // ~11 fps: smooth spinner, negligible socket traffic
+        do {
+            try stream.poll()
+        } catch {
+            view.finish()
+            return try client.hostAudit(scanFilesystem: scanFilesystem)
+        }
+        view.render(stream.snapshot)
+    }
+    view.finish()
+    guard let report = stream.report else {
+        return try client.hostAudit(scanFilesystem: scanFilesystem)
+    }
+    return report
+}
+
+/// Present a spinner while the (blocking) remediation review is prepared. csecd
+/// re-checks the host before showing the Touch ID window, so without this the
+/// terminal would sit silent for several seconds. The blocking call stays on the
+/// calling thread; only the spinner animates on a helper thread.
+private func remediateWithProgress(
+    client: AgentClient, scanFilesystem: Bool, animate: Bool
+) throws -> HostRemediationSummary {
+    guard animate else { return try client.hostRemediate(scanFilesystem: scanFilesystem) }
+    installAuditInterruptCursorRestore()
+    let stop = AtomicFlag()
+    let finished = DispatchSemaphore(value: 0)
+    Thread.detachNewThread {
+        var spinner = IndeterminateSpinner(
+            label: "Re-checking host and preparing fixes — approve in the Touch ID window when it appears…")
+        while !stop.value {
+            spinner.tick()
+            usleep(90_000)
+        }
+        spinner.stop()
+        finished.signal()
+    }
+    defer {
+        stop.set()
+        finished.wait()
+    }
+    return try client.hostRemediate(scanFilesystem: scanFilesystem)
+}
+
+/// A tiny lock-guarded boolean shared with the spinner helper thread.
+private final class AtomicFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+    var value: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+    func set() { lock.lock(); flag = true; lock.unlock() }
 }
 
 // MARK: - Rendering (value-free)

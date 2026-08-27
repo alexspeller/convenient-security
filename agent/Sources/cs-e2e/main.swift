@@ -303,6 +303,18 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.handleRiskOperation(request: risk, caller: caller)
     case let .hostAudit(request):
         return Response(requestID: request.requestID, hostAuditReport: nil)
+    case let .hostAuditStart(request):
+        return .failed(
+            .deliveryNotSupported,
+            message: "the e2e harness does not run the host posture audit",
+            requestID: request.requestID
+        )
+    case let .hostAuditPoll(request):
+        return .failed(
+            .deliveryNotSupported,
+            message: "the e2e harness does not run the host posture audit",
+            requestID: request.requestID
+        )
     case let .hostRemediate(request):
         return await agent.runHostRemediation(request: request, caller: caller)
     case let .approveProtectedLaunch(approval):

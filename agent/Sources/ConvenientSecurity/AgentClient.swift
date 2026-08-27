@@ -199,6 +199,28 @@ public struct AgentClient {
         return report
     }
 
+    /// Begin a *streaming* host audit: csecd runs the engine as a background job
+    /// and this launcher polls it for value-free progress snapshots so `csec audit`
+    /// can animate the scan. Returns a handle carrying the initial snapshot and an
+    /// open, authenticated connection; call `poll()` on it until `snapshot.done`,
+    /// then read `report`. Falls back to the blocking `hostAudit` is the caller's
+    /// job when this throws (an older csecd that lacks the streaming verbs).
+    public func beginHostAudit(scanFilesystem: Bool = false) throws -> HostAuditProgressStream {
+        let connection = try AgentConnection(path: path, serverTrustPolicy: serverTrustPolicy)
+        let request = HostAuditRequest(scanFilesystem: scanFilesystem)
+        let response = try connection.send(.hostAuditStart(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let snapshot = response.hostAuditProgress else {
+            throw ClientError.transportFailed
+        }
+        return HostAuditProgressStream(
+            connection: connection,
+            jobID: request.requestID,
+            initial: snapshot,
+            report: response.hostAuditReport
+        )
+    }
+
     /// Ask csecd to present the batched remediation review (one Touch ID) and
     /// apply the selected fixes. Returns the value-free applied/skipped/failed
     /// summary; csecd owns the review window and the privileged applies.
@@ -398,6 +420,48 @@ public final class AgentOutputRedactionSession {
         }
         if finish { finishedStreams.insert(stream) }
         return OutputRedactionResult(data: redactedData, matches: matches)
+    }
+}
+
+/// Caller-facing handle for a streaming host audit. `poll()` fetches the next
+/// value-free progress snapshot over the persistent authenticated connection;
+/// once `isDone`, `report` holds the finished value-free report. Deliberately
+/// single-threaded — the launcher's render loop drives it at its own cadence.
+public final class HostAuditProgressStream {
+    private let connection: AgentConnection
+    private let jobID: String
+    public private(set) var snapshot: HostAuditProgressSnapshot
+    public private(set) var report: HostAuditReport?
+
+    fileprivate init(
+        connection: AgentConnection,
+        jobID: String,
+        initial: HostAuditProgressSnapshot,
+        report: HostAuditReport?
+    ) {
+        self.connection = connection
+        self.jobID = jobID
+        self.snapshot = initial
+        self.report = report
+    }
+
+    /// True once the audit has finished and its report is available.
+    public var isDone: Bool { snapshot.done && report != nil }
+
+    /// Fetch the next progress snapshot. Idempotent once done — it returns the
+    /// final snapshot without another round-trip (the server has retired the job).
+    @discardableResult
+    public func poll() throws -> HostAuditProgressSnapshot {
+        if isDone { return snapshot }
+        let request = HostAuditPollRequest(jobID: jobID)
+        let response = try connection.send(.hostAuditPoll(request))
+        try AgentClient.check(response: response, requestID: request.requestID)
+        guard let next = response.hostAuditProgress else {
+            throw AgentClient.ClientError.transportFailed
+        }
+        snapshot = next
+        if let report = response.hostAuditReport { self.report = report }
+        return next
     }
 }
 

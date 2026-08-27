@@ -356,6 +356,8 @@ public enum Request: Sendable {
     case risk(RiskOperationRequest)
     case approveProtectedLaunch(ProtectedLaunchApprovalRequest)
     case hostAudit(HostAuditRequest)
+    case hostAuditStart(HostAuditRequest)
+    case hostAuditPoll(HostAuditPollRequest)
     case hostRemediate(HostRemediationRequest)
 }
 
@@ -367,7 +369,7 @@ extension Request: Codable {
         case store, editSessionID, document, mode, externalEditorPath
         case operation, reference, level
         case protectedLaunchApproval
-        case scanFilesystem, selectedKeys
+        case scanFilesystem, selectedKeys, jobID
     }
 
     public init(from decoder: Decoder) throws {
@@ -473,6 +475,16 @@ extension Request: Codable {
                 scanFilesystem: try container.decodeIfPresent(Bool.self, forKey: .scanFilesystem) ?? false,
                 requestUUID: try Self.decodeUUID(container, forKey: .requestID)
             ))
+        case "host_audit_start":
+            self = .hostAuditStart(HostAuditRequest(
+                scanFilesystem: try container.decodeIfPresent(Bool.self, forKey: .scanFilesystem) ?? false,
+                requestUUID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
+        case "host_audit_poll":
+            self = .hostAuditPoll(HostAuditPollRequest(
+                jobID: try container.decode(String.self, forKey: .jobID),
+                requestUUID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
         case "host_remediate":
             self = .hostRemediate(HostRemediationRequest(
                 selectedKeys: try container.decodeIfPresent([String].self, forKey: .selectedKeys) ?? [],
@@ -563,6 +575,16 @@ extension Request: Codable {
             try container.encode(WireProtocol.version, forKey: .version)
             try container.encode(request.requestID, forKey: .requestID)
             try container.encode(request.scanFilesystem, forKey: .scanFilesystem)
+        case let .hostAuditStart(request):
+            try container.encode("host_audit_start", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.scanFilesystem, forKey: .scanFilesystem)
+        case let .hostAuditPoll(request):
+            try container.encode("host_audit_poll", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.jobID, forKey: .jobID)
         case let .hostRemediate(request):
             try container.encode("host_remediate", forKey: .type)
             try container.encode(WireProtocol.version, forKey: .version)
@@ -608,6 +630,7 @@ public struct Response: Codable, Sendable {
     public let protectedLaunchApproved: Bool?
     public let accessExpiresAt: Date?
     public let hostAuditReport: HostAuditReport?
+    public let hostAuditProgress: HostAuditProgressSnapshot?
     public let hostRemediation: HostRemediationSummary?
     public let failure: ProtocolFailure?
     public let error: String?
@@ -632,6 +655,7 @@ public struct Response: Codable, Sendable {
         protectedLaunchApproved: Bool? = nil,
         accessExpiresAt: Date? = nil,
         hostAuditReport: HostAuditReport? = nil,
+        hostAuditProgress: HostAuditProgressSnapshot? = nil,
         hostRemediation: HostRemediationSummary? = nil,
         failure: ProtocolFailure? = nil,
         error: String? = nil
@@ -655,6 +679,7 @@ public struct Response: Codable, Sendable {
         self.protectedLaunchApproved = protectedLaunchApproved
         self.accessExpiresAt = accessExpiresAt
         self.hostAuditReport = hostAuditReport
+        self.hostAuditProgress = hostAuditProgress
         self.hostRemediation = hostRemediation
         self.failure = failure
         self.error = error
