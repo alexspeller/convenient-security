@@ -113,10 +113,44 @@ public struct HostAuditEngine: Sendable {
     ) async -> HostAuditReport {
         let checks = HostCheckRegistry.all
         let total = checks.count
+        // Checks are independent pure functions of the context, so they run
+        // concurrently (bounded) — the wall-clock becomes the slowest single check
+        // rather than the sum. Output order is still deterministic: the report is
+        // re-sorted by (on-thesis, severity, id) below.
+        let maxConcurrent = min(12, max(1, total))
         var findings: [HostFinding] = []
-        for (index, check) in checks.enumerated() {
-            await onProgress?(index, total, check.meta.id, check.meta.title)
-            findings.append(await check.evaluate(ctx))
+        findings.reserveCapacity(total)
+        var completed = 0
+        var started = 0
+        // Indices of checks started but not yet finished. The progress snapshot
+        // names the *oldest still-running* check, so as the fast checks drain the
+        // display converges onto the genuine long pole (e.g. the Gatekeeper sweep)
+        // rather than sitting on a misleading near-complete bar.
+        var inFlight = Set<Int>()
+
+        func report() async {
+            let sample = inFlight.min().map { checks[$0].meta }
+            await onProgress?(completed, total, sample?.id ?? "", sample?.title ?? "")
+        }
+
+        await withTaskGroup(of: (Int, HostFinding).self) { group in
+            func startNext() async {
+                guard started < total else { return }
+                let index = started
+                let check = checks[index]
+                started += 1
+                inFlight.insert(index)
+                await report()
+                group.addTask { (index, await Self.timed(check, ctx)) }
+            }
+            for _ in 0..<maxConcurrent { await startNext() }
+            while let (index, finding) = await group.next() {
+                findings.append(finding)
+                inFlight.remove(index)
+                completed += 1
+                await report()
+                await startNext()
+            }
         }
         await onProgress?(total, total, "", "")
         let ordered = HostAuditReport.ordered(findings)
@@ -131,6 +165,20 @@ public struct HostAuditEngine: Sendable {
             verdict: Self.verdict(for: ordered),
             generatedAtHint: generatedAtHint
         )
+    }
+
+    /// Evaluate one check, optionally logging its wall-clock to stderr when
+    /// `CSEC_AUDIT_TIMING` is set. Diagnostic for finding slow checks; value-free
+    /// (only the catalog id and a duration are emitted).
+    private static func timed(_ check: any HostCheck, _ ctx: HostAuditContext) async -> HostFinding {
+        guard ProcessInfo.processInfo.environment["CSEC_AUDIT_TIMING"] != nil else {
+            return await check.evaluate(ctx)
+        }
+        let started = Date()
+        let finding = await check.evaluate(ctx)
+        let ms = Date().timeIntervalSince(started) * 1000
+        FileHandle.standardError.write(Data(String(format: "audit-timing %@ %.0fms\n", check.meta.id, ms).utf8))
+        return finding
     }
 
     static func verdict(for findings: [HostFinding]) -> String {

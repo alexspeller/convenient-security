@@ -530,6 +530,56 @@ public final class InMemoryBaselineStore: BaselineStoring, @unchecked Sendable {
     public func save(_ baseline: HostAuditBaseline) { lock.lock(); self.baseline = baseline; lock.unlock() }
 }
 
+// MARK: - Per-run memoization (coalesce duplicate + concurrent reads)
+
+/// Wraps a command runner so identical invocations within one audit run execute
+/// once. The engine runs checks concurrently, and a few slow system commands
+/// (notably `sfltool dumpbtm`, ~25s) are issued by more than one check; caching
+/// the in-flight `Task` means concurrent duplicate calls await a single execution
+/// rather than spawning the slow command twice. Scoped to one run (built fresh in
+/// `production()`), so nothing is cached across audits. Read-only commands only —
+/// the audit never mutates through this path.
+public actor MemoizingCommandRunner: CommandRunning {
+    private let base: CommandRunning
+    private var inFlight: [String: Task<HostCommandResult, Never>] = [:]
+
+    public init(_ base: CommandRunning) { self.base = base }
+
+    public func run(_ command: HostCommand) async -> HostCommandResult {
+        let key = command.executable + "\u{0}"
+            + command.arguments.joined(separator: "\u{1}") + "\u{0}"
+            + (command.standardInput ?? "")
+        if let existing = inFlight[key] { return await existing.value }
+        let base = self.base
+        // Detached so the real command runs off the actor — distinct commands stay
+        // concurrent; only identical ones coalesce onto this shared Task.
+        let task = Task<HostCommandResult, Never>.detached { await base.run(command) }
+        inFlight[key] = task
+        return await task.value
+    }
+}
+
+/// Wraps the privileged host ops so identical reads within one run coalesce (e.g.
+/// two checks both read `.sharingServices`). Applies are never cached.
+public actor MemoizingPrivilegedHostOps: PrivilegedHostOps {
+    private let base: PrivilegedHostOps
+    private var inFlight: [HostRootRead: Task<HostPrivilegedRead, Never>] = [:]
+
+    public init(_ base: PrivilegedHostOps) { self.base = base }
+
+    public func read(_ query: HostRootRead) async -> HostPrivilegedRead {
+        if let existing = inFlight[query] { return await existing.value }
+        let base = self.base
+        let task = Task<HostPrivilegedRead, Never>.detached { await base.read(query) }
+        inFlight[query] = task
+        return await task.value
+    }
+
+    public func apply(_ change: HostRootChange) async -> HostPrivilegedApply {
+        await base.apply(change)
+    }
+}
+
 // MARK: - Self identity + options + context
 
 /// csec's own code identities, used to mark HA-D01 (csec's Full Disk Access) as
@@ -606,10 +656,12 @@ public struct HostAuditContext: Sendable {
         rootHelper: RootHelperClient,
         options: HostAuditOptions = HostAuditOptions()
     ) -> HostAuditContext {
-        let commands = SystemCommandRunner()
+        // One memoizing runner shared by the checks and the TCC reader, so any
+        // command issued by more than one check (or concurrently) runs once.
+        let commands = MemoizingCommandRunner(SystemCommandRunner())
         return HostAuditContext(
             commands: commands,
-            privileged: RootHelperPrivilegedOps(client: rootHelper),
+            privileged: MemoizingPrivilegedHostOps(RootHelperPrivilegedOps(client: rootHelper)),
             tcc: SystemTCCReader(commands: commands),
             files: SystemFileInspector(),
             environment: ProcessInfo.processInfo.environment,
