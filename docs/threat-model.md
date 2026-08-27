@@ -189,6 +189,21 @@ plugins, configuration, or inputs trustworthy. The signed installed behavior
 must pass [`regular-file-security-matrix.md`](regular-file-security-matrix.md)
 before real secrets are used.
 
+`csec protect`/`csec exec` extend this mechanism to whole-file *sidecar
+materialization* without changing the privileged helper. `csec protect` imports a
+plaintext file into the store and leaves a `*.csec` pointer; `csec exec` scans the
+project for those pointers and, at ordinary user privilege, installs a symlink
+from each file's original path into the same root-owned tmpfs (the helper still
+writes nothing outside its mount, so it is never a confused deputy). The
+confidentiality boundary is unchanged — an unrelated same-UID process that
+follows the symlink still gets `EACCES` on the `0040` target — but the symlink
+itself sits in a user-writable directory and is therefore not an integrity
+boundary: same-uid malware can replace it, which is out of scope for the same
+reason a compromised consumer is. Because a sidecar in a hostile directory is
+untrusted, `csecd` binds each value to the project-relative path its blob recorded
+at import, so a planted or moved sidecar that redirects a value to a different
+path fails closed before any launch.
+
 ### Keychain cache
 
 The persistent cache uses the data-protection keychain and the daemon's

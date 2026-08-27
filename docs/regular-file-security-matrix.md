@@ -15,6 +15,21 @@ root-owned file tree on bounded tmpfs and a one-time primary GID given only to
 the approved process tree. This is not a boundary from root, an administrator
 who can mutate installed privileged paths, or code inside the authorized tree.
 
+`csec exec` extends the same boundary to whole-file **sidecar materialization**:
+`csec protect` moves a plaintext file into the store and leaves a `*.csec`
+pointer, and `csec exec` scans the project for those pointers and surfaces each
+value back at its original path. The tmpfs bytes and their `root:<gid>`
+isolation are identical to `exec-file`; the only additions are launcher-side and
+run at ordinary user privilege — the root helper still writes nothing outside its
+mount. A symlink `<project>/<target> -> <mount>/<nonce>/<rel>` (never a root
+write into the user's directory) points the tool at the protected file, so the
+same-UID rejection row below must also hold when the pathname is reached through
+that symlink. Because that link lives in a user-writable directory it is **not an
+integrity boundary** — same-uid malware can replace it and feed the tree
+attacker-controlled configuration — but the protected bytes stay unreadable.
+csecd independently binds each sidecar value to the project-relative path its
+blob was protected at, so a planted or moved sidecar fails closed before launch.
+
 The release claim requires all of these invariants together:
 
 - exact signed `csec` prepares and consumes one launch, while exact signed
@@ -49,6 +64,7 @@ Automated gate: **PASS on 2026-08-22** (`bin/ci`, debug and release builds).
 | Consumer semantics | `stat`, independent open/reopen, seek, `mmap`, fork/exec descendant reopen, clean exit, and session cleanup | `cs-e2e` + `cs-file-probe` |
 | Consent and plaintext flow | Every launch repeats consent and resolution; output leak is masked; diagnostics contain no raw fixture; `root-status` reaches the authenticated synthetic endpoint | `cs-e2e` |
 | GitHub profile | Ambient token authority rejected before resolution; protected `GH_CONFIG_DIR/hosts.yml` accepted by a direct synthetic `gh`; raw token absent from output | `cs-e2e` + `cs-gh-fixture` |
+| Sidecar materialization | Bounded filename-agnostic `*.csec` subtree scan with hard overflow (not truncation); symlink-mode binding validation (raw-only, `csec://`-only, valid project path, no env var) and its root-store env-skip; launcher symlink install refuses to clobber and tears down only its own links; blob-path binding accepts the stored path and rejects a redirect; a real `csec exec -- cat .envrc` reads the materialized bytes and leaves no link | `cs-selftest` + `cs-e2e` |
 | Privileged attack surface | Release `csec-rootd` has no AppKit, LocalAuthentication, ServiceManagement, provider, Keychain-item, policy/UI, or agent implementation dependency | release link/symbol checks in `bin/ci` |
 | Package shape | Root helper and plist paths/modes, shell syntax, plist syntax, exact code-requirement checks, and verify-before-bootstrap ordering | static checks in `bin/ci` |
 
@@ -74,6 +90,7 @@ mode, mount, or lifecycle assertion to make a row pass.
 | tmpfs | Mount is the fixed path/type with `nodev,nosuid,noexec,nobrowse`, byte cap no greater than 32 MiB, node cap no greater than 2,048, and root-owned non-writable parents | **PENDING** |
 | File metadata | Live launch has root:capability-GID `0050` directories and `0040` regular, single-link files; no path component is attacker-controlled or writable | **PENDING** |
 | Same-UID rejection | Concurrent unrelated process with the same login UID gets `EACCES` for traversal/open even with the exact pathname, while the approved child and fork/exec descendant can reopen | **PENDING** |
+| Sidecar symlink isolation | A `csec exec` materialized `<project>/<target>` symlink into `root:<gid>` tmpfs is readable by the approved tree but gives an unrelated same-UID process `EACCES` on the target; the launcher removes the link after exit and a crash leaves only a dangling link over an unlinked node | **PENDING** |
 | Credential drop | Target has login real/effective UID, capability real/effective primary GID, expected ordinary supplementary groups, joined audit session, core limit zero, only intended inherited descriptors, cwd, and stdio | **PENDING** |
 | GID collisions | Assigned account groups and live process groups in `50000...59999` are skipped; cursor is fsynced before use; corruption/exhaustion fail closed | **PENDING** |
 | No reuse | Repeated launches never reuse a GID in one boot, including helper crash/restart; reboot reset cannot collide with a surviving prior-boot process | **PENDING** |

@@ -115,7 +115,10 @@ func usage() -> Never {
                credential protocols.
     exec       Run <cmd> with secret references resolved into its environment. Any env
                value that is a secret reference (DATABASE_URL=csec://…) is resolved in
-               place; --set NAME=<ref> injects additional ones. Terminal output is
+               place; --set NAME=<ref> injects additional ones. If the project holds
+               *.csec sidecars (from csec protect), csec instead materializes each
+               protected file back at its original path for the wrapped tree on
+               root-owned tmpfs (the same boundary as exec-file). Terminal output is
                masked by default; use 'always' for captured logs and pipes.
     session    Register a kernel-verified broad grant root, then run <cmd> at the same PID.
     creds      Serve AWS credential_process or Git credential-helper output via a private pipe.
@@ -126,6 +129,10 @@ func usage() -> Never {
                on bounded tmpfs. A fresh primary GID is the per-launch capability;
                csec never receives file bytes. --gh-config creates protected hosts.yml
                only after ambient GitHub authentication has been removed.
+    protect    Move whole plaintext secret files into the encrypted store and replace
+               each with a tiny <name>.csec sidecar; a later csec exec materializes
+               them. The value is durable in the store before any plaintext is removed.
+               --keep-plaintext leaves the original in place; --dry-run only reports.
     bridge     Private framed stdin/stdout protocol for language clients; not for terminals.
     tool-exec  Fail-closed AI command broker using csecd's active-value scanner.
     hook       PreToolUse stdin/stdout adapter for Claude Code or Codex.

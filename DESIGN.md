@@ -248,6 +248,22 @@ allocator's persisted cursor and restart cleanup prevent stale plaintext from
 making a prior GID useful after daemon restart. See the remaining signed-device
 gate in [`docs/regular-file-security-matrix.md`](docs/regular-file-security-matrix.md).
 
+`csec protect` and `csec exec` build a whole-file workflow on this mechanism.
+`csec protect` imports plaintext files into the store as per-value AES-GCM blobs
+(one Touch ID for the batch, durable before any plaintext is unlinked) and
+replaces each with a tiny strict-JSON `*.csec` sidecar naming its `csec://` value.
+`csec exec` scans the project subtree for those sidecars and, when any are
+present, drives the same root-helper launch with symlink-delivered bindings: the
+helper materializes each value into tmpfs exactly as above, and the launcher — at
+ordinary user privilege, never the helper — installs a symlink from each file's
+original path into that tmpfs and removes it on exit. A reference is one native
+value whether it holds a short token or a whole binary file; the storage tier
+(editable document vs. blob) is invisible at the reference. Because a sidecar
+lives in a hostile directory, csecd binds each value to the project-relative path
+its blob recorded at import, so a planted or moved sidecar fails closed; the
+symlink itself is a confidentiality-only surface that same-uid malware can
+replace, an accepted integrity limitation.
+
 ### Environment compatibility
 
 `csec exec` resolves environment values that are provider references and accepts
