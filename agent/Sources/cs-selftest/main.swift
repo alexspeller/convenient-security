@@ -3028,6 +3028,21 @@ do {
     }, "setup flags ambiguous dotenv interpolation instead of guessing its value")
     check(!discovery.candidates.contains { $0.locator.identifier == "env:PORT" },
           "setup omits ordinary non-secret-looking environment entries")
+    // The walker now accumulates each directory's path relative to the root
+    // instead of slicing an entry's standardized absolute path (which the macOS
+    // /var firmlink normalizes, silently dropping every match). Cover the nested
+    // case that the relative accumulation must get right.
+    try FileManager.default.createDirectory(
+        at: project.appendingPathComponent("config"), withIntermediateDirectories: true)
+    try Data("NESTED_TOKEN='nested-synthetic-never-in-audit'\n".utf8).write(
+        to: project.appendingPathComponent("config/.env"))
+    let nestedDiscovery = try LocalSecretDiscoveryEngine.discover(
+        projectDirectory: project.path,
+        environment: [:]
+    )
+    check(nestedDiscovery.candidates.contains {
+        $0.locator.identifier == "dotenv:config/.env:NESTED_TOKEN"
+    }, "the relative-path walk resolves a nested dotenv file's project path")
     check(!discovery.candidates.contains {
         $0.locator.identifier == "dotenv:.env.symlink:LINKED_SECRET"
     }, "setup never follows a discovered dotenv symlink")

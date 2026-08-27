@@ -1170,7 +1170,12 @@ public enum LocalSecretDiscoveryEngine {
         ]
         var result: [String] = []
         var visited = 0
-        var pendingDirectories: [(url: URL, depth: Int)] = [(root, 0)]
+        // Carry each directory's path relative to the root through the walk rather
+        // than reconstructing it from absolute paths: a standardized absolute path
+        // resolves the macOS /var -> /private/var firmlink, so comparing it against
+        // a currentDirectoryPath-derived root would spuriously fail and drop every
+        // dotenv under a project that lives beneath /var or /tmp.
+        var pendingDirectories: [(url: URL, depth: Int, relativePath: String)] = [(root, 0, "")]
         var nextDirectoryIndex = 0
         scan: while nextDirectoryIndex < pendingDirectories.count {
             let directory = pendingDirectories[nextDirectoryIndex]
@@ -1196,21 +1201,22 @@ public enum LocalSecretDiscoveryEngine {
                     )
                     break scan
                 }
+                let name = url.lastPathComponent
+                let relative = directory.relativePath.isEmpty
+                    ? name
+                    : directory.relativePath + "/" + name
                 let values = try? url.resourceValues(forKeys: Set(keys))
                 if values?.isDirectory == true {
                     if values?.isSymbolicLink != true,
-                       !excludedDirectories.contains(url.lastPathComponent),
+                       !excludedDirectories.contains(name),
                        directory.depth < 4 {
-                        pendingDirectories.append((url, directory.depth + 1))
+                        pendingDirectories.append((url, directory.depth + 1, relative))
                     }
                     continue
                 }
                 guard values?.isRegularFile == true,
                       values?.isSymbolicLink != true,
-                      isLiveDotenvName(url.lastPathComponent) else { continue }
-                let standardized = url.standardizedFileURL.path
-                guard standardized.hasPrefix(root.path + "/") else { continue }
-                let relative = String(standardized.dropFirst(root.path.count + 1))
+                      isLiveDotenvName(name) else { continue }
                 guard relative.utf8.count <= 1024,
                       !relative.contains(":") else { continue }
                 result.append(relative)
