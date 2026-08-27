@@ -46,9 +46,14 @@ public final class ProtectedSymlinkMaterialization {
     }
 
     private let directoryFD: Int32
+    /// Absolute tmpfs mount root (`<mount>`). A blocking name is only ever
+    /// reclaimed when it is a dangling symlink pointing inside this directory, so
+    /// nothing outside csec's own mount can be mistaken for a stale link.
+    private let mountRoot: String
     private var installed: [(path: String, tmpfsPath: String)] = []
 
-    public init(projectDirectory: String) throws {
+    public init(projectDirectory: String, mountRoot: String) throws {
+        self.mountRoot = mountRoot
         directoryFD = projectDirectory.withCString {
             open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         }
@@ -75,11 +80,54 @@ public final class ProtectedSymlinkMaterialization {
         let parentFD = try openParent(of: link.projectRelativePath)
         defer { close(parentFD) }
         let leaf = leafComponent(of: link.projectRelativePath)
-        guard symlinkat(link.tmpfsPath, parentFD, leaf) == 0 else {
-            if errno == EEXIST { throw ProtectedSymlinkError.targetOccupied(link.projectRelativePath) }
-            throw ProtectedSymlinkError.linkCreationFailed(link.projectRelativePath)
+        if symlinkat(link.tmpfsPath, parentFD, leaf) != 0 {
+            let firstErrno = errno
+            guard firstErrno == EEXIST else {
+                throw ProtectedSymlinkError.linkCreationFailed(link.projectRelativePath)
+            }
+            // A hard-killed prior launch skips teardown (it exits without running
+            // `removeAll`), so a dangling protected link can survive and block a
+            // fresh launch at the same path. Reclaim it — but only when it is
+            // provably a dead csec link — then retry once.
+            guard reclaimStaleLink(parentFD: parentFD, leaf: leaf) else {
+                throw ProtectedSymlinkError.targetOccupied(link.projectRelativePath)
+            }
+            guard symlinkat(link.tmpfsPath, parentFD, leaf) == 0 else {
+                throw ProtectedSymlinkError.linkCreationFailed(link.projectRelativePath)
+            }
         }
         installed.append((path: link.projectRelativePath, tmpfsPath: link.tmpfsPath))
+    }
+
+    /// Decide whether the leaf currently occupying a target is a *stale* protected
+    /// link that may be reclaimed, and if so, remove it. All three conditions must
+    /// hold, so nothing else is ever touched:
+    ///   1. it is a symlink — `readlinkat` succeeds (it returns `EINVAL` on a real
+    ///      file or directory), so a genuine file that took the name is never
+    ///      removed;
+    ///   2. its target points inside our own tmpfs mount — a user's symlink to any
+    ///      other location is left untouched; and
+    ///   3. it is dangling — following it fails with `ENOENT`, so a *live* link
+    ///      belonging to a concurrently running launch (whose session still exists)
+    ///      is never removed. A fresh launch always uses a new nonce, so a dangling
+    ///      old-nonce link can never come back to life.
+    /// Returns true only when it unlinked such a link.
+    private func reclaimStaleLink(parentFD: Int32, leaf: String) -> Bool {
+        // An empty or root mount root would make the prefix test match anything;
+        // require a real absolute path before trusting the ownership check.
+        guard mountRoot.hasPrefix("/"), mountRoot.utf8.count > 1 else { return false }
+
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let count = readlinkat(parentFD, leaf, &buffer, buffer.count - 1)
+        guard count > 0, count < Int(PATH_MAX) - 1 else { return false }
+        buffer[Int(count)] = 0
+        let target = String(cString: buffer)
+        guard target == mountRoot || target.hasPrefix(mountRoot + "/") else { return false }
+
+        // Follow the link: a live target resolves (leave it), a dangling one is
+        // `ENOENT` (reclaim it). Any other error is treated as "do not touch".
+        guard faccessat(parentFD, leaf, F_OK, 0) != 0, errno == ENOENT else { return false }
+        return unlinkat(parentFD, leaf, 0) == 0
     }
 
     /// Remove every link this instance created, but only where the name is still

@@ -388,7 +388,8 @@ func runSidecarExec(
             )
 
             let session = try ProtectedSymlinkMaterialization(
-                projectDirectory: FileManager.default.currentDirectoryPath)
+                projectDirectory: FileManager.default.currentDirectoryPath,
+                mountRoot: RootHelperSocket.defaultMountPath())
             materialization = session
             let sessionPrefix = (RootHelperSocket.defaultMountPath() as NSString)
                 .appendingPathComponent(prepared.nonce)

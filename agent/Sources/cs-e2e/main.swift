@@ -1418,6 +1418,25 @@ do {
             + "err \"\(combined.err)\")")
     check((try? FileManager.default.destinationOfSymbolicLink(atPath: envrcPath)) == nil,
           "the combined launch still tears the sidecar symlink down afterwards")
+
+    // Stale-link reclamation (F3) through the real launcher: simulate a hard-killed
+    // prior run by planting a dangling protected link where .envrc must reappear,
+    // pointing at a vanished session inside the real mount. The next exec must
+    // reclaim it and still surface the file, not fail with EEXIST.
+    let mountRoot = (rootFixtureDirectory as NSString).appendingPathComponent("files")
+    let deadTarget = (mountRoot as NSString)
+        .appendingPathComponent("00000000-0000-0000-0000-000000000000/files/protected-0")
+    try? FileManager.default.removeItem(atPath: envrcPath)
+    try FileManager.default.createSymbolicLink(atPath: envrcPath, withDestinationPath: deadTarget)
+    check(!FileManager.default.fileExists(atPath: envrcPath),
+          "stale-link fixture: the planted link dangles into a vanished session")
+    let reclaimed = runInProject(["exec", "/bin/cat", ".envrc"])
+    check(reclaimed.status == 0 && reclaimed.out == secret,
+          "csec exec reclaims a dangling protected link from a hard-killed run and still "
+            + "materializes the file (status \(reclaimed.status), out \"\(reclaimed.out)\", "
+            + "err \"\(reclaimed.err)\")")
+    check((try? FileManager.default.destinationOfSymbolicLink(atPath: envrcPath)) == nil,
+          "the reclaimed launch tears its own materialized link down afterwards")
 } catch {
     check(false, "csec exec sidecar materialization end-to-end succeeds (\(error))")
 }

@@ -816,7 +816,7 @@ do {
     try Data("SECRET=1\n".utf8).write(to: URL(fileURLWithPath: envTmpfs))
     try Data("masterkey".utf8).write(to: URL(fileURLWithPath: keyTmpfs))
 
-    let materialization = try ProtectedSymlinkMaterialization(projectDirectory: project)
+    let materialization = try ProtectedSymlinkMaterialization(projectDirectory: project, mountRoot: mount)
     try materialization.install([
         .init(projectRelativePath: ".envrc", tmpfsPath: envTmpfs),
         .init(projectRelativePath: "config/master.key", tmpfsPath: keyTmpfs),
@@ -829,7 +829,7 @@ do {
     check((try? fm.destinationOfSymbolicLink(atPath: keyLink)) == keyTmpfs,
           "materialization creates a nested symlink at its project path")
 
-    let occupied = try ProtectedSymlinkMaterialization(projectDirectory: project)
+    let occupied = try ProtectedSymlinkMaterialization(projectDirectory: project, mountRoot: mount)
     try Data("real".utf8).write(
         to: URL(fileURLWithPath: (project as NSString).appendingPathComponent("existing")))
     checkThrows("materialization refuses to clobber an existing target file") {
@@ -842,7 +842,7 @@ do {
           "teardown removes the launcher's symlinks but leaves their tmpfs targets")
 
     // A real file that usurped a materialized link must survive teardown.
-    let guarded = try ProtectedSymlinkMaterialization(projectDirectory: project)
+    let guarded = try ProtectedSymlinkMaterialization(projectDirectory: project, mountRoot: mount)
     try guarded.install([.init(projectRelativePath: "usurped", tmpfsPath: envTmpfs)])
     let usurpedLink = (project as NSString).appendingPathComponent("usurped")
     try fm.removeItem(atPath: usurpedLink)
@@ -850,6 +850,61 @@ do {
     guarded.removeAll()
     check((try? Data(contentsOf: URL(fileURLWithPath: usurpedLink))) == Data("attacker".utf8),
           "teardown never removes a real file that replaced a materialized link")
+
+    // Stale-link reclamation (F3): a hard-killed prior launch skips teardown and
+    // leaves a dangling protected link into our mount. A fresh launch uses a new
+    // nonce, so the leftover link points at an old, now-gone tmpfs path and would
+    // otherwise block the launch with EEXIST. It is reclaimed — but ONLY when it is
+    // a dangling symlink into our own mount.
+    let staleOldTmpfs = (mount as NSString).appendingPathComponent("old-session-gone")
+    let staleNewTmpfs = (mount as NSString).appendingPathComponent("new-session-file")
+    try Data("REBORN=1\n".utf8).write(to: URL(fileURLWithPath: staleNewTmpfs))
+    let stalePath = (project as NSString).appendingPathComponent("stale.env")
+    try fm.createSymbolicLink(atPath: stalePath, withDestinationPath: staleOldTmpfs)
+    check(!fm.fileExists(atPath: staleOldTmpfs),
+          "stale-link fixture: the leftover link dangles (its old tmpfs target is gone)")
+    let reclaimer = try ProtectedSymlinkMaterialization(projectDirectory: project, mountRoot: mount)
+    try reclaimer.install([.init(projectRelativePath: "stale.env", tmpfsPath: staleNewTmpfs)])
+    check((try? fm.destinationOfSymbolicLink(atPath: stalePath)) == staleNewTmpfs
+          && (try? Data(contentsOf: URL(fileURLWithPath: stalePath))) == Data("REBORN=1\n".utf8),
+          "a dangling protected link into our mount is reclaimed so the launch proceeds")
+    reclaimer.removeAll()
+
+    // Safety 1: a LIVE link into the mount (a concurrent launch's, target still
+    // present) is never reclaimed — install refuses rather than break it.
+    let liveTmpfs = (mount as NSString).appendingPathComponent("live-session-file")
+    try Data("LIVE=1\n".utf8).write(to: URL(fileURLWithPath: liveTmpfs))
+    let livePath = (project as NSString).appendingPathComponent("live.env")
+    try fm.createSymbolicLink(atPath: livePath, withDestinationPath: liveTmpfs)
+    let liveClasher = try ProtectedSymlinkMaterialization(projectDirectory: project, mountRoot: mount)
+    checkThrows("a live link into our mount is never reclaimed (concurrent-launch safety)") {
+        try liveClasher.install([.init(projectRelativePath: "live.env", tmpfsPath: liveTmpfs)])
+    }
+    check((try? fm.destinationOfSymbolicLink(atPath: livePath)) == liveTmpfs
+          && fm.fileExists(atPath: liveTmpfs),
+          "the live link and its target both survive the refused launch")
+
+    // Safety 2: a dangling symlink pointing OUTSIDE our mount (a user's own broken
+    // link) is never reclaimed, even though it dangles.
+    let foreignPath = (project as NSString).appendingPathComponent("foreign.env")
+    try fm.createSymbolicLink(atPath: foreignPath, withDestinationPath: "/nonexistent/user/target")
+    let foreignClasher = try ProtectedSymlinkMaterialization(projectDirectory: project, mountRoot: mount)
+    checkThrows("a dangling link outside our mount is never reclaimed") {
+        try foreignClasher.install([.init(projectRelativePath: "foreign.env", tmpfsPath: envTmpfs)])
+    }
+    check((try? fm.destinationOfSymbolicLink(atPath: foreignPath)) == "/nonexistent/user/target",
+          "the foreign dangling link is left untouched")
+
+    // Safety 3: an empty mount root disables reclamation entirely, so a dangling
+    // link is never treated as ours when we cannot prove ownership.
+    let noRootPath = (project as NSString).appendingPathComponent("noroot.env")
+    try fm.createSymbolicLink(atPath: noRootPath, withDestinationPath: staleOldTmpfs)
+    let noRoot = try ProtectedSymlinkMaterialization(projectDirectory: project, mountRoot: "")
+    checkThrows("an empty mount root never reclaims any link") {
+        try noRoot.install([.init(projectRelativePath: "noroot.env", tmpfsPath: staleNewTmpfs)])
+    }
+    check((try? fm.destinationOfSymbolicLink(atPath: noRootPath)) == staleOldTmpfs,
+          "with no provable mount ownership the dangling link is left untouched")
 } catch {
     check(false, "protected symlink materialization checks succeed (\(error))")
 }

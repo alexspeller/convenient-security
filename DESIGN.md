@@ -256,7 +256,10 @@ replaces each with a tiny strict-JSON `*.csec` sidecar naming its `csec://` valu
 present, drives the same root-helper launch with symlink-delivered bindings: the
 helper materializes each value into tmpfs exactly as above, and the launcher — at
 ordinary user privilege, never the helper — installs a symlink from each file's
-original path into that tmpfs and removes it on exit. A reference is one native
+original path into that tmpfs and removes it on exit. A hard-killed launcher
+skips that teardown, so a later launch reclaims a leftover link — but only when it
+is a *dangling* symlink into csec's own mount, never a real file, a link pointing
+elsewhere, or a live link a concurrent launch still uses. A reference is one native
 value whether it holds a short token or a whole binary file; the storage tier
 (editable document vs. blob) is invisible at the reference. Because a sidecar
 lives in a hostile directory, csecd binds each value to the project-relative path

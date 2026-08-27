@@ -26,7 +26,11 @@ write into the user's directory) points the tool at the protected file, so the
 same-UID rejection row below must also hold when the pathname is reached through
 that symlink. Because that link lives in a user-writable directory it is **not an
 integrity boundary** — same-uid malware can replace it and feed the tree
-attacker-controlled configuration — but the protected bytes stay unreadable.
+attacker-controlled configuration — but the protected bytes stay unreadable. A
+launcher killed with `SIGKILL` cannot run teardown, so its link is left dangling
+over the (already-reclaimed) tmpfs node; the next launch reclaims such a leftover
+only when it is a dangling symlink pointing inside csec's own mount, so a real
+file, a link elsewhere, or a live link from a concurrent launch is never removed.
 csecd independently binds each sidecar value to the project-relative path its
 blob was protected at, so a planted or moved sidecar fails closed before launch.
 
