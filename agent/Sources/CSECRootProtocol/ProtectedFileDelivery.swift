@@ -581,6 +581,18 @@ public enum RootHelperSocket {
         }
         return canonicalPath
     }
+
+    /// The tmpfs mount directory, derived from the active socket so a debug
+    /// override relocates both together (the root helper derives it the same way).
+    /// The launcher computes a symlink target's tmpfs path as
+    /// `defaultMountPath()/<nonce>/<binding.relativePath>`.
+    public static func defaultMountPath() -> String {
+        if isUsingDebugOverride {
+            return ((defaultPath() as NSString).deletingLastPathComponent as NSString)
+                .appendingPathComponent("files")
+        }
+        return canonicalMountPath
+    }
 }
 
 public enum RootLaunchState: String, Codable, Sendable {

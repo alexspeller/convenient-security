@@ -1351,6 +1351,54 @@ do {
     check(false, "csec protect end-to-end succeeds (\(error))")
 }
 
+// Full sidecar materialization: protect a file, then `csec exec` in the same
+// project must surface it at its original path so the wrapped child reads the
+// protected bytes — and must tear the link down afterwards.
+do {
+    let projectDir = NSTemporaryDirectory()
+        + "csec-exec-sidecar-e2e-\(UUID().uuidString.lowercased())"
+    try FileManager.default.createDirectory(atPath: projectDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: projectDir) }
+    let envrcPath = projectDir + "/.envrc"
+    let secret = "export SECRET_TOKEN=exec-sidecar-synthetic\nuse_flake\n"
+    try Data(secret.utf8).write(to: URL(fileURLWithPath: envrcPath))
+
+    func runInProject(_ arguments: [String]) -> (status: Int32, out: String, err: String) {
+        let process = Process()
+        process.executableURL = csecURL
+        process.arguments = arguments
+        process.currentDirectoryURL = URL(fileURLWithPath: projectDir)
+        var environment = ProcessInfo.processInfo.environment
+        environment["CSEC_SOCKET"] = socketPath
+        process.environment = environment
+        let outPipe = Pipe(), errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        do { try process.run() } catch { return (-1, "", "spawn failed: \(error)") }
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus,
+                String(data: outData, encoding: .utf8) ?? "",
+                String(data: errData, encoding: .utf8) ?? "")
+    }
+
+    let protectResult = runInProject(["protect", ".envrc"])
+    check(protectResult.status == 0
+          && !FileManager.default.fileExists(atPath: envrcPath)
+          && FileManager.default.fileExists(atPath: envrcPath + ".csec"),
+          "sidecar exec setup: protect replaces .envrc with a sidecar (err: \(protectResult.err))")
+
+    let execResult = runInProject(["exec", "/bin/cat", ".envrc"])
+    check(execResult.status == 0 && execResult.out == secret,
+          "csec exec materializes a *.csec file at its project path for the child "
+            + "(status \(execResult.status), out \"\(execResult.out)\", err \"\(execResult.err)\")")
+    check((try? FileManager.default.destinationOfSymbolicLink(atPath: envrcPath)) == nil,
+          "csec exec tears down the materialized symlink after the child exits")
+} catch {
+    check(false, "csec exec sidecar materialization end-to-end succeeds (\(error))")
+}
+
 func runCsecWithInput(
     _ arguments: [String],
     input: Data,

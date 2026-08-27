@@ -62,7 +62,12 @@ public enum ProtectedSidecarScanner {
         let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
         var discoveries: [DiscoveredProtectedFile] = []
         var visited = 0
-        var pending: [(url: URL, depth: Int)] = [(root, 0)]
+        // Carry each directory's path relative to the root through the walk rather
+        // than reconstructing it from absolute paths afterward: on macOS a temp
+        // dir resolves through the /var -> /private/var firmlink, so comparing an
+        // entry's standardized absolute path against the root's would spuriously
+        // fail and drop every sidecar.
+        var pending: [(url: URL, depth: Int, relativePath: String)] = [(root, 0, "")]
         var next = 0
 
         scan: while next < pending.count {
@@ -76,54 +81,49 @@ public enum ProtectedSidecarScanner {
                     options: []
                 ).sorted { $0.lastPathComponent < $1.lastPathComponent }
             } catch {
-                // A directory we cannot list simply contributes no sidecars; a
-                // hostile or transient subtree must not abort the whole launch.
+                // A directory we cannot list contributes no sidecars; a hostile or
+                // transient subtree must not abort the whole launch.
                 continue
             }
             for url in entries {
                 visited += 1
                 if visited > Self.maximumVisitedEntries { break scan }
+                let name = url.lastPathComponent
+                let relative = directory.relativePath.isEmpty
+                    ? name
+                    : directory.relativePath + "/" + name
                 let values = try? url.resourceValues(forKeys: Set(keys))
                 if values?.isDirectory == true {
                     if values?.isSymbolicLink != true,
-                       !Self.excludedDirectories.contains(url.lastPathComponent),
+                       !Self.excludedDirectories.contains(name),
                        directory.depth < Self.maximumDepth {
-                        pending.append((url, directory.depth + 1))
+                        pending.append((url, directory.depth + 1, relative))
                     }
                     continue
                 }
                 guard values?.isRegularFile == true,
                       values?.isSymbolicLink != true,
-                      url.lastPathComponent.hasSuffix(ProtectedFileSidecar.suffix) else { continue }
+                      name.hasSuffix(ProtectedFileSidecar.suffix) else { continue }
 
                 let targetName: String
                 do {
-                    targetName = try ProtectedFileSidecar.targetName(
-                        forSidecarNamed: url.lastPathComponent
-                    )
+                    targetName = try ProtectedFileSidecar.targetName(forSidecarNamed: name)
                 } catch {
                     // A name that ends in `.csec` but cannot name a real target
                     // (`.csec`, `..csec`) is not a usable sidecar; skip it.
                     continue
                 }
-
                 guard let bytes = Self.readBounded(
                     url: url,
                     maximum: ProtectedFileSidecar.maximumBytes
                 ), let sidecar = try? ProtectedFileSidecar(data: bytes) else { continue }
 
-                let sidecarPath = url.standardizedFileURL.path
-                guard sidecarPath.hasPrefix(root.path + "/") else { continue }
-                let sidecarRelative = String(sidecarPath.dropFirst(root.path.count + 1))
-                let targetRelative = (sidecarRelative as NSString)
-                    .deletingLastPathComponent.isEmpty
+                let targetRelative = directory.relativePath.isEmpty
                     ? targetName
-                    : ((sidecarRelative as NSString).deletingLastPathComponent as NSString)
-                        .appendingPathComponent(targetName)
-
+                    : directory.relativePath + "/" + targetName
                 discoveries.append(DiscoveredProtectedFile(
                     targetRelativePath: targetRelative,
-                    sidecarRelativePath: sidecarRelative,
+                    sidecarRelativePath: relative,
                     reference: sidecar.reference
                 ))
                 if discoveries.count > Self.maximumSidecars {
@@ -153,9 +153,9 @@ public enum ProtectedSidecarScanner {
             guard count > 0 else { break }
             total += count
         }
-        // A file larger than the sidecar bound is not a sidecar; the strict
-        // parser would reject it anyway, but bounding the read avoids slurping a
-        // large unrelated file that merely ends in `.csec`.
+        // A file larger than the sidecar bound is not a sidecar; the strict parser
+        // would reject it anyway, but bounding the read avoids slurping a large
+        // unrelated file that merely ends in `.csec`.
         guard total <= maximum else { return nil }
         return Data(buffer.prefix(total))
     }

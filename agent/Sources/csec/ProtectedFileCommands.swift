@@ -277,6 +277,146 @@ func runExecFile(_ arguments: [String]) -> Never {
     }
 }
 
+/// `csec exec` in a project holding `*.csec` sidecars: materialize every
+/// protected file back at its original project path for the wrapped process tree,
+/// then run the command. The tmpfs bytes and their `root:<gid>` isolation come
+/// from the same rootd path `csec exec-file` uses; the launcher additionally
+/// installs — and always tears down — the symlinks that surface each file where a
+/// tool expects it. csecd independently binds each value to the path its blob was
+/// protected at, so a planted or moved sidecar fails closed before any launch.
+func runSidecarExec(
+    commandLine: [String],
+    discoveries: [DiscoveredProtectedFile],
+    reason: String?,
+    ttlSeconds: Int,
+    outputGuard: OutputGuardConfiguration
+) -> Never {
+    // Symlink teardown must survive `cs_terminate_like_wait_status` (which exits
+    // and skips `defer`), so it is done explicitly at every exit path rather than
+    // in a `defer`; a hard-killed launcher leaves only dangling links over an
+    // already-unlinked tmpfs node.
+    var materialization: ProtectedSymlinkMaterialization?
+    do {
+        let executable = try conservativeExecutable(command: commandLine[0])
+        let bindings = discoveries.enumerated().map { offset, discovery in
+            ProtectedFileBinding.symlink(
+                projectRelativePath: discovery.targetRelativePath,
+                reference: discovery.reference.uri,
+                index: offset
+            )
+        }
+        let environment = ProtectedLaunchPlan.sanitizedEnvironment(
+            ProcessInfo.processInfo.environment
+        )
+        let io = try ProtectedLaunchIO(outputMode: outputGuard.mode)
+        let operation = reason
+            ?? "csec exec (\(discoveries.count) protected file(s)) "
+                + "\((executable.canonicalPath as NSString).lastPathComponent)"
+        let deliveryPlan = DeliveryPlan(
+            mechanism: .capabilityGIDFile,
+            executable: executable,
+            root: .caller,
+            descendantScope: .subtree,
+            destination: .localDevelopment,
+            requestedTTLSeconds: ttlSeconds,
+            operationContext: operation,
+            commandDigest: try ExecutableInspection.commandDigest(commandLine),
+            outputGuard: outputGuard.plan
+        )
+        guard let startTime = ProcessAncestry.startTime(of: getpid()) else {
+            throw ProtectedFileCommandError.setupFailed
+        }
+        let auditSessionID = cs_self_audit_session_id()
+        guard auditSessionID != UInt32.max else { throw ProtectedFileCommandError.setupFailed }
+        let launchPlan = ProtectedLaunchPlan(
+            launcherPID: getpid(),
+            launcherStartTime: startTime,
+            uid: getuid(),
+            auditSessionID: auditSessionID,
+            executable: executable,
+            commandLine: commandLine,
+            environment: environment,
+            files: bindings,
+            deliveryPlan: deliveryPlan,
+            usesPTY: io.usesPTY
+        )
+        try launchPlan.validate()
+
+        #if DEBUG
+        let rootTrust: RootHelperServerTrustPolicy = .allowUnverifiedForTesting
+        #else
+        let rootTrust: RootHelperServerTrustPolicy = .requireProductRootHelper
+        #endif
+        let rootClient = RootHelperClient(trustPolicy: rootTrust)
+        let prepared = try rootClient.prepare(
+            plan: launchPlan,
+            cwdFD: io.cwdFD,
+            stdinFD: io.childStdinFD,
+            stdoutFD: io.childStdoutFD,
+            stderrFD: io.childStderrFD
+        )
+        io.didPrepare()
+
+        do {
+            // After approval the tmpfs files exist; resolution also lets csecd bind
+            // each value to its stored path before it returns success here.
+            try makeAgentClient().approveProtectedLaunch(
+                rendezvousNonce: prepared.nonce,
+                launchPlan: launchPlan,
+                launchPlanDigest: prepared.planDigest
+            )
+
+            let session = try ProtectedSymlinkMaterialization(
+                projectDirectory: FileManager.default.currentDirectoryPath)
+            materialization = session
+            let sessionPrefix = (RootHelperSocket.defaultMountPath() as NSString)
+                .appendingPathComponent(prepared.nonce)
+            try session.install(bindings.map { binding in
+                ProtectedSymlinkMaterialization.Link(
+                    projectRelativePath: binding.symlinkTarget ?? "",
+                    tmpfsPath: (sessionPrefix as NSString)
+                        .appendingPathComponent(binding.relativePath)
+                )
+            })
+
+            let scanner: AgentOutputRedactionSession?
+            if outputGuard.mode != .never, !io.streams.isEmpty {
+                scanner = try makeAgentClient().beginOutputRedaction(
+                    destination: .localDevelopment,
+                    streams: io.streams,
+                    includeShortValues: outputGuard.includeShortValues
+                )
+            } else {
+                scanner = nil
+            }
+            defer { scanner?.close() }
+
+            let child = try rootClient.start(
+                nonce: prepared.nonce,
+                planDigest: prepared.planDigest
+            )
+            let status = try RemoteRootProcessSupervisor.run(
+                io: io,
+                rootClient: rootClient,
+                prepared: prepared,
+                childPID: child.pid,
+                childStartTime: child.startTime,
+                scanner: scanner
+            )
+            materialization?.removeAll()
+            cs_terminate_like_wait_status(status)
+        } catch {
+            materialization?.removeAll()
+            rootClient.cancel(nonce: prepared.nonce, planDigest: prepared.planDigest)
+            throw error
+        }
+    } catch {
+        materialization?.removeAll()
+        writeProtectedFileError("csec exec: \(error.localizedDescription)\n")
+        exit(1)
+    }
+}
+
 private func requireNoAmbientGitHubAuthority(ghPath: String, host: String) throws {
     let ambientNames = [
         "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",

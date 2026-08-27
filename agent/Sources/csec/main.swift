@@ -763,6 +763,31 @@ func runExec(_ arguments: [String]) -> Never {
         exit(2)
     }
 
+    // A project holding `*.csec` sidecars needs its protected files back at their
+    // original paths for the wrapped tree, which only the rootd launch can do.
+    // Route there when any are present; overflow past the per-launch bound is a
+    // hard error, never a silent fallback to environment injection.
+    do {
+        let discoveries = try ProtectedSidecarScanner.scan(
+            projectDirectory: FileManager.default.currentDirectoryPath)
+        if !discoveries.isEmpty {
+            if !explicit.isEmpty {
+                FileHandle.standardError.write(Data(
+                    "csec exec: warning: --set is ignored when protected-file sidecars are present\n".utf8))
+            }
+            runSidecarExec(
+                commandLine: commandLine,
+                discoveries: discoveries,
+                reason: reason,
+                ttlSeconds: ttlSeconds,
+                outputGuard: outputGuard
+            )
+        }
+    } catch {
+        FileHandle.standardError.write(Data("csec exec: \(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+
     let client = makeAgentClient()
 
     let knownSchemes: Set<String>
