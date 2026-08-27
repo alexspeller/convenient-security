@@ -1254,6 +1254,57 @@ check(rootStatus.status == 0
       && rootStatus.err.isEmpty,
       "root-status verifies the authenticated root-helper protocol endpoint")
 
+// `csec protect` end to end: run the real launcher in a throwaway project dir and
+// confirm it imports the plaintext into the encrypted store, writes a valid
+// sidecar in its place, removes the plaintext, and that the imported value
+// resolves back byte-for-byte through csec://.
+do {
+    let projectDir = NSTemporaryDirectory()
+        + "csec-protect-e2e-\(UUID().uuidString.lowercased())"
+    try FileManager.default.createDirectory(
+        atPath: projectDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: projectDir) }
+    let envrcPath = projectDir + "/.envrc"
+    let envrcBytes = Data("export SECRET_TOKEN=protect-e2e-synthetic\nuse_flake\n".utf8)
+    try envrcBytes.write(to: URL(fileURLWithPath: envrcPath))
+
+    let process = Process()
+    process.executableURL = csecURL
+    process.arguments = ["protect", ".envrc"]
+    process.currentDirectoryURL = URL(fileURLWithPath: projectDir)
+    var environment = ProcessInfo.processInfo.environment
+    environment["CSEC_SOCKET"] = socketPath
+    process.environment = environment
+    let outPipe = Pipe(), errPipe = Pipe()
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+    try process.run()
+    _ = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let protectErr = String(
+        data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    process.waitUntilExit()
+
+    check(process.terminationStatus == 0,
+          "csec protect exits cleanly (stderr: \(protectErr))")
+    check(!FileManager.default.fileExists(atPath: envrcPath),
+          "csec protect removes the plaintext file")
+    let sidecarPath = envrcPath + ".csec"
+    check(FileManager.default.fileExists(atPath: sidecarPath),
+          "csec protect writes a .csec sidecar in the plaintext's place")
+
+    let sidecar = try ProtectedFileSidecar(
+        data: Data(contentsOf: URL(fileURLWithPath: sidecarPath)))
+    let resolved = try client.access(
+        references: [sidecar.reference.uri],
+        reason: "protect e2e resolve",
+        ttlSeconds: 3600
+    )
+    check(resolved[sidecar.reference.uri] == envrcBytes,
+          "the protected .envrc resolves back through csec:// with full fidelity")
+} catch {
+    check(false, "csec protect end-to-end succeeds (\(error))")
+}
+
 func runCsecWithInput(
     _ arguments: [String],
     input: Data,

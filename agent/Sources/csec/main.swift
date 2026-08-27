@@ -85,6 +85,7 @@ func usage() -> Never {
       csec hook claude|codex
       csec hook-config claude|codex
       csec edit [--editor] <store>
+      csec protect [--store <store>] [--keep-plaintext] [--dry-run] <path>…
       csec risk inspect <reference>
       csec risk classify low|standard|high|critical <reference>
       csec risk raise low|standard|high|critical <reference>
@@ -182,6 +183,8 @@ case "hook-config":
     runHookConfig(Array(arguments.dropFirst()))
 case "edit":
     runEdit(Array(arguments.dropFirst()))
+case "protect":
+    runProtect(Array(arguments.dropFirst()))
 case "risk":
     runRisk(Array(arguments.dropFirst()))
 case "setup":

@@ -659,6 +659,41 @@ do {
     check(false, "whole-file import + cross-tier uniqueness checks succeed (\(error))")
 }
 
+print("\n# ProtectedFileImportPlanner (csec protect naming)")
+do {
+    let storeA = try ProtectedFileImportPlanner.storeName(
+        forProjectDirectory: "/Users/alex/projects/my-app")
+    let storeAagain = try ProtectedFileImportPlanner.storeName(
+        forProjectDirectory: "/Users/alex/projects/my-app")
+    let storeB = try ProtectedFileImportPlanner.storeName(
+        forProjectDirectory: "/Users/bob/work/my-app")
+    check(storeA == storeAagain, "a project directory derives a stable store name")
+    check(storeA != storeB,
+          "different directories with the same base name derive different stores")
+    check(storeA.value.contains("my-app"),
+          "the store name keeps the directory name for legibility")
+    for dir in ["/", "/Users/alex/.config", "/tmp/weird name!@#", "/a", "/123"] {
+        check((try? ProtectedFileImportPlanner.storeName(forProjectDirectory: dir)) != nil,
+              "a store name is always valid for '\(dir)'")
+    }
+
+    for path in [".envrc", ".env", "config/master.key", "deep/a b/c!d.json", "-x", "..y", "café/x"] {
+        let key = ProtectedFileImportPlanner.storeKey(forRelativePath: path)
+        check(NativeStoreDocument.isValidKey(key),
+              "a store key is always valid for '\(path)'")
+        check((try? NativeSecretReference(store: storeA, key: key)) != nil,
+              "the derived csec://store/key parses for '\(path)'")
+    }
+    check(ProtectedFileImportPlanner.storeKey(forRelativePath: ".envrc")
+            == ProtectedFileImportPlanner.storeKey(forRelativePath: ".envrc"),
+          "a relative path derives a stable key")
+    check(ProtectedFileImportPlanner.storeKey(forRelativePath: "a/x")
+            != ProtectedFileImportPlanner.storeKey(forRelativePath: "b/x"),
+          "distinct relative paths derive distinct keys")
+} catch {
+    check(false, "protected-file import planner checks succeed (\(error))")
+}
+
 print("\n# ProtectedFileSidecar (untrusted *.csec pointer)")
 do {
     let ref = try NativeSecretReference(store: try NativeStoreName("project"), key: "env_home")
