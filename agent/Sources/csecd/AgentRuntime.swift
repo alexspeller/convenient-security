@@ -50,9 +50,25 @@ func startAgentServer() async {
   if cacheEnabled {
     do {
       let files = try SecureNativeStoreFileBackend()
+      // The file/blob tier of the same csec:// namespace: whole-file (including
+      // binary) values in per-value envelopes, under their own directory and
+      // keychain service so a blob store and a document store may share a name
+      // without their key records colliding. A single blob envelope (or the
+      // index) is larger than the 1 MiB document, so the ciphertext cap is raised.
+      let blobFiles = try SecureNativeStoreFileBackend(
+        directoryPath: NativeBlobStore.defaultBlobDirectoryPath(),
+        maximumCiphertextBytes: max(
+          NativeBlobIndex.maximumIndexBytes, NativeBlobStore.maximumBlobBytes) + 1024
+      )
+      let blobStore = NativeBlobStore(
+        keyBackend: SecurityNativeStoreKeyBackend(
+          service: SecurityNativeStoreKeyBackend.blobService),
+        fileBackend: blobFiles
+      )
       nativeStore = NativeEncryptedFileProvider(
         keyBackend: SecurityNativeStoreKeyBackend(),
-        fileBackend: files
+        fileBackend: files,
+        blobStore: blobStore
       )
     } catch {
       FileHandle.standardError.write(

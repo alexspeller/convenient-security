@@ -592,6 +592,73 @@ do {
     check(false, "unified csec:// provider blob resolution succeeds (\(error))")
 }
 
+// Whole-file import: a blob commits against an authorized edit session's unlock
+// (one consent covers the batch), and cross-tier uniqueness holds both ways so a
+// csec://store/key resolves to exactly one value.
+do {
+    let blobs = NativeBlobStore(
+        keyBackend: InMemoryNativeStoreKeyBackend(),
+        fileBackend: InMemoryNativeStoreFileBackend()
+    )
+    let provider = NativeEncryptedFileProvider(
+        keyBackend: InMemoryNativeStoreKeyBackend(),
+        fileBackend: InMemoryNativeStoreFileBackend(),
+        blobStore: blobs
+    )
+    let store = try NativeStoreName("importtier")
+    let callerPID: pid_t = 4242
+    let callerStart: UInt64 = 999
+
+    let importSession = try await provider.beginEdit(
+        store: store, callerPID: callerPID, callerStartTime: callerStart, unlock: nativeUnlock)
+    let envrc = Data("export A=1\nuse_flake\n".utf8)
+    let commit = try await provider.commitBlobs(
+        sessionID: importSession.sessionID,
+        requests: [.init(key: "envrc", data: envrc, mode: 0o600, path: ".envrc")],
+        callerPID: callerPID, callerStartTime: callerStart
+    )
+    check(commit.generation == 1 && commit.secretCount == 1,
+          "a blob import through an authorized edit session commits one generation")
+    let resolved = try await provider.resolve(
+        try SecretRef("csec://importtier/envrc"), unlock: nativeUnlock)
+    check(resolved.value == envrc,
+          "an imported blob resolves via csec:// with exact bytes")
+
+    // A document commit may not shadow an existing blob key.
+    let shadowSession = try await provider.beginEdit(
+        store: store, callerPID: callerPID, callerStartTime: callerStart, unlock: nativeUnlock)
+    do {
+        _ = try await provider.commitEdit(
+            sessionID: shadowSession.sessionID,
+            document: Data(#"{"envrc":"shadow"}"#.utf8),
+            callerPID: callerPID, callerStartTime: callerStart)
+        check(false, "a document key cannot shadow an existing blob key")
+    } catch NativeStoreError.crossTierKeyConflict {
+        check(true, "a document key cannot shadow an existing blob key")
+    }
+
+    // And a blob import may not shadow an existing document key.
+    let docSession = try await provider.beginEdit(
+        store: store, callerPID: callerPID, callerStartTime: callerStart, unlock: nativeUnlock)
+    _ = try await provider.commitEdit(
+        sessionID: docSession.sessionID,
+        document: Data(#"{"TOKEN":"abc"}"#.utf8),
+        callerPID: callerPID, callerStartTime: callerStart)
+    let clashSession = try await provider.beginEdit(
+        store: store, callerPID: callerPID, callerStartTime: callerStart, unlock: nativeUnlock)
+    do {
+        _ = try await provider.commitBlobs(
+            sessionID: clashSession.sessionID,
+            requests: [.init(key: "TOKEN", data: Data("x".utf8), mode: 0o600, path: "t")],
+            callerPID: callerPID, callerStartTime: callerStart)
+        check(false, "a blob key cannot shadow an existing document key")
+    } catch NativeStoreError.crossTierKeyConflict {
+        check(true, "a blob key cannot shadow an existing document key")
+    }
+} catch {
+    check(false, "whole-file import + cross-tier uniqueness checks succeed (\(error))")
+}
+
 print("\n# ProtectedFileSidecar (untrusted *.csec pointer)")
 do {
     let ref = try NativeSecretReference(store: try NativeStoreName("project"), key: "env_home")

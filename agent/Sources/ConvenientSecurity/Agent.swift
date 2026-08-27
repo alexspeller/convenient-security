@@ -1624,9 +1624,15 @@ public actor Agent {
                 message: "too many native-store edit sessions are active",
                 requestID: requestID
             )
+        case .crossTierKeyConflict:
+            return .failed(
+                .invalidStoreDocument,
+                message: "a key cannot exist in both the editable-document and file tiers of one store",
+                requestID: requestID
+            )
         case .authenticationRequired, .keyUnavailable, .storeNotFound,
              .secretNotFound, .integrityFailure, .filesystemFailure,
-             .randomGenerationFailed:
+             .randomGenerationFailed, .blobTierUnavailable:
             return .failed(
                 .nativeStoreUnavailable,
                 message: "the native encrypted store is unavailable or failed integrity validation",

@@ -86,6 +86,8 @@ public enum NativeStoreError: Error, Sendable, Equatable {
     case tooManyEditSessions
     case filesystemFailure
     case randomGenerationFailed
+    case blobTierUnavailable
+    case crossTierKeyConflict
 }
 
 extension NativeStoreError: LocalizedError {
@@ -121,6 +123,10 @@ extension NativeStoreError: LocalizedError {
             return "the encrypted store could not be read or written safely"
         case .randomGenerationFailed:
             return "secure random generation failed"
+        case .blobTierUnavailable:
+            return "the native store's file/blob tier is not configured"
+        case .crossTierKeyConflict:
+            return "a key cannot exist in both the editable-document and file tiers of one store"
         }
     }
 }
@@ -851,6 +857,14 @@ public actor NativeEncryptedFileProvider: SecretProvider {
         if session.baseline.generation > 0 {
             _ = try await loadDocument(store: session.store, record: session.baseline)
         }
+        // Cross-tier uniqueness: a csec://store/key must resolve to exactly one
+        // value, so an editable-document key may not shadow a file/blob key.
+        if let blobStore, !document.values.isEmpty {
+            let blobs = try await blobStore.list(store: session.store, unlock: session.unlock)
+            for key in document.values.keys where blobs[key] != nil {
+                throw NativeStoreError.crossTierKeyConflict
+            }
+        }
 
         let generation = session.baseline.generation + 1
         let fileID = try Self.randomBytes(count: 16).hexString
@@ -893,6 +907,41 @@ public actor NativeEncryptedFileProvider: SecretProvider {
             await fileBackend.delete(named: Self.fileName(store: session.store, fileID: oldID))
         }
         return NativeStoreEditCommit(generation: generation, secretCount: document.values.count)
+    }
+
+    /// Import whole-file values into the store's file/blob tier, reusing an
+    /// already-authorized edit session's biometric unlock. One `beginEdit`
+    /// consent covers this batch just as it would a document commit, and the
+    /// session is consumed either way. Cross-tier uniqueness is enforced against
+    /// the session's document baseline: a `csec://store/key` must resolve to
+    /// exactly one value, so a blob key may not shadow an editable-document key.
+    public func commitBlobs(
+        sessionID: String,
+        requests: [NativeBlobStore.PutRequest],
+        callerPID: pid_t,
+        callerStartTime: UInt64,
+        now: Date = Date()
+    ) async throws -> NativeStoreEditCommit {
+        pruneSessions(now: now)
+        guard let session = editSessions[sessionID],
+              session.caller == EditCaller(pid: callerPID, startTime: callerStartTime) else {
+            throw NativeStoreError.editSessionExpired
+        }
+        guard let blobStore else { throw NativeStoreError.blobTierUnavailable }
+        guard !requests.isEmpty else { throw NativeStoreError.invalidDocument }
+        if session.baseline.generation > 0 {
+            let document = try await loadDocument(store: session.store, record: session.baseline)
+            for request in requests where document.values[request.key] != nil {
+                throw NativeStoreError.crossTierKeyConflict
+            }
+        }
+        let generation = try await blobStore.putBlobs(
+            store: session.store,
+            requests: requests,
+            unlock: session.unlock
+        )
+        editSessions[sessionID] = nil
+        return NativeStoreEditCommit(generation: generation, secretCount: requests.count)
     }
 
     public func cancelEdit(
