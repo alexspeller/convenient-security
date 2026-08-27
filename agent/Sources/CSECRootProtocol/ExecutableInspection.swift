@@ -5,11 +5,19 @@ import Darwin
 
 public enum ExecutableInspectionError: Error, LocalizedError {
     case notFound(String)
+    case notFoundLooksLikeShellCommand(String)
     case notExecutable(String)
 
     public var errorDescription: String? {
         switch self {
         case let .notFound(command): return "executable not found: \(command)"
+        case let .notFoundLooksLikeShellCommand(command):
+            return "executable not found: \(command)\n"
+                + "The quoted string was used as one program name: csec takes a command "
+                + "and its arguments separately, like env, without shell parsing. "
+                + "Pass the arguments individually (… -- /bin/echo \"$NAME\") or name a "
+                + "shell explicitly to expand variables inside the guarded environment "
+                + "(… -- /bin/sh -c 'echo \"$NAME\"')."
         case let .notExecutable(path): return "not an executable file: \(path)"
         }
     }
@@ -69,6 +77,13 @@ public enum ExecutableInspection {
                 .standardizedFileURL
                 .resolvingSymlinksInPath()
                 .path
+        }
+        // `csec exec '/bin/echo $VAR'` reads as one program name with a space in
+        // it. A path that exists under that literal name resolved above; a
+        // missing one is far more likely a shell command line quoted into a
+        // single argument, so explain the argv model instead of just "not found".
+        if command.contains(where: \.isWhitespace) {
+            throw ExecutableInspectionError.notFoundLooksLikeShellCommand(command)
         }
         throw ExecutableInspectionError.notFound(command)
     }

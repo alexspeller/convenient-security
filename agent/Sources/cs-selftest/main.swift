@@ -2004,6 +2004,17 @@ if let legacy = try? JSONDecoder().decode(Request.self, from: legacyJSON),
 
 check((try? ExecutableInspection.resolve(command: "sh"))?.hasPrefix("/") == true,
       "launcher resolves PATH commands to an absolute executable")
+do {
+    _ = try ExecutableInspection.resolve(command: "/bin/echo $NAME")
+    check(false, "a quoted shell command line used as one program name is rejected")
+} catch let error as ExecutableInspectionError {
+    if case .notFoundLooksLikeShellCommand = error {
+        check(error.localizedDescription.contains("like env"),
+              "a missing program name containing whitespace explains the argv model")
+    } else {
+        check(false, "a missing whitespace program name raises the shell-command guidance, got \(error)")
+    }
+}
 check(ExecutableInspection.independentlyProtected(path: "/bin/sh"),
       "root-owned system executable is independently protected")
 check(!ExecutableInspection.independentlyProtected(

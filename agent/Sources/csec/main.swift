@@ -958,6 +958,14 @@ func runExec(_ arguments: [String]) -> Never {
     let argv: [UnsafeMutablePointer<CChar>?] = commandLine.map { strdup($0) } + [nil]
     execvp(commandLine[0], argv)
 
+    // Secret-free launches never went through ExecutableInspection, so give the
+    // quoted-shell-command mistake the same explanation it produces there.
+    if errno == ENOENT, commandLine[0].contains(where: \.isWhitespace) {
+        let guidance = ExecutableInspectionError
+            .notFoundLooksLikeShellCommand(commandLine[0]).localizedDescription
+        FileHandle.standardError.write(Data("csec exec: \(guidance)\n".utf8))
+        exit(127)
+    }
     let message = String(cString: strerror(errno))
     FileHandle.standardError.write(Data("csec exec: \(commandLine[0]): \(message)\n".utf8))
     exit(127)
