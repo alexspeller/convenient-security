@@ -791,6 +791,60 @@ do {
     check(false, "protected-file sidecar scan checks succeed (\(error))")
 }
 
+print("\n# ProtectedSymlinkMaterialization (launcher-installed sidecar links)")
+do {
+    let fm = FileManager.default
+    let project = NSTemporaryDirectory() + "csec-symlink-project-\(UUID().uuidString.lowercased())"
+    let mount = NSTemporaryDirectory() + "csec-symlink-mount-\(UUID().uuidString.lowercased())"
+    try fm.createDirectory(
+        atPath: (project as NSString).appendingPathComponent("config"),
+        withIntermediateDirectories: true)
+    try fm.createDirectory(atPath: mount, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(atPath: project); try? fm.removeItem(atPath: mount) }
+
+    let envTmpfs = (mount as NSString).appendingPathComponent("files-envrc")
+    let keyTmpfs = (mount as NSString).appendingPathComponent("files-key")
+    try Data("SECRET=1\n".utf8).write(to: URL(fileURLWithPath: envTmpfs))
+    try Data("masterkey".utf8).write(to: URL(fileURLWithPath: keyTmpfs))
+
+    let materialization = try ProtectedSymlinkMaterialization(projectDirectory: project)
+    try materialization.install([
+        .init(projectRelativePath: ".envrc", tmpfsPath: envTmpfs),
+        .init(projectRelativePath: "config/master.key", tmpfsPath: keyTmpfs),
+    ])
+    let envLink = (project as NSString).appendingPathComponent(".envrc")
+    let keyLink = (project as NSString).appendingPathComponent("config/master.key")
+    check((try? fm.destinationOfSymbolicLink(atPath: envLink)) == envTmpfs
+          && (try? Data(contentsOf: URL(fileURLWithPath: envLink))) == Data("SECRET=1\n".utf8),
+          "materialization links a project path to its tmpfs file and reads through it")
+    check((try? fm.destinationOfSymbolicLink(atPath: keyLink)) == keyTmpfs,
+          "materialization creates a nested symlink at its project path")
+
+    let occupied = try ProtectedSymlinkMaterialization(projectDirectory: project)
+    try Data("real".utf8).write(
+        to: URL(fileURLWithPath: (project as NSString).appendingPathComponent("existing")))
+    checkThrows("materialization refuses to clobber an existing target file") {
+        try occupied.install([.init(projectRelativePath: "existing", tmpfsPath: envTmpfs)])
+    }
+
+    materialization.removeAll()
+    check(!fm.fileExists(atPath: envLink) && !fm.fileExists(atPath: keyLink)
+          && fm.fileExists(atPath: envTmpfs),
+          "teardown removes the launcher's symlinks but leaves their tmpfs targets")
+
+    // A real file that usurped a materialized link must survive teardown.
+    let guarded = try ProtectedSymlinkMaterialization(projectDirectory: project)
+    try guarded.install([.init(projectRelativePath: "usurped", tmpfsPath: envTmpfs)])
+    let usurpedLink = (project as NSString).appendingPathComponent("usurped")
+    try fm.removeItem(atPath: usurpedLink)
+    try Data("attacker".utf8).write(to: URL(fileURLWithPath: usurpedLink))
+    guarded.removeAll()
+    check((try? Data(contentsOf: URL(fileURLWithPath: usurpedLink))) == Data("attacker".utf8),
+          "teardown never removes a real file that replaced a materialized link")
+} catch {
+    check(false, "protected symlink materialization checks succeed (\(error))")
+}
+
 do {
     let testDirectory = NSTemporaryDirectory()
         + "csec-native-files-\(UUID().uuidString.lowercased())"
