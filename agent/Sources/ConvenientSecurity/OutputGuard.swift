@@ -255,38 +255,42 @@ public struct StreamingOutputRedactor: Sendable {
             return OutputRedactionResult(data: result, matches: [])
         }
 
-        let safeStartLimit = flushing
-            ? pending.count
-            : max(0, pending.count - longestPatternLength + 1)
         var output: [UInt8] = []
         output.reserveCapacity(pending.count)
         var matches: [OutputRedactionMatch] = []
         var index = 0
 
-        while index < pending.count, flushing || index < safeStartLimit {
-            var matched: OutputRedactionPattern?
+        scan: while index < pending.count {
             if let candidates = candidatesByFirstByte[pending[index]] {
+                // Candidates are longest-first, so a still-completable longer
+                // value is considered before a shorter complete match could
+                // claim its leading bytes and break longest-match semantics.
                 for candidate in candidates {
                     let end = index + candidate.bytes.count
-                    guard end <= pending.count else { continue }
-                    if pending[index..<end].elementsEqual(candidate.bytes) {
-                        matched = candidate
-                        break // candidates are longest-first
+                    if end <= pending.count {
+                        guard pending[index..<end].elementsEqual(candidate.bytes) else { continue }
+                        output.append(contentsOf: candidate.replacement)
+                        matches.append(OutputRedactionMatch(
+                            opaqueID: candidate.opaqueID,
+                            representation: candidate.representation
+                        ))
+                        index = end
+                        continue scan
+                    }
+                    // Withhold only a tail that genuinely tracks this
+                    // candidate's leading bytes: unseen input could still
+                    // complete the match. Anything else is forwarded
+                    // immediately — a fixed lookback window would hold back
+                    // interactive prompts and echoes for dozens of bytes and
+                    // make a supervised shell unusable.
+                    if !flushing,
+                       pending[index...].elementsEqual(candidate.bytes.prefix(pending.count - index)) {
+                        break scan
                     }
                 }
             }
-
-            if let matched {
-                output.append(contentsOf: matched.replacement)
-                matches.append(OutputRedactionMatch(
-                    opaqueID: matched.opaqueID,
-                    representation: matched.representation
-                ))
-                index += matched.bytes.count
-            } else {
-                output.append(pending[index])
-                index += 1
-            }
+            output.append(pending[index])
+            index += 1
         }
 
         if index > 0 {

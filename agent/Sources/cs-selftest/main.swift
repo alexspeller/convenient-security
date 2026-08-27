@@ -2768,6 +2768,29 @@ let unmatchedFlush = redact(
 check(unmatchedFlush.data == Data("trailing-abcd".utf8) && unmatchedFlush.matches.isEmpty,
       "an unmatched trailing prefix is forwarded intact at EOF")
 
+// Interactive streams live on immediacy: a chunk whose tail cannot begin any
+// protected value must be forwarded in full without waiting for more input,
+// or a supervised shell never shows its prompt.
+var promptRedactor = StreamingOutputRedactor(patterns: [prefixPattern, longestPattern])
+let promptResult = promptRedactor.process(Data("bash-5.2$ ".utf8))
+check(promptResult.data == Data("bash-5.2$ ".utf8) && promptResult.matches.isEmpty,
+      "a chunk with no viable secret prefix is forwarded immediately, not withheld")
+
+var echoRedactor = StreamingOutputRedactor(patterns: [prefixPattern, longestPattern])
+let echoedImmediately = Data("ls -l\r".utf8).allSatisfy { byte in
+    echoRedactor.process(Data([byte])).data == Data([byte])
+}
+check(echoedImmediately,
+      "byte-at-a-time echo of ordinary characters is emitted keystroke by keystroke")
+
+// Withholding stays precise: only the tail that tracks a candidate's leading
+// bytes is held back, and a diverging byte releases it verbatim.
+var divergeRedactor = StreamingOutputRedactor(patterns: [prefixPattern, longestPattern])
+let heldPrefix = divergeRedactor.process(Data("cmd: abcde".utf8))
+let released = divergeRedactor.process(Data("X".utf8))
+check(heldPrefix.data == Data("cmd: ".utf8) && released.data == Data("abcdeX".utf8),
+      "a viable prefix is withheld from its own first byte and released on divergence")
+
 let encodedCatalog = OutputRedactionCatalog(
     valuesByReference: ["op://Synthetic/Output/token": Data("alpha:/\"beta-token".utf8)]
 )
