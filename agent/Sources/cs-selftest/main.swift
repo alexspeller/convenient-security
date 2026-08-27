@@ -733,6 +733,64 @@ do {
     check(false, "protected-file sidecar checks succeed (\(error))")
 }
 
+print("\n# ProtectedSidecarScanner (bounded *.csec discovery)")
+do {
+    let fm = FileManager.default
+    let projectDirectory = NSTemporaryDirectory()
+        + "csec-sidecar-scan-\(UUID().uuidString.lowercased())"
+    try fm.createDirectory(atPath: projectDirectory, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(atPath: projectDirectory) }
+
+    let store = try NativeStoreName("project")
+    func writeSidecar(_ base: String, _ relativePath: String, key: String) throws -> NativeSecretReference {
+        let ref = try NativeSecretReference(store: store, key: key)
+        let full = (base as NSString).appendingPathComponent(relativePath)
+        try fm.createDirectory(
+            atPath: (full as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true
+        )
+        try ProtectedFileSidecar(reference: ref).encoded().write(to: URL(fileURLWithPath: full))
+        return ref
+    }
+
+    let envRef = try writeSidecar(projectDirectory, ".envrc.csec", key: "env_home")
+    let configRef = try writeSidecar(projectDirectory, "config/prod.json.csec", key: "config_prod")
+    // A sidecar under an excluded build directory is never reached.
+    _ = try writeSidecar(projectDirectory, "node_modules/pkg/.env.csec", key: "vendored")
+    // A plain file and a name that is only the suffix are not sidecars.
+    try Data("noise".utf8).write(
+        to: URL(fileURLWithPath: (projectDirectory as NSString).appendingPathComponent("README.md")))
+    // A symlink ending in .csec is not followed.
+    try fm.createSymbolicLink(
+        atPath: (projectDirectory as NSString).appendingPathComponent("link.csec"),
+        withDestinationPath: "/etc/passwd"
+    )
+
+    let discovered = try ProtectedSidecarScanner.scan(projectDirectory: projectDirectory)
+    check(discovered.map(\.targetRelativePath) == [".envrc", "config/prod.json"],
+          "the scan finds every in-tree *.csec, sorted, skipping excluded/symlink/non-sidecar entries")
+    check(discovered.first?.sidecarRelativePath == ".envrc.csec"
+            && discovered.first?.reference == envRef,
+          "a discovery pairs its target with the sidecar path and reference")
+    check(discovered.last?.targetRelativePath == "config/prod.json"
+            && discovered.last?.reference == configRef,
+          "a nested sidecar resolves a nested target path")
+
+    // Overflow past the per-launch maximum is a hard error, not truncation.
+    let overflowDirectory = NSTemporaryDirectory()
+        + "csec-sidecar-overflow-\(UUID().uuidString.lowercased())"
+    try fm.createDirectory(atPath: overflowDirectory, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(atPath: overflowDirectory) }
+    for index in 0...ProtectedSidecarScanner.maximumSidecars {
+        _ = try writeSidecar(overflowDirectory, "file\(index).csec", key: "k\(index)")
+    }
+    checkThrows("more sidecars than a launch allows is a hard error") {
+        _ = try ProtectedSidecarScanner.scan(projectDirectory: overflowDirectory)
+    }
+} catch {
+    check(false, "protected-file sidecar scan checks succeed (\(error))")
+}
+
 do {
     let testDirectory = NSTemporaryDirectory()
         + "csec-native-files-\(UUID().uuidString.lowercased())"
