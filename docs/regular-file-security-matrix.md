@@ -31,8 +31,16 @@ launcher killed with `SIGKILL` cannot run teardown, so its link is left dangling
 over the (already-reclaimed) tmpfs node; the next launch reclaims such a leftover
 only when it is a dangling symlink pointing inside csec's own mount, so a real
 file, a link elsewhere, or a live link from a concurrent launch is never removed.
-csecd independently binds each sidecar value to the project-relative path its
-blob was protected at, so a planted or moved sidecar fails closed before launch.
+A sidecar is source-neutral: it may name any secret reference (`op://`, `csec://`,
+…), in either the strict JSON `csec protect` writes or a bare reference, and a
+`*.csec` file that cannot be parsed is warned about rather than silently skipped.
+For a native `csec://` sidecar, csecd independently binds its value to the
+project-relative path its blob was protected at, so a planted or moved native
+sidecar fails closed before launch. A non-native reference has no recorded
+protect-path and cannot be path-bound; like `op://` everywhere else it relies on
+the Touch ID review that shows the reference, which is the same protection a
+planted `op://` env-scan line or `--set` already has (so a source-neutral sidecar
+adds no new plant capability).
 
 The same launch also folds in `csec exec`'s ordinary environment injection:
 `--set` assignments and env-scanned references become **value-in-environment**

@@ -199,10 +199,18 @@ confidentiality boundary is unchanged — an unrelated same-UID process that
 follows the symlink still gets `EACCES` on the `0040` target — but the symlink
 itself sits in a user-writable directory and is therefore not an integrity
 boundary: same-uid malware can replace it, which is out of scope for the same
-reason a compromised consumer is. Because a sidecar in a hostile directory is
-untrusted, `csecd` binds each value to the project-relative path its blob recorded
-at import, so a planted or moved sidecar that redirects a value to a different
-path fails closed before any launch.
+reason a compromised consumer is. A sidecar is source-neutral — it may name any
+secret reference, as either the strict JSON `csec protect` writes or a bare
+reference — and a `*.csec` file that cannot be parsed is warned about, not silently
+skipped, so a broken sidecar is visible rather than looking like a missing secret.
+For a native `csec://` sidecar, because it sits in a hostile directory `csecd`
+binds its value to the project-relative path its blob recorded at import, so a
+planted or moved native sidecar that redirects a value to a different path fails
+closed before any launch. A non-native reference (`op://`, …) has no recorded
+protect-path and cannot be path-bound; a planted one is caught only by the Touch ID
+review that shows the reference — the same protection an attacker-planted `op://`
+env-scan line or `--set` already faces, so allowing source-neutral sidecars adds no
+new capability for the automated, opportunistic adversary this model targets.
 
 The same launch folds in `csec exec`'s ordinary environment injection (`--set`
 and env-scanned references) as value-in-environment bindings: csecd resolves each

@@ -101,7 +101,7 @@ func runProtect(_ arguments: [String]) -> Never {
         //    any plaintext — the values are safely imported regardless.
         for item in planned {
             let reference = try NativeSecretReference(store: store, key: item.key)
-            let sidecar = try ProtectedFileSidecar(reference: reference).encoded()
+            let sidecar = try ProtectedFileSidecar(reference: SecretRef(reference.uri)).encoded()
             try writeFileAtomically(path: item.sidecarPath, data: sidecar, mode: 0o600)
         }
 

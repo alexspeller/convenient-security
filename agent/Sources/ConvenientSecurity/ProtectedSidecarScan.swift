@@ -11,16 +11,43 @@ import Darwin
 public struct DiscoveredProtectedFile: Equatable, Sendable {
     public let targetRelativePath: String
     public let sidecarRelativePath: String
-    public let reference: NativeSecretReference
+    public let reference: SecretRef
 
     public init(
         targetRelativePath: String,
         sidecarRelativePath: String,
-        reference: NativeSecretReference
+        reference: SecretRef
     ) {
         self.targetRelativePath = targetRelativePath
         self.sidecarRelativePath = sidecarRelativePath
         self.reference = reference
+    }
+}
+
+/// A file that looks like a sidecar (its name ends in `.csec`) but could not be
+/// used, surfaced so `csec exec` can warn about it rather than silently skipping —
+/// a broken sidecar otherwise looks exactly like "the secret just wasn't there".
+/// Value-free: it carries the project-relative path and a human-readable reason.
+public struct ProtectedSidecarIssue: Equatable, Sendable {
+    public let sidecarRelativePath: String
+    public let reason: String
+
+    public init(sidecarRelativePath: String, reason: String) {
+        self.sidecarRelativePath = sidecarRelativePath
+        self.reason = reason
+    }
+}
+
+/// The outcome of a scan: the usable sidecars plus any `.csec` files that could
+/// not be parsed into one. Overflow past the per-launch bound is still a thrown
+/// error, not an issue, because it aborts the launch rather than degrading it.
+public struct ProtectedSidecarScanResult: Equatable, Sendable {
+    public let discoveries: [DiscoveredProtectedFile]
+    public let issues: [ProtectedSidecarIssue]
+
+    public init(discoveries: [DiscoveredProtectedFile], issues: [ProtectedSidecarIssue]) {
+        self.discoveries = discoveries
+        self.issues = issues
     }
 }
 
@@ -57,10 +84,11 @@ public enum ProtectedSidecarScanner {
         "DerivedData", "build", "dist", "coverage", "tmp",
     ]
 
-    public static func scan(projectDirectory: String) throws -> [DiscoveredProtectedFile] {
+    public static func scan(projectDirectory: String) throws -> ProtectedSidecarScanResult {
         let root = URL(fileURLWithPath: projectDirectory, isDirectory: true)
         let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
         var discoveries: [DiscoveredProtectedFile] = []
+        var issues: [ProtectedSidecarIssue] = []
         var visited = 0
         // Carry each directory's path relative to the root through the walk rather
         // than reconstructing it from absolute paths afterward: on macOS a temp
@@ -101,22 +129,55 @@ public enum ProtectedSidecarScanner {
                     }
                     continue
                 }
-                guard values?.isRegularFile == true,
-                      values?.isSymbolicLink != true,
-                      name.hasSuffix(ProtectedFileSidecar.suffix) else { continue }
+                // Only names that look like a sidecar are considered; anything else
+                // is unrelated and never warned about.
+                guard name.hasSuffix(ProtectedFileSidecar.suffix) else { continue }
 
+                // From here the entry claims to be a sidecar, so every failure is a
+                // reported issue (`csec exec` warns) rather than a silent skip — a
+                // broken sidecar otherwise looks identical to "the file just wasn't
+                // there". A `.csec` symlink or special file is refused, not followed.
+                guard values?.isRegularFile == true, values?.isSymbolicLink != true else {
+                    issues.append(ProtectedSidecarIssue(
+                        sidecarRelativePath: relative,
+                        reason: "not a regular file (a sidecar must be a plain file, "
+                            + "not a symlink or special file)"
+                    ))
+                    continue
+                }
                 let targetName: String
                 do {
                     targetName = try ProtectedFileSidecar.targetName(forSidecarNamed: name)
                 } catch {
-                    // A name that ends in `.csec` but cannot name a real target
-                    // (`.csec`, `..csec`) is not a usable sidecar; skip it.
+                    issues.append(ProtectedSidecarIssue(
+                        sidecarRelativePath: relative,
+                        reason: (error as? LocalizedError)?.errorDescription
+                            ?? "does not name a target file"
+                    ))
                     continue
                 }
                 guard let bytes = Self.readBounded(
                     url: url,
                     maximum: ProtectedFileSidecar.maximumBytes
-                ), let sidecar = try? ProtectedFileSidecar(data: bytes) else { continue }
+                ) else {
+                    issues.append(ProtectedSidecarIssue(
+                        sidecarRelativePath: relative,
+                        reason: "could not be read, or is larger than a sidecar may be "
+                            + "(max \(ProtectedFileSidecar.maximumBytes) bytes)"
+                    ))
+                    continue
+                }
+                let sidecar: ProtectedFileSidecar
+                do {
+                    sidecar = try ProtectedFileSidecar(data: bytes)
+                } catch {
+                    issues.append(ProtectedSidecarIssue(
+                        sidecarRelativePath: relative,
+                        reason: (error as? LocalizedError)?.errorDescription
+                            ?? "is not a valid protected-file sidecar"
+                    ))
+                    continue
+                }
 
                 let targetRelative = directory.relativePath.isEmpty
                     ? targetName
@@ -131,7 +192,10 @@ public enum ProtectedSidecarScanner {
                 }
             }
         }
-        return discoveries.sorted { $0.targetRelativePath < $1.targetRelativePath }
+        return ProtectedSidecarScanResult(
+            discoveries: discoveries.sorted { $0.targetRelativePath < $1.targetRelativePath },
+            issues: issues.sorted { $0.sidecarRelativePath < $1.sidecarRelativePath }
+        )
     }
 
     /// Read at most `maximum` bytes from a regular file without following a

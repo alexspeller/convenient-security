@@ -11,31 +11,40 @@ public enum ProtectedFileSidecarError: Error, Equatable, LocalizedError {
         switch self {
         case .notASidecar: return "not a csec protected-file sidecar"
         case .tooLarge: return "the sidecar is larger than a protected-file descriptor may be"
-        case .malformed: return "the sidecar is not a well-formed protected-file descriptor"
+        case .malformed:
+            return "not a valid sidecar: expected a secret reference (e.g. op://… or "
+                + "csec://…), optionally quoted, or the JSON that `csec protect` writes"
         case .unsupportedVersion: return "the sidecar uses an unsupported descriptor version"
         case .invalidTargetName: return "the sidecar does not name a valid target file"
         }
     }
 }
 
-/// The on-disk `<name>.csec` marker that replaces a plaintext secret file. It is
-/// a tiny, strict-JSON *pointer* to a native `csec://<store>/<key>` value — never
-/// a value — and it lives in a user-writable, possibly hostile directory, so it
-/// is parsed as untrusted metadata: exact key set, fixed magic, bounded size, and
-/// a reference that must use the native `csec://` scheme (never `op://` or any
-/// remote provider). Materialization resolves the reference against the store's
-/// file/blob tier and matches that blob's own recorded path against the sidecar's
-/// location (Stage 4), so a planted sidecar cannot redirect another store's value
-/// here.
+/// The on-disk `<name>.csec` marker that replaces a plaintext secret file: a
+/// tiny *pointer* to a secret reference — never a value. It is **source-neutral**,
+/// naming any secret reference (`op://…`, `csec://…`, …) exactly as every other
+/// csec surface does. Two on-disk forms are accepted, both parsed as untrusted
+/// metadata under a bounded size:
+///   1. the strict JSON envelope `csec protect` writes (fixed magic, version, and
+///      an exact key set), and
+///   2. a bare reference — a single secret URL on its own, tolerant of surrounding
+///      whitespace and one layer of quotes (the shape a `csec get` / 1Password
+///      value naturally has), so a hand-written sidecar just works.
+/// A native `csec://` reference additionally gets the planted-sidecar defense:
+/// materialization matches the blob's own recorded protect-path against the
+/// sidecar's location (`Agent.protectedFilePathsAreBound`), so a moved or planted
+/// native sidecar fails closed. A non-native reference has no such recorded path,
+/// so — like `op://` everywhere else in csec — it relies on the Touch ID review
+/// that shows the reference before any value is released.
 public struct ProtectedFileSidecar: Sendable, Equatable {
     public static let suffix = ".csec"
     public static let magic = "convenient-security/protected-file"
     public static let currentVersion = 1
     public static let maximumBytes = 4096
 
-    public let reference: NativeSecretReference
+    public let reference: SecretRef
 
-    public init(reference: NativeSecretReference) {
+    public init(reference: SecretRef) {
         self.reference = reference
     }
 
@@ -54,10 +63,25 @@ public struct ProtectedFileSidecar: Sendable, Equatable {
 
     public init(data: Data) throws {
         guard data.count <= Self.maximumBytes else { throw ProtectedFileSidecarError.tooLarge }
-        guard let any = try? JSONSerialization.jsonObject(with: data, options: []),
-              let object = any as? [String: Any] else {
-            throw ProtectedFileSidecarError.malformed
+        // Prefer the strict JSON envelope (what `csec protect` writes). Only a JSON
+        // object is treated as the envelope; a bare quoted string is a fragment
+        // JSONSerialization rejects by default, so it falls through to the bare form.
+        if let any = try? JSONSerialization.jsonObject(with: data, options: []),
+           let object = any as? [String: Any] {
+            self.reference = try Self.reference(fromEnvelope: object)
+            return
         }
+        // Fall back to a bare reference: a single secret URL on its own line,
+        // tolerant of surrounding whitespace and one layer of quotes.
+        if let text = String(data: data, encoding: .utf8),
+           let reference = try? SecretRef(Self.unwrapBareReference(text)) {
+            self.reference = reference
+            return
+        }
+        throw ProtectedFileSidecarError.malformed
+    }
+
+    private static func reference(fromEnvelope object: [String: Any]) throws -> SecretRef {
         guard Set(object.keys) == ["csec", "version", "reference"] else {
             throw ProtectedFileSidecarError.malformed
         }
@@ -71,14 +95,26 @@ public struct ProtectedFileSidecar: Sendable, Equatable {
               Double(versionNumber.intValue) == versionNumber.doubleValue else {
             throw ProtectedFileSidecarError.unsupportedVersion
         }
-        guard let referenceString = object["reference"] as? String else {
+        guard let referenceString = object["reference"] as? String,
+              let secretRef = try? SecretRef(referenceString) else {
             throw ProtectedFileSidecarError.malformed
         }
-        guard let secretRef = try? SecretRef(referenceString),
-              let nativeRef = try? NativeSecretReference(secretRef) else {
-            throw ProtectedFileSidecarError.malformed
+        return secretRef
+    }
+
+    /// Trim surrounding whitespace and a single layer of matching quotes so a
+    /// hand-written or `csec get`-piped reference (which 1Password prints quoted)
+    /// parses. Inner content is never altered, so a reference's own path — which
+    /// may legitimately contain spaces — is preserved.
+    static func unwrapBareReference(_ text: String) -> String {
+        var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        for quote in ["\"", "'"] where trimmed.count >= 2
+            && trimmed.hasPrefix(quote) && trimmed.hasSuffix(quote) {
+            trimmed = String(trimmed.dropFirst().dropLast())
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            break
         }
-        self.reference = nativeRef
+        return trimmed
     }
 
     /// The base name of the sidecar file for a given target file name.

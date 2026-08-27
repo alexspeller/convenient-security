@@ -453,6 +453,12 @@ do {
           "a sidecar redirected to a different path is rejected (planted-sidecar defense)")
     check(await agent.protectedFilePathsAreBound([envDelivered]),
           "environment-delivered bindings are not path-bound")
+    // Source-neutral: a non-native (op://) sidecar has no recorded protect-path, so
+    // it is not path-bound here and instead relies on the review that shows it.
+    let nonNative = ProtectedFileBinding.symlink(
+        projectRelativePath: "secrets/token", reference: "op://vault/item/field", index: 0)
+    check(await agent.protectedFilePathsAreBound([nonNative]),
+          "a source-neutral (op://) sidecar is not path-bound; it relies on the review")
 } catch {
     check(false, "blob-path binding e2e checks succeed (\(error))")
 }
@@ -1458,6 +1464,33 @@ do {
             + "err \"\(reclaimed.err)\")")
     check((try? FileManager.default.destinationOfSymbolicLink(atPath: envrcPath)) == nil,
           "the reclaimed launch tears its own materialized link down afterwards")
+
+    // Source-neutral: a hand-written BARE sidecar naming an op:// reference (no JSON
+    // envelope, no csec:// requirement) materializes end-to-end through the real
+    // launch. The value is compared inside the child so the default guard has
+    // nothing to redact.
+    try Data("op://demo/db/url\n".utf8).write(
+        to: URL(fileURLWithPath: projectDir + "/db.url.csec"))
+    let bareOp = runInProject([
+        "exec", "--", "/bin/sh", "-c",
+        "test \"$(cat db.url)\" = 'postgres://s3cr3t' && printf bare-op-ok",
+    ])
+    check(bareOp.status == 0 && bareOp.out == "bare-op-ok",
+          "a bare op:// sidecar materializes source-neutrally through the real launch "
+            + "(status \(bareOp.status), out \"\(bareOp.out)\", err \"\(bareOp.err)\")")
+
+    // A *.csec file that cannot be parsed WARNS on stderr instead of being silently
+    // skipped — otherwise a broken sidecar is indistinguishable from the secret
+    // simply not being there.
+    try Data("this is not a reference\n".utf8).write(
+        to: URL(fileURLWithPath: projectDir + "/broken.env.csec"))
+    let warned = runInProject(["exec", "--", "/bin/sh", "-c", "printf ran"])
+    check(warned.status == 0
+          && warned.out == "ran"
+          && warned.err.contains("broken.env.csec")
+          && warned.err.contains("warning"),
+          "csec exec warns about an unparseable *.csec instead of silently skipping "
+            + "(err \"\(warned.err)\")")
 } catch {
     check(false, "csec exec sidecar materialization end-to-end succeeds (\(error))")
 }

@@ -648,21 +648,28 @@ public actor Agent {
         )
     }
 
-    /// Planted-sidecar defense for symlink-delivered (`*.csec`) bindings: the
-    /// value must come from a blob whose recorded `csec protect` path equals the
-    /// sidecar's own project location, so a sidecar dropped or moved by same-uid
-    /// malware cannot redirect a value to a path it was never protected at. It
-    /// reuses the store key record cached by the just-completed resolution, so it
-    /// adds no second Touch ID, and fails closed: a symlink binding whose
-    /// reference is not a native blob, or whose recorded path differs, is
-    /// rejected. Environment-delivered bindings are unaffected.
+    /// Planted-sidecar defense for symlink-delivered (`*.csec`) bindings that name
+    /// a native `csec://` blob: the value must come from a blob whose recorded
+    /// `csec protect` path equals the sidecar's own project location, so a sidecar
+    /// dropped or moved by same-uid malware cannot redirect a native value to a
+    /// path it was never protected at. It reuses the store key record cached by the
+    /// just-completed resolution, so it adds no second Touch ID, and fails closed:
+    /// a native binding whose recorded path differs (or is absent) is rejected.
+    ///
+    /// A sidecar is source-neutral, so a non-native reference (`op://`, …) has no
+    /// recorded protect-path and cannot be path-bound; it is allowed here and, like
+    /// `op://` everywhere else in csec, relies on the Touch ID review that shows the
+    /// reference before release. Environment-delivered bindings are unaffected.
     public func protectedFilePathsAreBound(_ bindings: [ProtectedFileBinding]) async -> Bool {
         for binding in bindings {
             guard let target = binding.symlinkTarget else { continue }
+            guard let reference = try? SecretRef(binding.reference) else { return false }
+            // Only native references carry a recorded protect-path to bind against.
+            guard reference.scheme == "csec" else { continue }
             guard let nativeStore,
-                  let reference = try? NativeSecretReference(SecretRef(binding.reference)),
+                  let nativeReference = try? NativeSecretReference(reference),
                   let recordedPath = await nativeStore.recordedBlobPath(
-                      store: reference.store, key: reference.key),
+                      store: nativeReference.store, key: nativeReference.key),
                   recordedPath == target else {
                 return false
             }

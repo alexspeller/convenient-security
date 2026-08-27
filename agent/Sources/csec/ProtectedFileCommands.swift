@@ -856,6 +856,20 @@ private func writeProtectedFileError(_ message: String) {
     FileHandle.standardError.write(Data(message.utf8))
 }
 
+/// Warn — in color on a terminal — that a `*.csec` file could not be used as a
+/// sidecar, rather than silently skipping it: a broken sidecar otherwise looks
+/// exactly like the secret simply not being there. The path is untrusted metadata
+/// from a possibly hostile directory, so it is neutralized before display and the
+/// reason (our own copy) is printed verbatim.
+func warnProtectedSidecarIssue(path: String, reason: String) {
+    let color = TerminalStyle.colorEnabled(STDERR_FILENO)
+    let label = TerminalStyle.paint(
+        "csec exec: warning:", TerminalStyle.Code.yellow, color: color)
+    let safePath = TerminalStyle.paint(
+        ReviewDisplay.sanitized(path), TerminalStyle.Code.bold, color: color)
+    writeProtectedFileError("\(label) \(safePath): \(reason)\n")
+}
+
 @discardableResult
 private func writeProtectedFileAll(fd: Int32, data: Data) -> Bool {
     var offset = 0

@@ -251,21 +251,31 @@ gate in [`docs/regular-file-security-matrix.md`](docs/regular-file-security-matr
 `csec protect` and `csec exec` build a whole-file workflow on this mechanism.
 `csec protect` imports plaintext files into the store as per-value AES-GCM blobs
 (one Touch ID for the batch, durable before any plaintext is unlinked) and
-replaces each with a tiny strict-JSON `*.csec` sidecar naming its `csec://` value.
-`csec exec` scans the project subtree for those sidecars and, when any are
+replaces each with a tiny `*.csec` sidecar naming its `csec://` value. A sidecar
+is **source-neutral** — it names any secret reference exactly as every other csec
+surface does — and is recognized in either of two on-disk forms: the strict JSON
+envelope `csec protect` writes, or a bare reference (a lone secret URL, tolerant of
+surrounding whitespace and one layer of quotes) so a hand-written pointer just
+works. `csec exec` scans the project subtree for those sidecars and, when any are
 present, drives the same root-helper launch with symlink-delivered bindings: the
 helper materializes each value into tmpfs exactly as above, and the launcher — at
 ordinary user privilege, never the helper — installs a symlink from each file's
-original path into that tmpfs and removes it on exit. A hard-killed launcher
-skips that teardown, so a later launch reclaims a leftover link — but only when it
-is a *dangling* symlink into csec's own mount, never a real file, a link pointing
-elsewhere, or a live link a concurrent launch still uses. A reference is one native
-value whether it holds a short token or a whole binary file; the storage tier
-(editable document vs. blob) is invisible at the reference. Because a sidecar
-lives in a hostile directory, csecd binds each value to the project-relative path
-its blob recorded at import, so a planted or moved sidecar fails closed; the
-symlink itself is a confidentiality-only surface that same-uid malware can
-replace, an accepted integrity limitation. The same launch also folds in
+original path into that tmpfs and removes it on exit. A `*.csec` file that looks
+like a sidecar but cannot be parsed is reported and warned about, never silently
+skipped — a broken sidecar otherwise looks identical to the secret simply not
+being there. A hard-killed launcher skips that teardown, so a later launch reclaims
+a leftover link — but only when it is a *dangling* symlink into csec's own mount,
+never a real file, a link pointing elsewhere, or a live link a concurrent launch
+still uses. A reference is one value whether it holds a short token or a whole
+binary file; the storage tier (editable document vs. blob) is invisible at the
+reference. A native `csec://` sidecar additionally gets the planted-sidecar
+defense: because it lives in a hostile directory, csecd binds its value to the
+project-relative path its blob recorded at import, so a planted or moved native
+sidecar fails closed. A non-native reference (`op://`, …) has no recorded
+protect-path and cannot be path-bound, so — like `op://` everywhere else in csec —
+it relies on the Touch ID review that shows the reference before release. The
+symlink itself is a confidentiality-only surface that same-uid malware can replace,
+an accepted integrity limitation. The same launch also folds in
 `csec exec`'s ordinary environment injection: each `--set` assignment or
 env-scanned reference becomes a value-in-environment binding whose resolved value
 the helper places directly into the child environment. csecd resolves everything

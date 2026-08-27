@@ -703,12 +703,33 @@ do {
     check(false, "protected-file import planner checks succeed (\(error))")
 }
 
-print("\n# ProtectedFileSidecar (untrusted *.csec pointer)")
+print("\n# ProtectedFileSidecar (untrusted *.csec pointer, source-neutral)")
 do {
-    let ref = try NativeSecretReference(store: try NativeStoreName("project"), key: "env_home")
+    let good = "convenient-security/protected-file"
+    let ref = try SecretRef("csec://project/env_home")
     let encoded = try ProtectedFileSidecar(reference: ref).encoded()
     check(try ProtectedFileSidecar(data: encoded).reference == ref,
-          "a sidecar round-trips its csec:// reference")
+          "a sidecar round-trips its reference through the JSON envelope")
+    // Source-neutral: any provider scheme is accepted in the JSON envelope, not
+    // only native csec://. (This corrects the old csec://-only restriction.)
+    let opEnvelope = #"{"csec":"\#(good)","version":1,"reference":"op://vault/item/field"}"#
+    check(try ProtectedFileSidecar(data: Data(opEnvelope.utf8)).reference
+            == (try SecretRef("op://vault/item/field")),
+          "a 1Password reference in the envelope is accepted (source-neutral)")
+    // Bare-reference forms: a lone secret URL, tolerant of whitespace and one
+    // layer of quotes (the shape a piped `csec get`/1Password value has).
+    for (label, text) in [
+        ("bare op:// with trailing newline", "op://Personal/foo/bar\n"),
+        ("bare csec://", "csec://project/env_home"),
+        ("single-quoted", "'op://vault/item'"),
+        ("surrounded by whitespace", "   op://vault/item\t\n"),
+    ] {
+        check((try? ProtectedFileSidecar(data: Data(text.utf8)))?.reference.uri != nil,
+              "a bare reference is accepted: \(label)")
+    }
+    check(try ProtectedFileSidecar(data: Data("\"op://Employee/My Item/password\"\n".utf8))
+            .reference == (try SecretRef("op://Employee/My Item/password")),
+          "surrounding quotes and whitespace are stripped without altering the reference path")
     let derivedDotEnvrc = try ProtectedFileSidecar.targetName(forSidecarNamed: ".envrc.csec")
     let derivedConfig = try ProtectedFileSidecar.targetName(forSidecarNamed: "config.json.csec")
     check(derivedDotEnvrc == ".envrc" && derivedConfig == "config.json",
@@ -718,20 +739,19 @@ do {
             _ = try ProtectedFileSidecar.targetName(forSidecarNamed: bad)
         }
     }
-    func rejects(_ label: String, _ json: String) {
-        checkThrows(label) { _ = try ProtectedFileSidecar(data: Data(json.utf8)) }
+    func rejects(_ label: String, _ content: String) {
+        checkThrows(label) { _ = try ProtectedFileSidecar(data: Data(content.utf8)) }
     }
-    let good = "convenient-security/protected-file"
-    rejects("an unknown key is rejected",
+    // A JSON object is only ever read as the strict envelope; it never falls back
+    // to the bare form, so a malformed envelope is still rejected.
+    rejects("an unknown envelope key is rejected",
             #"{"csec":"\#(good)","version":1,"reference":"csec://project/env_home","x":1}"#)
-    rejects("a wrong magic is rejected",
+    rejects("a wrong envelope magic is rejected",
             #"{"csec":"evil","version":1,"reference":"csec://project/env_home"}"#)
-    rejects("an unsupported version is rejected",
+    rejects("an unsupported envelope version is rejected",
             #"{"csec":"\#(good)","version":2,"reference":"csec://project/env_home"}"#)
-    rejects("a legacy csecfile:// reference is rejected",
-            #"{"csec":"\#(good)","version":1,"reference":"csecfile://project/env_home"}"#)
-    rejects("a 1Password reference is rejected",
-            #"{"csec":"\#(good)","version":1,"reference":"op://vault/item/field"}"#)
+    rejects("content that is neither JSON nor a reference is rejected", "not a reference at all\n")
+    rejects("an empty file is rejected", "")
     checkThrows("an opaque ciphertext file is not a sidecar") {
         _ = try ProtectedFileSidecar(data: Data("CSECBLB1".utf8) + Data((0..<64).map { UInt8($0) }))
     }
@@ -751,8 +771,8 @@ do {
     defer { try? fm.removeItem(atPath: projectDirectory) }
 
     let store = try NativeStoreName("project")
-    func writeSidecar(_ base: String, _ relativePath: String, key: String) throws -> NativeSecretReference {
-        let ref = try NativeSecretReference(store: store, key: key)
+    func writeSidecar(_ base: String, _ relativePath: String, key: String) throws -> SecretRef {
+        let ref = try SecretRef("csec://\(store.value)/\(key)")
         let full = (base as NSString).appendingPathComponent(relativePath)
         try fm.createDirectory(
             atPath: (full as NSString).deletingLastPathComponent,
@@ -761,29 +781,41 @@ do {
         try ProtectedFileSidecar(reference: ref).encoded().write(to: URL(fileURLWithPath: full))
         return ref
     }
+    func writeRaw(_ relativePath: String, _ content: String) throws {
+        let full = (projectDirectory as NSString).appendingPathComponent(relativePath)
+        try fm.createDirectory(
+            atPath: (full as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try Data(content.utf8).write(to: URL(fileURLWithPath: full))
+    }
 
     let envRef = try writeSidecar(projectDirectory, ".envrc.csec", key: "env_home")
     let configRef = try writeSidecar(projectDirectory, "config/prod.json.csec", key: "config_prod")
+    // A bare-reference sidecar (source-neutral, hand-written) is discovered too.
+    try writeRaw("api.key.csec", "op://Personal/api/key\n")
     // A sidecar under an excluded build directory is never reached.
     _ = try writeSidecar(projectDirectory, "node_modules/pkg/.env.csec", key: "vendored")
     // A plain file and a name that is only the suffix are not sidecars.
-    try Data("noise".utf8).write(
-        to: URL(fileURLWithPath: (projectDirectory as NSString).appendingPathComponent("README.md")))
-    // A symlink ending in .csec is not followed.
+    try writeRaw("README.md", "noise")
+    // A *.csec file that cannot be parsed is reported as an issue, not skipped.
+    try writeRaw("broken.env.csec", "this is not a reference")
+    // A symlink ending in .csec is not followed — and is reported as an issue.
     try fm.createSymbolicLink(
         atPath: (projectDirectory as NSString).appendingPathComponent("link.csec"),
         withDestinationPath: "/etc/passwd"
     )
 
-    let discovered = try ProtectedSidecarScanner.scan(projectDirectory: projectDirectory)
-    check(discovered.map(\.targetRelativePath) == [".envrc", "config/prod.json"],
-          "the scan finds every in-tree *.csec, sorted, skipping excluded/symlink/non-sidecar entries")
-    check(discovered.first?.sidecarRelativePath == ".envrc.csec"
-            && discovered.first?.reference == envRef,
+    let scan = try ProtectedSidecarScanner.scan(projectDirectory: projectDirectory)
+    check(scan.discoveries.map(\.targetRelativePath) == [".envrc", "api.key", "config/prod.json"],
+          "the scan finds every in-tree *.csec (JSON and bare), sorted, skipping excluded/non-sidecar")
+    check(scan.discoveries.first(where: { $0.sidecarRelativePath == ".envrc.csec" })?.reference == envRef
+            && scan.discoveries.first(where: { $0.targetRelativePath == "config/prod.json" })?
+                .reference == configRef,
           "a discovery pairs its target with the sidecar path and reference")
-    check(discovered.last?.targetRelativePath == "config/prod.json"
-            && discovered.last?.reference == configRef,
-          "a nested sidecar resolves a nested target path")
+    check(scan.discoveries.first(where: { $0.targetRelativePath == "api.key" })?.reference
+            == (try SecretRef("op://Personal/api/key")),
+          "a bare-reference sidecar resolves its source-neutral reference")
+    check(scan.issues.map(\.sidecarRelativePath) == ["broken.env.csec", "link.csec"],
+          "an unparseable *.csec and a *.csec symlink are reported as issues, not silently skipped")
 
     // Overflow past the per-launch maximum is a hard error, not truncation.
     let overflowDirectory = NSTemporaryDirectory()

@@ -782,9 +782,15 @@ func runExec(_ arguments: [String]) -> Never {
     // into the same launch as value-in-environment bindings, so one approval
     // delivers both files and values.
     do {
-        let discoveries = try ProtectedSidecarScanner.scan(
+        let scan = try ProtectedSidecarScanner.scan(
             projectDirectory: FileManager.default.currentDirectoryPath)
-        if !discoveries.isEmpty {
+        // A file that looks like a sidecar but cannot be parsed is warned about, not
+        // silently skipped — otherwise a broken `*.csec` looks identical to the
+        // secret simply not being there.
+        for issue in scan.issues {
+            warnProtectedSidecarIssue(path: issue.sidecarRelativePath, reason: issue.reason)
+        }
+        if !scan.discoveries.isEmpty {
             let assignments: [(name: String, reference: String)]
             do {
                 let knownSchemes = Set(try makeAgentClient().schemes())
@@ -804,7 +810,7 @@ func runExec(_ arguments: [String]) -> Never {
             }
             runSidecarExec(
                 commandLine: commandLine,
-                discoveries: discoveries,
+                discoveries: scan.discoveries,
                 environmentAssignments: assignments,
                 reason: reason,
                 ttlSeconds: ttlSeconds,
