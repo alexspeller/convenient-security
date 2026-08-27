@@ -32,6 +32,13 @@ func auditAnimationEnabled() -> Bool {
     isatty(fileno(stderr)) == 1
 }
 
+/// True when the launcher can drive an interactive picker: it reads keys from
+/// stdin and draws the UI on stderr, so both must be terminals. Independent of
+/// stdout, so `csec audit` can pipe its report/attestation while still prompting.
+func auditInteractionEnabled() -> Bool {
+    isatty(fileno(stdin)) == 1 && isatty(fileno(stderr)) == 1
+}
+
 /// A single, redraw-in-place progress line for the streaming audit.
 struct AuditProgressView {
     private let start: Date

@@ -147,6 +147,20 @@ public struct HostFinding: Codable, Sendable, Equatable {
     }
 }
 
+/// One finding the user has triaged (accepted as an exemption, or deferred as a
+/// TODO). Value-free: `note` is the user's own local reason text, never a
+/// credential; timestamps are opaque hints stamped by the agent.
+public struct HostTriageInfo: Codable, Sendable, Equatable {
+    public let id: String
+    public let note: String?
+    public let recordedAtHint: String?
+    public init(id: String, note: String? = nil, recordedAtHint: String? = nil) {
+        self.id = id
+        self.note = note
+        self.recordedAtHint = recordedAtHint
+    }
+}
+
 /// The severity-ordered collection the CLI/agent renders, plus honest-coverage
 /// bookkeeping so the report never over-claims.
 public struct HostAuditReport: Codable, Sendable, Equatable {
@@ -162,19 +176,76 @@ public struct HostAuditReport: Codable, Sendable, Equatable {
     public let verdict: String
     /// Stamped by the caller (CLI/agent), not the model.
     public let generatedAtHint: String?
+    /// Value-free display metadata: the reversible fixes the launcher renders as a
+    /// checkbox picker. Populated only on the interactive/streaming path.
+    public let remediationItems: [HostRemediationItem]
+    /// Findings the user has accepted as documented risks (value-free notes).
+    public let exemptions: [HostTriageInfo]
+    /// Findings the user has deferred as TODOs (weekly notification reminders).
+    public let todos: [HostTriageInfo]
 
     public init(
         findings: [HostFinding],
         unverifiable: [UnverifiableNote] = [],
         coverageNotes: [String] = [],
         verdict: String,
-        generatedAtHint: String? = nil
+        generatedAtHint: String? = nil,
+        remediationItems: [HostRemediationItem] = [],
+        exemptions: [HostTriageInfo] = [],
+        todos: [HostTriageInfo] = []
     ) {
         self.findings = findings
         self.unverifiable = unverifiable
         self.coverageNotes = coverageNotes
         self.verdict = verdict
         self.generatedAtHint = generatedAtHint
+        self.remediationItems = remediationItems
+        self.exemptions = exemptions
+        self.todos = todos
+    }
+
+    /// Return a copy with the launcher-facing triage/remediation metadata attached
+    /// (the base engine produces only findings; the service annotates afterwards).
+    public func annotated(
+        remediationItems: [HostRemediationItem],
+        exemptions: [HostTriageInfo],
+        todos: [HostTriageInfo]
+    ) -> HostAuditReport {
+        HostAuditReport(
+            findings: findings, unverifiable: unverifiable, coverageNotes: coverageNotes,
+            verdict: verdict, generatedAtHint: generatedAtHint,
+            remediationItems: remediationItems, exemptions: exemptions, todos: todos)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case findings, unverifiable, coverageNotes, verdict, generatedAtHint
+        case remediationItems, exemptions, todos
+    }
+
+    // Custom Codable so a payload without the newer triage/remediation fields (an
+    // older sender, or an external `--json` fixture) still decodes cleanly.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        findings = try c.decode([HostFinding].self, forKey: .findings)
+        unverifiable = try c.decodeIfPresent([UnverifiableNote].self, forKey: .unverifiable) ?? []
+        coverageNotes = try c.decodeIfPresent([String].self, forKey: .coverageNotes) ?? []
+        verdict = try c.decode(String.self, forKey: .verdict)
+        generatedAtHint = try c.decodeIfPresent(String.self, forKey: .generatedAtHint)
+        remediationItems = try c.decodeIfPresent([HostRemediationItem].self, forKey: .remediationItems) ?? []
+        exemptions = try c.decodeIfPresent([HostTriageInfo].self, forKey: .exemptions) ?? []
+        todos = try c.decodeIfPresent([HostTriageInfo].self, forKey: .todos) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(findings, forKey: .findings)
+        try c.encode(unverifiable, forKey: .unverifiable)
+        try c.encode(coverageNotes, forKey: .coverageNotes)
+        try c.encode(verdict, forKey: .verdict)
+        try c.encodeIfPresent(generatedAtHint, forKey: .generatedAtHint)
+        try c.encode(remediationItems, forKey: .remediationItems)
+        try c.encode(exemptions, forKey: .exemptions)
+        try c.encode(todos, forKey: .todos)
     }
 
     public struct UnverifiableNote: Codable, Sendable, Equatable {

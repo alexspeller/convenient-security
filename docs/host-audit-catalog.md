@@ -268,11 +268,15 @@ Per the ethos, the audit does not merely report — it **proposes the secure
 default and applies it for you after one confirmation**. Findings sort into three
 remediation classes:
 
-**1. Auto-fix (one review, one Touch ID).** Safe, reversible, low-blast changes.
-csec presents them as a single batched **checklist the user can deselect items
-from** (each change shown explicitly, dry-run first); one Touch ID then applies
-everything still selected, atomically per target, and never bundles privileged
-mutations into one implicit transaction. Eligible:
+**1. Auto-fix (terminal picker, one bare Touch ID).** Safe, reversible, low-blast
+changes. csec presents them as an **in-terminal checkbox picker the user can
+deselect items from** (each change shown explicitly); the still-selected set goes
+to csecd, which re-checks the host and applies it under a single **bare system
+Touch ID** (physical-presence gate), atomically per target, never bundling
+privileged mutations into one implicit transaction. Selection lives in the terminal
+rather than a trusted window because every fix is reversible and security-positive
+— a tampered selection can only apply *more* hardening, never leak a credential.
+Eligible:
 
 | ID | Change | Why safe |
 |----|--------|----------|
@@ -305,6 +309,18 @@ judgment call where auto-applying would risk breaking a legitimate setup:
   judgment; csec flags with evidence.
 - Installing LuLu / Little Snitch (HA-C03) — third-party; their own onboarding is
   good, so csec links rather than drives.
+
+**4. Triage the remainder + attest.** Everything still failing after the picker —
+non-auto-fixable, declined, or a fix that didn't take — is walked one finding at a
+time: keep it as a **TODO** (a weekly notification reminder, rate-limited per
+finding, until it's fixed) or accept it as an **exemption** (a value-free note;
+suppressed from re-nagging). Both persist in the accepted baseline and clear
+automatically once the control passes. The flow then re-scans (when anything was
+applied) and prints a copy-paste **attestation** — machine identity
+(model · macOS · hostname, no serial), verified controls, accepted risks, planned
+remediation — suitable for showing the laptop is properly configured; it honestly
+lists anything still needing attention. `csec audit --attest` regenerates just that
+block on demand.
 
 ## Detection-feasibility summary
 
@@ -381,11 +397,14 @@ accepts the new state; unreviewed drift keeps surfacing.
    no runtime fetch — all-local, nothing rots.
 4. **Guided helpers:** FileVault (HA-G03) and Santa MONITOR-mode (HA-B08) get
    guided helpers; LuLu / Little Snitch stay doc-links.
-5. **Auto-fix confirmation:** one review + one Touch ID — the batched auto-fix set
-   is a checklist the user can deselect from, then a single tap applies the rest.
+5. **Auto-fix confirmation:** an in-terminal checkbox picker the user can deselect
+   from, then a single **bare Touch ID** in csecd applies the still-selected set —
+   selection is terminal-native because every fix is reversible and
+   security-positive.
 6. **Periodic re-audit:** runs on a schedule against a stored accepted baseline;
-   on a regression it **notifies only** (no background mutation), and the user
-   re-runs `csec audit` to remediate.
+   on a regression it **notifies only** (no background mutation), and it also posts
+   a **weekly** reminder for any still-open triage TODO. Exempted findings never
+   re-alert; the user re-runs `csec audit` to remediate.
 7. **Offline version currency:** report `unknown` with the last successful check
    time; never render an unreachable catalog as a pass.
 8. **csec's own FDA grant:** shown in HA-D01 as `expected-self`, never a finding.

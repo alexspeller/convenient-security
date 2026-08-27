@@ -257,6 +257,20 @@ public struct AgentClient {
         return summary
     }
 
+    /// Persist a batch of value-free triage decisions into csecd's accepted
+    /// baseline: exemptions (accept-risk, with notes), todos (deferred fixes with
+    /// weekly reminders), and cleared (remove from triage). csecd owns the store; a
+    /// plain non-failure response confirms the merge.
+    public func hostRecordTriage(
+        exemptions: [HostTriageDecision] = [],
+        todos: [String] = [],
+        cleared: [String] = []
+    ) throws {
+        let request = HostTriageRequest(exemptions: exemptions, todos: todos, cleared: cleared)
+        let response = try send(.hostRecordTriage(request))
+        try Self.check(response: response, requestID: request.requestID)
+    }
+
     /// Ask csecd to review/resolve a protected-file launch and send the rendered
     /// bytes directly to csec-rootd. A successful response contains only a
     /// boolean; file plaintext is never decoded by this client process.

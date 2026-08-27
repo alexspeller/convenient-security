@@ -36,9 +36,16 @@ enum PeriodicHostAudit {
         source.schedule(deadline: .now() + .seconds(min(interval, 300)), repeating: .seconds(interval))
         source.setEventHandler {
             Task {
-                let regressions = await HostAuditService.regressions()
-                guard !regressions.isEmpty else { return }
-                await report(regressions)
+                let now = Date()
+                let findings = await HostAuditService.periodicScan(now: now)
+                if !findings.regressions.isEmpty {
+                    await report(findings.regressions)
+                }
+                if !findings.dueTodoReminders.isEmpty {
+                    await remindTodos(
+                        findings.dueTodoReminders,
+                        atHint: ISO8601DateFormatter().string(from: now))
+                }
             }
         }
         source.resume()
@@ -62,5 +69,31 @@ enum PeriodicHostAudit {
                     identifier: "csec-regression-\(finding.id)", content: content, trigger: nil))
             }
         }
+    }
+
+    /// Weekly reminder for still-open TODOs the user deferred. One rolling
+    /// notification (rate-limited per finding via `stampTodoReminders`), so the
+    /// user is nudged without being nagged daily.
+    private static func remindTodos(_ ids: [String], atHint: String) async {
+        // Value-free ids only; cap the inline list so the body stays short.
+        let shown = ids.prefix(4).joined(separator: ", ")
+        let suffix = ids.count > 4 ? ", …" : ""
+        guard notificationsAvailable else {
+            FileHandle.standardError.write(Data(
+                "csecd: \(ids.count) security TODO(s) still open: \(shown)\(suffix) — run `csec audit`\n".utf8))
+            HostAuditService.stampTodoReminders(ids, atHint: atHint)
+            return
+        }
+        await MainActor.run {
+            let center = UNUserNotificationCenter.current()
+            let content = UNMutableNotificationContent()
+            content.title = "Security TODOs still open"
+            content.body = ids.count == 1
+                ? "\(shown) is still deferred — run `csec audit` to fix or re-triage."
+                : "\(ids.count) deferred fixes (\(shown)\(suffix)) — run `csec audit` to fix or re-triage."
+            center.add(UNNotificationRequest(
+                identifier: "csec-todo-reminder", content: content, trigger: nil))
+        }
+        HostAuditService.stampTodoReminders(ids, atHint: atHint)
     }
 }

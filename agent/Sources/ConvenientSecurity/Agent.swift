@@ -1634,6 +1634,25 @@ public actor Agent {
         return Response(requestID: request.requestID, hostRemediation: summary)
     }
 
+    /// Persist the user's value-free triage decisions (exemptions/TODOs/cleared)
+    /// into the accepted baseline. Verified-launcher gated like remediation; the
+    /// store is csecd-owned so there is a single writer. Returns a plain success.
+    public func recordHostTriage(
+        request: HostTriageRequest,
+        caller: CallerInfo
+    ) async -> Response {
+        guard isVerifiedLauncher(caller) else {
+            return .failed(
+                .consentDenied,
+                message: "host triage requires the verified csec launcher",
+                requestID: request.requestID
+            )
+        }
+        HostAuditService.recordTriage(
+            request, recordedAtHint: ISO8601DateFormatter().string(from: Date()))
+        return Response(requestID: request.requestID)
+    }
+
     /// Register the authenticated launcher's current process incarnation. A
     /// descendant can later name the opaque ID, but access succeeds only when
     /// a fresh kernel ancestry walk reaches this exact PID/start-time pair.

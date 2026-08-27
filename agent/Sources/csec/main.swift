@@ -95,7 +95,7 @@ func usage() -> Never {
                  [--store <store>
                   --import DEST=env:NAME|DEST=dotenv:PATH:NAME]…
                  [--replace-secret] [--no-audit-prompt]
-      csec audit [--report-only] [--json] [--scan-filesystem]
+      csec audit [--report-only] [--json] [--attest] [--scan-filesystem]
       csec install | uninstall | status
       csec root-status
 
@@ -143,10 +143,14 @@ func usage() -> Never {
     audit      Run the value-free host posture audit through csecd and render the
                findings (severity-ordered, ★ marks controls that shrink same-user
                malware blast radius). On a terminal the scan animates live progress;
-               piped or --json output stays plain. By default csecd then offers the
-               reversible fixes as one Touch ID review; --report-only just prints,
-               --json emits the machine-readable report, and --scan-filesystem adds
-               the bounded SUID/world-writable sweep.
+               piped or --json output stays plain. By default it then offers the
+               reversible fixes as an in-terminal checkbox picker (one bare Touch ID
+               in csecd applies the selected set), triages whatever is still failing
+               (accept as an exemption, or keep as a TODO with weekly reminders), and
+               prints a copy-paste attestation of the final posture. --report-only
+               just prints the report, --attest prints only the pasteable
+               attestation, --json emits the machine-readable report, and
+               --scan-filesystem adds the bounded SUID/world-writable sweep.
     install    Register csecd as a login-item LaunchAgent so it runs in the background.
     uninstall  Unregister the csecd LaunchAgent.
     status     Show whether the csecd LaunchAgent is registered/enabled.

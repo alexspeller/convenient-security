@@ -38,6 +38,7 @@ public actor HostAuditProgressBoard {
         await HostAuditService.runInteractive(
             scanFilesystem: scanFilesystem,
             generatedAtHint: ISO8601DateFormatter().string(from: Date()),
+            includeRemediation: true,
             onProgress: onProgress
         )
     }

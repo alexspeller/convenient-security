@@ -99,6 +99,61 @@ public struct HostRemediationSummary: Codable, Sendable, Equatable {
     }
 }
 
+/// One triage decision the launcher records for a finding: accept it as a
+/// documented risk (an exemption, with an optional value-free note). The
+/// `todos`/`cleared` lists on the request carry bare ids.
+public struct HostTriageDecision: Codable, Sendable, Equatable {
+    public let id: String
+    public let note: String?
+    public init(id: String, note: String? = nil) {
+        self.id = id
+        self.note = note
+    }
+}
+
+/// Persist a batch of triage decisions into the accepted baseline: `exemptions`
+/// (accept-risk, with notes), `todos` (deferred fixes, weekly reminders), and
+/// `cleared` (remove from triage). Value-free — notes are the user's own text.
+public struct HostTriageRequest: Sendable, Equatable {
+    public let requestID: String
+    public let exemptions: [HostTriageDecision]
+    public let todos: [String]
+    public let cleared: [String]
+    public init(
+        exemptions: [HostTriageDecision] = [],
+        todos: [String] = [],
+        cleared: [String] = [],
+        requestID: UUID = UUID()
+    ) {
+        self.requestID = requestID.uuidString.lowercased()
+        self.exemptions = exemptions
+        self.todos = todos
+        self.cleared = cleared
+    }
+    public init(
+        exemptions: [HostTriageDecision],
+        todos: [String],
+        cleared: [String],
+        requestUUID: UUID
+    ) {
+        self.requestID = requestUUID.uuidString.lowercased()
+        self.exemptions = exemptions
+        self.todos = todos
+        self.cleared = cleared
+    }
+}
+
+/// Value-free result of a periodic background scan: `pass → fail` regressions and
+/// the TODO ids whose weekly reminder is now due.
+public struct PeriodicHostFindings: Sendable {
+    public let regressions: [HostFinding]
+    public let dueTodoReminders: [String]
+    public init(regressions: [HostFinding], dueTodoReminders: [String]) {
+        self.regressions = regressions
+        self.dueTodoReminders = dueTodoReminders
+    }
+}
+
 /// Builds the production audit context (real command runner, root-helper
 /// privileged ops as the agent role, FDA-gated TCC reader) and runs the engine.
 /// Shared by the on-demand handler and the periodic re-audit so there is exactly
@@ -120,36 +175,79 @@ public enum HostAuditService {
     public static func runReport(
         scanFilesystem: Bool,
         generatedAtHint: String? = nil,
+        includeRemediation: Bool = false,
         onProgress: (@Sendable (Int, Int, String, String) async -> Void)? = nil
     ) async -> HostAuditReport {
         let ctx = productionContext(scanFilesystem: scanFilesystem)
-        return await HostAuditEngine().run(ctx, generatedAtHint: generatedAtHint, onProgress: onProgress)
+        let report = await HostAuditEngine().run(
+            ctx, generatedAtHint: generatedAtHint, onProgress: onProgress)
+        return await annotate(report, ctx: ctx, includeRemediation: includeRemediation)
     }
 
     /// The interactive path (user-initiated `csec audit`). Produces the report and
     /// records the current state as the accepted baseline — the user has now seen
     /// it, so a later background run only flags a *change* from this point. An
     /// optional `onProgress` callback streams value-free per-check progress so the
-    /// launcher can animate the scan.
+    /// launcher can animate the scan. The report is annotated *after* the baseline
+    /// advance so it reflects any triage cleared by a now-passing finding.
     public static func runInteractive(
         scanFilesystem: Bool,
         generatedAtHint: String? = nil,
+        includeRemediation: Bool = false,
         onProgress: (@Sendable (Int, Int, String, String) async -> Void)? = nil
     ) async -> HostAuditReport {
-        let report = await runReport(
-            scanFilesystem: scanFilesystem, generatedAtHint: generatedAtHint, onProgress: onProgress)
-        recordBaseline(report, acceptedAtHint: generatedAtHint)
-        return report
+        let ctx = productionContext(scanFilesystem: scanFilesystem)
+        let base = await HostAuditEngine().run(
+            ctx, generatedAtHint: generatedAtHint, onProgress: onProgress)
+        recordBaseline(base, acceptedAtHint: generatedAtHint)
+        return await annotate(base, ctx: ctx, includeRemediation: includeRemediation)
+    }
+
+    /// Attach the launcher-facing, value-free triage/remediation metadata: the
+    /// accepted exemptions and TODOs from the baseline, and (when requested) the
+    /// reversible fixes the launcher renders as a checkbox picker. Building the
+    /// remediation items reuses the run's memoized ctx, so it is near-free.
+    static func annotate(
+        _ report: HostAuditReport, ctx: HostAuditContext, includeRemediation: Bool
+    ) async -> HostAuditReport {
+        let baseline = ctx.baseline.load()
+        let exemptions = triageInfos(baseline.exemptions)
+        let todos = triageInfos(baseline.todos)
+        var items: [HostRemediationItem] = []
+        if includeRemediation {
+            items = await HostRemediationBuilder.plans(for: report, ctx: ctx).map(\.item)
+        }
+        return report.annotated(remediationItems: items, exemptions: exemptions, todos: todos)
+    }
+
+    private static func triageInfos(_ records: [String: TriageRecord]) -> [HostTriageInfo] {
+        records
+            .map { HostTriageInfo(id: $0.key, note: $0.value.note, recordedAtHint: $0.value.recordedAtHint) }
+            .sorted { $0.id < $1.id }
     }
 
     /// Persist the current statuses as the accepted baseline (Decision 6). Only the
     /// interactive path calls this; the background timer never advances the baseline.
     public static func recordBaseline(_ report: HostAuditReport, acceptedAtHint: String? = nil) {
         let store = FileBaselineStore()
-        var baseline = store.load()
+        store.save(applyingBaseline(report, to: store.load(), acceptedAtHint: acceptedAtHint))
+    }
+
+    /// Pure baseline advance — testable without touching the on-disk store.
+    public static func applyingBaseline(
+        _ report: HostAuditReport, to baseline: HostAuditBaseline, acceptedAtHint: String? = nil
+    ) -> HostAuditBaseline {
+        var baseline = baseline
         for finding in report.findings {
             baseline.entries[finding.id] = BaselineEntry(
                 status: finding.status.rawValue, acceptedAtHint: acceptedAtHint)
+        }
+        // A triaged finding that now holds a secure/expected/n-a status is resolved;
+        // drop its exemption/TODO so it stops surfacing (and stops reminding).
+        for finding in report.findings
+        where finding.status == .pass || finding.status == .expectedSelf || finding.status == .notApplicable {
+            baseline.exemptions.removeValue(forKey: finding.id)
+            baseline.todos.removeValue(forKey: finding.id)
         }
         // Decision 7: remember the last time the online update catalog was actually
         // reachable (HA-B06 determinable). Offline runs then report `unknown` with
@@ -159,18 +257,105 @@ public enum HostAuditService {
            pending.status != .unknown {
             baseline.lastVersionCheckHint = hint
         }
-        store.save(baseline)
+        return baseline
+    }
+
+    /// Merge a batch of user triage decisions into the accepted baseline. An
+    /// exemption supersedes a TODO for the same id and vice versa; `cleared` removes
+    /// both. Re-recording a TODO preserves its reminder cadence.
+    public static func recordTriage(_ request: HostTriageRequest, recordedAtHint: String? = nil) {
+        let store = FileBaselineStore()
+        store.save(applyingTriage(request, to: store.load(), recordedAtHint: recordedAtHint))
+    }
+
+    /// Pure triage merge — testable without touching the on-disk store.
+    public static func applyingTriage(
+        _ request: HostTriageRequest, to baseline: HostAuditBaseline, recordedAtHint: String? = nil
+    ) -> HostAuditBaseline {
+        var baseline = baseline
+        for decision in request.exemptions {
+            baseline.exemptions[decision.id] = TriageRecord(
+                note: decision.note, recordedAtHint: recordedAtHint)
+            baseline.todos.removeValue(forKey: decision.id)
+        }
+        for id in request.todos {
+            let existing = baseline.todos[id]
+            baseline.todos[id] = TriageRecord(
+                note: nil,
+                recordedAtHint: existing?.recordedAtHint ?? recordedAtHint,
+                lastRemindedAtHint: existing?.lastRemindedAtHint)
+            baseline.exemptions.removeValue(forKey: id)
+        }
+        for id in request.cleared {
+            baseline.exemptions.removeValue(forKey: id)
+            baseline.todos.removeValue(forKey: id)
+        }
+        return baseline
     }
 
     /// Run a value-free re-audit and return the findings that **regressed**: a
-    /// control that was `pass` in the accepted baseline and is now `fail`. This is
-    /// the high-signal event (it can mean malware disabling a defense). Notify-only.
+    /// control that was `pass` in the accepted baseline and is now `fail` (skipping
+    /// anything the user has exempted). The high-signal event — it can mean malware
+    /// disabling a defense. Notify-only.
     public static func regressions() async -> [HostFinding] {
         let baseline = FileBaselineStore().load()
         let report = await runReport(scanFilesystem: false)
-        return report.findings.filter { finding in
+        return baselineRegressions(report: report, baseline: baseline)
+    }
+
+    /// One background tick's worth of work derived from a single re-audit:
+    /// regressions plus the TODOs whose weekly reminder is now due.
+    public static func periodicScan(now: Date) async -> PeriodicHostFindings {
+        let baseline = FileBaselineStore().load()
+        let report = await runReport(scanFilesystem: false)
+        return PeriodicHostFindings(
+            regressions: baselineRegressions(report: report, baseline: baseline),
+            dueTodoReminders: dueTodoReminders(report: report, baseline: baseline, now: now))
+    }
+
+    /// Pure regression diff — testable without a live audit.
+    public static func baselineRegressions(
+        report: HostAuditReport, baseline: HostAuditBaseline
+    ) -> [HostFinding] {
+        report.findings.filter { finding in
             baseline.entries[finding.id]?.status == FindingStatus.pass.rawValue
                 && finding.status == .fail
+                && baseline.exemptions[finding.id] == nil
         }
+    }
+
+    /// TODO ids due for a weekly reminder: the finding still fails and the last
+    /// reminder is absent or older than `interval`. Pure over its inputs.
+    public static func dueTodoReminders(
+        report: HostAuditReport,
+        baseline: HostAuditBaseline,
+        now: Date,
+        interval: TimeInterval = 7 * 24 * 60 * 60
+    ) -> [String] {
+        let failing = Set(report.findings.filter { $0.status == .fail }.map(\.id))
+        return baseline.todos.compactMap { id, record -> String? in
+            guard failing.contains(id) else { return nil }
+            guard let hint = record.lastRemindedAtHint,
+                  let last = ISO8601DateFormatter().date(from: hint) else { return id }
+            return now.timeIntervalSince(last) >= interval ? id : nil
+        }.sorted()
+    }
+
+    /// Record that a weekly TODO reminder was just posted for these ids.
+    public static func stampTodoReminders(_ ids: [String], atHint: String) {
+        guard !ids.isEmpty else { return }
+        let store = FileBaselineStore()
+        store.save(stamping(ids, in: store.load(), atHint: atHint))
+    }
+
+    /// Pure reminder-stamp — testable without touching the on-disk store.
+    public static func stamping(
+        _ ids: [String], in baseline: HostAuditBaseline, atHint: String
+    ) -> HostAuditBaseline {
+        var baseline = baseline
+        for id in ids where baseline.todos[id] != nil {
+            baseline.todos[id]?.lastRemindedAtHint = atHint
+        }
+        return baseline
     }
 }

@@ -234,7 +234,8 @@ func startAgentServer() async {
       // interactive path, so it also records the accepted baseline.
       let report = await HostAuditService.runInteractive(
         scanFilesystem: request.scanFilesystem,
-        generatedAtHint: ISO8601DateFormatter().string(from: Date())
+        generatedAtHint: ISO8601DateFormatter().string(from: Date()),
+        includeRemediation: true
       )
       return Response(requestID: request.requestID, hostAuditReport: report)
     case .hostAuditStart(let request):
@@ -245,6 +246,8 @@ func startAgentServer() async {
       return await hostAuditBoard.poll(request)
     case .hostRemediate(let request):
       return await agent.runHostRemediation(request: request, caller: caller)
+    case .hostRecordTriage(let request):
+      return await agent.recordHostTriage(request: request, caller: caller)
     }
   }
 

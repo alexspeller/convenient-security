@@ -324,6 +324,12 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         )
     case let .hostRemediate(request):
         return await agent.runHostRemediation(request: request, caller: caller)
+    case let .hostRecordTriage(request):
+        return .failed(
+            .deliveryNotSupported,
+            message: "the e2e harness does not persist host triage",
+            requestID: request.requestID
+        )
     case let .approveProtectedLaunch(approval):
         guard approval.validate(caller: caller) else {
             return .failed(

@@ -391,6 +391,7 @@ public enum Request: Sendable {
     case hostAuditStart(HostAuditRequest)
     case hostAuditPoll(HostAuditPollRequest)
     case hostRemediate(HostRemediationRequest)
+    case hostRecordTriage(HostTriageRequest)
 }
 
 extension Request: Codable {
@@ -402,6 +403,7 @@ extension Request: Codable {
         case operation, reference, level
         case protectedLaunchApproval
         case scanFilesystem, selectedKeys, jobID
+        case exemptions, todos, cleared
     }
 
     public init(from decoder: Decoder) throws {
@@ -529,6 +531,13 @@ extension Request: Codable {
                 scanFilesystem: try container.decodeIfPresent(Bool.self, forKey: .scanFilesystem) ?? false,
                 requestUUID: try Self.decodeUUID(container, forKey: .requestID)
             ))
+        case "host_record_triage":
+            self = .hostRecordTriage(HostTriageRequest(
+                exemptions: try container.decodeIfPresent([HostTriageDecision].self, forKey: .exemptions) ?? [],
+                todos: try container.decodeIfPresent([String].self, forKey: .todos) ?? [],
+                cleared: try container.decodeIfPresent([String].self, forKey: .cleared) ?? [],
+                requestUUID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: container, debugDescription: "unknown request type"
@@ -635,6 +644,13 @@ extension Request: Codable {
             try container.encode(request.requestID, forKey: .requestID)
             try container.encode(request.selectedKeys, forKey: .selectedKeys)
             try container.encode(request.scanFilesystem, forKey: .scanFilesystem)
+        case let .hostRecordTriage(request):
+            try container.encode("host_record_triage", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.exemptions, forKey: .exemptions)
+            try container.encode(request.todos, forKey: .todos)
+            try container.encode(request.cleared, forKey: .cleared)
         }
     }
 

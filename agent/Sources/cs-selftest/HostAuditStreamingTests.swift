@@ -59,7 +59,10 @@ private func progressBoardTests() async {
             finalReport = report
             break
         }
-        await Task.yield()
+        // Yield real time (not a bare Task.yield) so the detached audit task makes
+        // progress even when the machine is under load — otherwise this busy poll
+        // loop can exhaust its budget before the background job finishes.
+        try? await Task.sleep(nanoseconds: 1_000_000)
     }
     check(monotonic, "board: the completed count is monotonic across polls")
     check(valueFree, "board: progress snapshots carry no control characters")

@@ -480,13 +480,63 @@ public struct BaselineEntry: Codable, Sendable, Equatable {
     }
 }
 
+/// One triaged finding: an accepted risk (exemption) or a deferred fix (TODO).
+/// Value-free — `note` is the user's own local reason text, never a credential.
+public struct TriageRecord: Codable, Sendable, Equatable {
+    /// User reason for an exemption (nil for a TODO).
+    public var note: String?
+    /// When the user recorded this triage decision (opaque ISO hint).
+    public var recordedAtHint: String?
+    /// When a TODO reminder was last posted (weekly rate-limit); nil = never.
+    public var lastRemindedAtHint: String?
+    public init(note: String? = nil, recordedAtHint: String? = nil, lastRemindedAtHint: String? = nil) {
+        self.note = note
+        self.recordedAtHint = recordedAtHint
+        self.lastRemindedAtHint = lastRemindedAtHint
+    }
+}
+
 public struct HostAuditBaseline: Codable, Sendable, Equatable {
     public var entries: [String: BaselineEntry]
     /// Last time the online version catalog was reachable (offline-currency).
     public var lastVersionCheckHint: String?
-    public init(entries: [String: BaselineEntry] = [:], lastVersionCheckHint: String? = nil) {
+    /// Findings the user accepted as documented risks (suppress re-nagging).
+    public var exemptions: [String: TriageRecord]
+    /// Findings the user deferred as TODOs (weekly notification reminders).
+    public var todos: [String: TriageRecord]
+
+    public init(
+        entries: [String: BaselineEntry] = [:],
+        lastVersionCheckHint: String? = nil,
+        exemptions: [String: TriageRecord] = [:],
+        todos: [String: TriageRecord] = [:]
+    ) {
         self.entries = entries
         self.lastVersionCheckHint = lastVersionCheckHint
+        self.exemptions = exemptions
+        self.todos = todos
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case entries, lastVersionCheckHint, exemptions, todos
+    }
+
+    // Custom decode so an existing baseline file predating the triage maps still
+    // loads (missing dictionaries default to empty).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        entries = try c.decodeIfPresent([String: BaselineEntry].self, forKey: .entries) ?? [:]
+        lastVersionCheckHint = try c.decodeIfPresent(String.self, forKey: .lastVersionCheckHint)
+        exemptions = try c.decodeIfPresent([String: TriageRecord].self, forKey: .exemptions) ?? [:]
+        todos = try c.decodeIfPresent([String: TriageRecord].self, forKey: .todos) ?? [:]
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(entries, forKey: .entries)
+        try c.encodeIfPresent(lastVersionCheckHint, forKey: .lastVersionCheckHint)
+        try c.encode(exemptions, forKey: .exemptions)
+        try c.encode(todos, forKey: .todos)
     }
 }
 

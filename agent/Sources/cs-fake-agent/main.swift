@@ -95,6 +95,12 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
             message: "the standalone fake agent does not run host remediation",
             requestID: request.requestID
         )
+    case let .hostRecordTriage(request):
+        return .failed(
+            .deliveryNotSupported,
+            message: "the standalone fake agent does not persist host triage",
+            requestID: request.requestID
+        )
     }
 }
 

@@ -10,33 +10,45 @@ import Darwin
 // The launcher is a thin client: it asks the resident agent (csecd) to run the
 // value-free audit and returns a `HostAuditReport`. All privileged reads (R!),
 // TCC/Full-Disk-Access enumeration, and remediation happen inside csecd. This
-// command renders the report (severity-ordered, ★ on-thesis first), then — unless
-// `--report-only` — asks csecd to present the batched remediation review (one
-// Touch ID) and prints the applied/skipped/failed summary.
+// command renders a formatted terminal report, then — when interactive and not
+// `--report-only` — drives an in-terminal checkbox picker for the reversible
+// fixes (one bare Touch ID in csecd applies the selected set), triages whatever
+// is still failing (accept as an exemption, or keep as a TODO with weekly
+// reminders), and prints a copy-paste attestation of the final posture.
 
 func runAudit(_ arguments: [String]) -> Never {
     var reportOnly = false
     var json = false
     var scanFilesystem = false
+    var attest = false
     for argument in arguments {
         switch argument {
         case "--report-only": reportOnly = true
         case "--json":
             json = true
             reportOnly = true      // JSON is a read-only data view
+        case "--attest": attest = true
         case "--scan-filesystem": scanFilesystem = true
         default:
             FileHandle.standardError.write(Data("csec audit: unknown option \(auditSafe(argument))\n".utf8))
             usage()
         }
     }
-    exit(performHostAudit(scanFilesystem: scanFilesystem, reportOnly: reportOnly, json: json))
+    exit(performHostAudit(
+        scanFilesystem: scanFilesystem, reportOnly: reportOnly, json: json, attest: attest))
 }
 
-/// Runs the audit and (optionally) remediation without exiting, so `csec setup`
-/// can finish with a host posture pass (Decision 1). Returns a process exit code.
+/// Runs the audit and (optionally) remediation/triage/attestation without exiting,
+/// so `csec setup` can finish with a host posture pass (Decision 1). Returns a
+/// process exit code.
 @discardableResult
-func performHostAudit(scanFilesystem: Bool, reportOnly: Bool, json: Bool, quietWhenUnavailable: Bool = false) -> Int32 {
+func performHostAudit(
+    scanFilesystem: Bool,
+    reportOnly: Bool,
+    json: Bool,
+    attest: Bool = false,
+    quietWhenUnavailable: Bool = false
+) -> Int32 {
     let client = makeAgentClient()
     // Animate the scan on an interactive terminal; keep machine output (piped
     // stdout or --json) on the plain, blocking request.
@@ -57,41 +69,98 @@ func performHostAudit(scanFilesystem: Bool, reportOnly: Bool, json: Bool, quietW
     }
 
     if json {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        if let data = try? encoder.encode(report), let text = String(data: data, encoding: .utf8) {
-            print(text)
-            return report.findings.contains { $0.status == .fail } ? 2 : 0
+        return emitJSON(report)
+    }
+
+    if attest {
+        // The regenerate-on-demand path: only the pasteable attestation to stdout.
+        printAttestation(report: report, exemptions: report.exemptions, todos: report.todos)
+        return exitCode(for: report)
+    }
+
+    print(AuditReportRenderer.render(
+        report, color: TerminalStyle.colorEnabled(STDOUT_FILENO),
+        width: TerminalStyle.terminalWidth(fd: STDOUT_FILENO)))
+
+    guard !reportOnly, auditInteractionEnabled() else {
+        return exitCode(for: report)
+    }
+
+    // --- Remediation: terminal checkbox picker → csecd applies under one Touch ID.
+    var fixesApplied = false
+    if !report.remediationItems.isEmpty {
+        if let selectedKeys = AuditSelectView.run(items: report.remediationItems) {
+            if selectedKeys.isEmpty {
+                print("No fixes selected.")
+            } else {
+                do {
+                    let summary = try remediateWithProgress(
+                        client: client, selectedKeys: selectedKeys,
+                        scanFilesystem: scanFilesystem, animate: animate)
+                    renderRemediation(summary)
+                    fixesApplied = !summary.applied.isEmpty
+                } catch {
+                    print("Remediation could not be completed (csecd unavailable or denied).")
+                }
+            }
         }
-        FileHandle.standardError.write(Data("csec audit: failed to encode report as JSON\n".utf8))
-        return 1
     }
 
-    renderReport(report)
+    // Guided helpers (FileVault, Santa) — interactive, launched on opt-in. Anything
+    // left failing afterwards still flows through triage below.
+    let guidedFails = Set(report.findings.filter { $0.status == .fail && $0.remediation == .guided }.map(\.id))
+    if guidedFails.contains("HA-G03") { GuidedHelper.fileVault() }
+    if guidedFails.contains("HA-B08") { GuidedHelper.santa() }
 
-    // Remediation: offer the batched, one-Touch-ID review unless report-only.
-    let hasFixables = report.batchFixable.isEmpty == false
-    let hasGuided = report.findings.contains { $0.status == .fail && $0.remediation == .guided }
-    if !reportOnly, hasFixables {
-        print("\n## Remediation")
-        print("csecd will present \(report.batchFixable.count) reversible fix(es) as one review — a single Touch ID applies the ones you keep selected.")
-        do {
-            let summary = try remediateWithProgress(
-                client: client, scanFilesystem: scanFilesystem, animate: animate)
-            renderRemediation(summary)
-        } catch {
-            print("- remediation review could not be presented (csecd unavailable or denied).")
+    // --- Re-audit after applying fixes so the triage + attestation reflect the
+    //     freshly measured state (the user chose verified freshness).
+    var finalReport = report
+    if fixesApplied {
+        if let refreshed = try? refreshReport(client: client, scanFilesystem: scanFilesystem, animate: animate) {
+            finalReport = refreshed
         }
     }
 
-    // Guided helpers (FileVault, Santa) — interactive, launched on opt-in.
-    if !reportOnly, hasGuided {
-        let fails = Set(report.findings.filter { $0.status == .fail }.map(\.id))
-        if fails.contains("HA-G03") { GuidedHelper.fileVault() }
-        if fails.contains("HA-B08") { GuidedHelper.santa() }
+    // --- Triage everything still failing that has not already been triaged.
+    let alreadyTriaged = Set(finalReport.exemptions.map(\.id)).union(finalReport.todos.map(\.id))
+    let toTriage = finalReport.findings.filter { $0.status == .fail && !alreadyTriaged.contains($0.id) }
+
+    var sessionExemptions: [HostTriageInfo] = []
+    var sessionTodos: [HostTriageInfo] = []
+    if !toTriage.isEmpty, let decisions = AuditTriageView.run(findings: toTriage), !decisions.isEmpty {
+        try? client.hostRecordTriage(exemptions: decisions.exemptions, todos: decisions.todos)
+        let nowHint = ISO8601DateFormatter().string(from: Date())
+        sessionExemptions = decisions.exemptions.map {
+            HostTriageInfo(id: $0.id, note: $0.note, recordedAtHint: nowHint)
+        }
+        sessionTodos = decisions.todos.map { HostTriageInfo(id: $0, recordedAtHint: nowHint) }
     }
 
-    return report.findings.contains { $0.status == .fail } ? 2 : 0
+    // --- Final attestation: fresh report + persisted-and-this-session triage.
+    let mergedExemptions = mergeTriage(
+        finalReport.exemptions, sessionExemptions, removing: Set(sessionTodos.map(\.id)))
+    let mergedTodos = mergeTriage(
+        finalReport.todos, sessionTodos, removing: Set(sessionExemptions.map(\.id)))
+    printAttestation(report: finalReport, exemptions: mergedExemptions, todos: mergedTodos)
+
+    return exitCode(for: finalReport)
+}
+
+// MARK: - JSON + exit codes
+
+private func emitJSON(_ report: HostAuditReport) -> Int32 {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+    if let data = try? encoder.encode(report), let text = String(data: data, encoding: .utf8) {
+        print(text)
+        return exitCode(for: report)
+    }
+    FileHandle.standardError.write(Data("csec audit: failed to encode report as JSON\n".utf8))
+    return 1
+}
+
+private func exitCode(for report: HostAuditReport) -> Int32 {
+    report.findings.contains { $0.status == .fail } ? 2 : 0
 }
 
 // MARK: - Streaming scan (animated)
@@ -131,20 +200,30 @@ private func runAnimatedAudit(client: AgentClient, scanFilesystem: Bool) throws 
     return report
 }
 
-/// Present a spinner while the (blocking) remediation review is prepared. csecd
-/// re-checks the host before showing the Touch ID window, so without this the
-/// terminal would sit silent for several seconds. The blocking call stays on the
-/// calling thread; only the spinner animates on a helper thread.
+/// Re-run the audit for the verified end state after fixes were applied, animating
+/// it like the first scan.
+private func refreshReport(client: AgentClient, scanFilesystem: Bool, animate: Bool) throws -> HostAuditReport {
+    animate
+        ? try runAnimatedAudit(client: client, scanFilesystem: scanFilesystem)
+        : try client.hostAudit(scanFilesystem: scanFilesystem)
+}
+
+/// Present a spinner while the (blocking) remediation runs. csecd re-checks the
+/// host and presents the Touch ID prompt; without this the terminal would sit
+/// silent for several seconds. The blocking call stays on the calling thread; only
+/// the spinner animates on a helper thread.
 private func remediateWithProgress(
-    client: AgentClient, scanFilesystem: Bool, animate: Bool
+    client: AgentClient, selectedKeys: [String], scanFilesystem: Bool, animate: Bool
 ) throws -> HostRemediationSummary {
-    guard animate else { return try client.hostRemediate(scanFilesystem: scanFilesystem) }
+    guard animate else {
+        return try client.hostRemediate(selectedKeys: selectedKeys, scanFilesystem: scanFilesystem)
+    }
     installAuditInterruptCursorRestore()
     let stop = AtomicFlag()
     let finished = DispatchSemaphore(value: 0)
     Thread.detachNewThread {
         var spinner = IndeterminateSpinner(
-            label: "Re-checking host and preparing fixes — approve in the Touch ID window when it appears…")
+            label: "Applying fixes — approve in the Touch ID prompt when it appears…")
         while !stop.value {
             spinner.tick()
             usleep(90_000)
@@ -156,7 +235,7 @@ private func remediateWithProgress(
         stop.set()
         finished.wait()
     }
-    return try client.hostRemediate(scanFilesystem: scanFilesystem)
+    return try client.hostRemediate(selectedKeys: selectedKeys, scanFilesystem: scanFilesystem)
 }
 
 /// A tiny lock-guarded boolean shared with the spinner helper thread.
@@ -167,84 +246,44 @@ private final class AtomicFlag: @unchecked Sendable {
     func set() { lock.lock(); flag = true; lock.unlock() }
 }
 
-// MARK: - Rendering (value-free)
-
-private func renderReport(_ report: HostAuditReport) {
-    print("# Host posture audit")
-    if let hint = report.generatedAtHint { print("_generated \(auditSafe(hint))_") }
-    print("\n\(auditSafe(report.verdict))")
-
-    let actionable = report.findings.filter { $0.status == .fail || $0.status == .unknown }
-    let fails = actionable.filter { $0.status == .fail }
-    if !fails.isEmpty {
-        print("\n## Needs attention (\(fails.count))")
-        for finding in fails { printFinding(finding) }
-    }
-
-    let unknowns = actionable.filter { $0.status == .unknown }
-    if !unknowns.isEmpty {
-        print("\n## Could not verify (\(unknowns.count))")
-        for finding in unknowns {
-            print("- \(finding.onThesis ? "★ " : "")\(finding.id)  \(auditSafe(finding.title))")
-            print("    \(auditSafe(finding.evidence))")
-            print("    ↳ \(auditSafe(finding.anchor))")
-        }
-    }
-
-    let passing = report.findings.filter { $0.status == .pass }
-    let expectedSelf = report.findings.filter { $0.status == .expectedSelf }
-    let notApplicable = report.findings.filter { $0.status == .notApplicable }
-    if !passing.isEmpty {
-        print("\n## Passing (\(passing.count))")
-        print("  " + passing.map(\.id).joined(separator: ", "))
-    }
-    if !expectedSelf.isEmpty {
-        print("\n## Expected (csec's own)")
-        for finding in expectedSelf { print("- \(finding.id)  \(auditSafe(finding.evidence))") }
-    }
-    if !notApplicable.isEmpty {
-        print("\n## Not applicable (\(notApplicable.count))")
-        print("  " + notApplicable.map(\.id).joined(separator: ", "))
-    }
-    if !report.coverageNotes.isEmpty {
-        print("\n## Coverage notes")
-        for note in report.coverageNotes { print("- \(auditSafe(note))") }
-    }
-}
-
-private func printFinding(_ finding: HostFinding) {
-    let icon: String
-    switch finding.severity {
-    case .high: icon = "🔴"
-    case .medium: icon = "🟠"
-    case .low: icon = "🟡"
-    case .info: icon = "·"
-    }
-    let star = finding.onThesis ? "★ " : ""
-    print("- \(icon) \(star)\(finding.id)  \(auditSafe(finding.title))  \(remediationTag(finding.remediation))")
-    print("    \(auditSafe(finding.evidence))")
-    print("    ↳ \(auditSafe(finding.anchor))")
-}
-
-private func remediationTag(_ remediation: RemediationClass) -> String {
-    switch remediation {
-    case .auto: return "[auto-fix]"
-    case .autoPrivileged: return "[auto-fix · root]"
-    case .guided: return "[guided]"
-    case .advise: return "[review]"
-    case .none: return ""
-    }
-}
+// MARK: - Remediation summary + attestation
 
 private func renderRemediation(_ summary: HostRemediationSummary) {
     if !summary.approved {
-        print("- no changes applied (review declined).")
+        print("No changes applied (Touch ID declined or unavailable).")
         return
     }
-    if !summary.applied.isEmpty { print("- applied: \(summary.applied.map(auditSafe).joined(separator: ", "))") }
-    if !summary.skipped.isEmpty { print("- skipped: \(summary.skipped.map(auditSafe).joined(separator: ", "))") }
-    if !summary.failed.isEmpty { print("- failed:  \(summary.failed.map(auditSafe).joined(separator: ", "))") }
-    if summary.applied.isEmpty && summary.failed.isEmpty { print("- no changes were selected.") }
+    if !summary.applied.isEmpty { print("Applied: \(summary.applied.map(auditSafe).joined(separator: ", "))") }
+    if !summary.skipped.isEmpty { print("Skipped: \(summary.skipped.map(auditSafe).joined(separator: ", "))") }
+    if !summary.failed.isEmpty { print("Failed:  \(summary.failed.map(auditSafe).joined(separator: ", "))") }
+    if summary.applied.isEmpty && summary.failed.isEmpty { print("No changes were applied.") }
+}
+
+/// Print the copy-paste attestation. The pasteable markdown block goes to stdout;
+/// the framing banner goes to stderr, so `csec audit --attest > file` captures only
+/// the block.
+private func printAttestation(
+    report: HostAuditReport, exemptions: [HostTriageInfo], todos: [HostTriageInfo]
+) {
+    let generatedAt = report.generatedAtHint ?? ISO8601DateFormatter().string(from: Date())
+    let body = AttestationRenderer.render(
+        report: report, identity: HostIdentity.current(),
+        exemptions: exemptions, todos: todos, generatedAtHint: generatedAt)
+    FileHandle.standardError.write(Data("\n─── copy the attestation below ───\n".utf8))
+    print(body)
+    FileHandle.standardError.write(Data("──────────────────────────────────\n".utf8))
+}
+
+/// Merge persisted + this-session triage infos by id (this session wins), dropping
+/// any id that moved to the other bucket this session.
+private func mergeTriage(
+    _ persisted: [HostTriageInfo], _ session: [HostTriageInfo], removing movedAway: Set<String>
+) -> [HostTriageInfo] {
+    var byID: [String: HostTriageInfo] = [:]
+    for info in persisted { byID[info.id] = info }
+    for info in session { byID[info.id] = info }
+    for id in movedAway { byID.removeValue(forKey: id) }
+    return byID.values.sorted { $0.id < $1.id }
 }
 
 /// Neutralize control / bidi characters in any string sent to the terminal.

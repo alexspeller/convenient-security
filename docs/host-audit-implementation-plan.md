@@ -171,11 +171,16 @@ case hostApply(id: String, change: HostRootChange, digest: String)   // reversib
 
 `runAudit(_ arguments:)`, dispatched from `csec/main.swift` and added to `usage()`:
 
-- **`csec audit`** — evaluate all checks → print the value-free report
-  (severity-ordered, ★ grouped first) → present the batched remediation review
-  (§6) → launch any opted-in guided helpers (§7).
+- **`csec audit`** — evaluate all checks → render the formatted value-free report
+  TUI (severity-ordered, ★ grouped first) → drive the in-terminal remediation
+  picker (§6) → launch any opted-in guided helpers (§7) → triage what's still
+  failing → print the copy-paste attestation. On a terminal the scan animates live
+  progress; piped/`--json` output stays plain.
 - **`--report-only`** — report, no remediation proposal (CI / AI-agent consumer).
-- **`--json`** — the `HostAuditReport` as stable JSON (ids are the contract).
+- **`--attest`** — print only the copy-paste attestation (re-scans for a truthful
+  artifact; machine identity + verified controls + accepted risks + planned work).
+- **`--json`** — the `HostAuditReport` as stable JSON (ids are the contract; now
+  also carries the value-free `remediationItems`/`exemptions`/`todos`).
 - **`--scan-filesystem`** — opt into the bounded HA-F10 sweep (off by default;
   logs its bound).
 - **Integration (Decision 1):** at the end of `runSetup(...)`, after the existing
@@ -187,21 +192,42 @@ case hostApply(id: String, change: HostRootChange, digest: String)   // reversib
 The report renderer mirrors `printSetupReport` in `SetupCommand.swift` (same
 `setupSafe`/document-safe sanitization discipline).
 
-## 6. Batched remediation — one review, one Touch ID (Decision 5)
+## 6. Batched remediation — terminal picker, one bare Touch ID (Decision 5)
 
-- Collect fixable findings (`.auto` / `.autoPrivileged`) into a
-  `HostRemediationBatch` of value-free change descriptors.
-- Present a new `HostRemediationReviewSession` (sibling to
-  `TrustedAccessReviewSession`, reusing its window chrome, banner/card helpers, and
-  `configureAuthentication()` Touch-ID activation): each change is a **default-on
-  checklist row** the user can deselect. One Touch ID authorizes the selected set.
-- On approval, compute `digest` over the selected change set. Apply:
-  - `.auto` in-process (e.g. `defaults` writes, `/etc/pam.d/sudo_local` create);
-  - `.autoPrivileged` via `PrivilegedHostOps.apply(change, digest:)`.
-  Application is **atomic per target**, results collected per change; a failure
-  reports completed changes and is safe to re-run (mirrors setup's multi-target
-  semantics). No implicit cross-target transaction.
-- Print an applied/skipped/failed summary.
+**Superseded by the terminal-native flow.** Fix *selection* now lives in the
+launcher's terminal, not an AppKit checklist window (which was replaced; the old
+window's overlapping-layout bug is moot).
+
+- The interactive `HostAuditReport` carries the value-free fixable set as
+  `remediationItems` (built by `HostRemediationBuilder` over the run's memoized
+  ctx). The launcher renders them in an **in-terminal checkbox picker**
+  (`AuditSelectModel` + a raw-mode driver): default-on, deselectable.
+- The selected catalog keys go to `hostRemediate(selectedKeys:)`. csecd re-audits
+  (TOCTOU-safe), filters plans to the selection, and `HostRemediationReviewSession`
+  presents a **bare system Touch ID sheet** (no custom window; its reason names the
+  count). This is safe here because every fix is reversible and security-positive —
+  a tampered selection can only apply *more* hardening, never leak a credential —
+  and Touch ID remains the physical-presence gate.
+- On approval, each `.autoPrivileged` change applies via
+  `PrivilegedHostOps.apply(change, digest:)` (helper re-derives the digest) and
+  `.auto` in-process; **atomic per target**, safe to re-run, no cross-target
+  transaction. Print an applied/skipped/failed summary.
+
+## 6a. Triage + attestation (terminal-native lifecycle)
+
+- After applying (and a verification re-audit when anything was applied), every
+  still-failing finding not already triaged is walked in a terminal prompt: keep as
+  a **TODO** or accept as an **exemption** (optional value-free note). Decisions go
+  to csecd via the `host_record_triage` verb and merge into the accepted baseline
+  (`HostAuditService.applyingTriage`); exemptions/TODOs clear automatically once the
+  control passes (`applyingBaseline`).
+- `PeriodicHostAudit` derives both `pass→fail` regressions and **weekly** TODO
+  reminders from a single background re-audit (`periodicScan`), rate-limited per
+  finding; exempted findings never re-alert. Notify-only.
+- The flow ends by printing a copy-paste **attestation** (`AttestationRenderer`):
+  machine identity (model · macOS · hostname, no serial), verified controls,
+  accepted risks (+notes), planned remediation — honestly surfacing anything that
+  still needs attention.
 
 ## 7. Guided helpers (Decision 4) — `Sources/csec/Guided/`
 

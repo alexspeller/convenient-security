@@ -6,8 +6,9 @@ import CSECRootProtocol
 // Touch ID applies the ones still selected. No secret value, path, or command
 // output ever enters these types.
 
-/// One reversible fix offered in the review checklist.
-public struct HostRemediationItem: Sendable, Equatable {
+/// One reversible fix offered in the review checklist. `Codable` so the value-free
+/// item can ride in a `HostAuditReport` for the launcher's terminal picker.
+public struct HostRemediationItem: Codable, Sendable, Equatable {
     /// The catalog id / remediation key, e.g. "HA-C01".
     public let key: String
     /// Value-free one-line title (what will change).

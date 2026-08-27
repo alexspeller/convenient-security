@@ -452,18 +452,37 @@ recomputes and requires to match before applying, exactly as the existing
 Keychain, or Touch ID dependency, so this preserves its minimal surface and adds
 no dangerous entitlements.
 
-Reporting and remediation are one flow. After the report, the safe, reversible
-`.auto`/`.autoPrivileged` fixes are collected into a **single batched review under
-one Touch ID** — a deselectable checklist rendered by a sibling of the trusted
-access-review window — and applied atomically per target, each change
-digest-bound; there is no implicit cross-target transaction. Two more-secure
-states that need a real choice or state transition get **guided interactive
-helpers** instead: FileVault (HA-G03), which keeps the recovery key local and
-never silently escrows it to iCloud, and Santa (HA-B08), which links to the
-official signed package and describes a MONITOR-mode starting posture and never
+Reporting and remediation are one **terminal-native** flow. The report renders as
+a formatted TUI (not raw markdown); the safe, reversible `.auto`/`.autoPrivileged`
+fixes are then presented as an **in-terminal checkbox picker** (default-on,
+deselectable), and the still-selected set is applied atomically per target, each
+change digest-bound, under a **single bare Touch ID** presented by csecd. There is
+no implicit cross-target transaction. Selection moved out of the old AppKit
+checklist window into the terminal deliberately: every remediation is a reversible,
+security-positive change, so a tampered selection can only apply *more* hardening,
+never leak a credential — the opposite direction of harm from the access-review
+case, where the WYSIWYG-in-trusted-window property is load-bearing. Touch ID still
+gates the privileged apply in csecd (physical presence a compromised launcher
+cannot forge), and csecd re-derives the plan from live state before applying.
+
+Two more-secure states that need a real choice or state transition get **guided
+interactive helpers** instead: FileVault (HA-G03), which keeps the recovery key
+local and never silently escrows it to iCloud, and Santa (HA-B08), which links to
+the official signed package and describes a MONITOR-mode starting posture and never
 sets LOCKDOWN. TCC-grant revocation, config-profile and root-CA removal, and
-similar judgment calls are advise-only. `csec setup` runs the audit report-only
-on completion so onboarding always ends with a host posture pass.
+similar judgment calls are advise-only.
+
+Whatever is still failing afterwards — non-auto-fixable, declined, or a fix that
+didn't take — flows through **triage**: per finding, accept it as a documented
+**exemption** (a value-free note, suppressed from re-nagging) or keep it as a
+**TODO** (a weekly notification reminder while it stays unfixed, riding the daily
+re-audit timer). Exemptions and TODOs persist in the accepted baseline and clear
+automatically when the control later passes. The flow ends by printing a
+copy-paste **attestation** — machine identity (model · macOS · hostname, no serial),
+verified controls, accepted risks, planned remediation — suitable for showing the
+laptop is properly configured; it honestly surfaces anything still needing
+attention. `csec setup` runs the audit report-only on completion so onboarding
+always ends with a host posture pass.
 
 Because `csecd` is resident, it also re-audits on a daily dispatch timer against
 an accepted baseline at
