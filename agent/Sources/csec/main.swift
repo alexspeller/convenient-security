@@ -118,8 +118,12 @@ func usage() -> Never {
                place; --set NAME=<ref> injects additional ones. If the project holds
                *.csec sidecars (from csec protect), csec instead materializes each
                protected file back at its original path for the wrapped tree on
-               root-owned tmpfs (the same boundary as exec-file). Terminal output is
-               masked by default; use 'always' for captured logs and pipes.
+               root-owned tmpfs (the same boundary as exec-file). Resolved values
+               appearing in the child's output are masked when stdout/stderr is a
+               terminal (the default, --redact-output=tty); piped or redirected
+               output passes through unmasked, with a warning. Pass
+               --redact-output=always to also mask output captured by pipes,
+               files, and logs.
     session    Register a kernel-verified broad grant root, then run <cmd> at the same PID.
     creds      Serve AWS credential_process or Git credential-helper output via a private pipe.
     exec-fd    Give a child anonymous single-open secret files at /dev/fd/N. Presets set
@@ -773,18 +777,35 @@ func runExec(_ arguments: [String]) -> Never {
     // A project holding `*.csec` sidecars needs its protected files back at their
     // original paths for the wrapped tree, which only the rootd launch can do.
     // Route there when any are present; overflow past the per-launch bound is a
-    // hard error, never a silent fallback to environment injection.
+    // hard error, never a silent fallback to environment injection. `csec exec`'s
+    // ordinary environment injection (`--set` and env-scanned references) is folded
+    // into the same launch as value-in-environment bindings, so one approval
+    // delivers both files and values.
     do {
         let discoveries = try ProtectedSidecarScanner.scan(
             projectDirectory: FileManager.default.currentDirectoryPath)
         if !discoveries.isEmpty {
-            if !explicit.isEmpty {
-                FileHandle.standardError.write(Data(
-                    "csec exec: warning: --set is ignored when protected-file sidecars are present\n".utf8))
+            let assignments: [(name: String, reference: String)]
+            do {
+                let knownSchemes = Set(try makeAgentClient().schemes())
+                let plan = try ExecPlanner.plan(
+                    environment: ProcessInfo.processInfo.environment,
+                    explicit: explicit,
+                    knownSchemes: knownSchemes
+                )
+                // Sort for a deterministic plan (dictionaries are unordered) so the
+                // digest and binding order are stable across identical invocations.
+                assignments = plan.assignments
+                    .map { (name: $0.key, reference: $0.value) }
+                    .sorted { $0.name < $1.name }
+            } catch {
+                FileHandle.standardError.write(Data("csec exec: \(error)\n".utf8))
+                exit(1)
             }
             runSidecarExec(
                 commandLine: commandLine,
                 discoveries: discoveries,
+                environmentAssignments: assignments,
                 reason: reason,
                 ttlSeconds: ttlSeconds,
                 outputGuard: outputGuard

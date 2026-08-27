@@ -262,7 +262,12 @@ value whether it holds a short token or a whole binary file; the storage tier
 lives in a hostile directory, csecd binds each value to the project-relative path
 its blob recorded at import, so a planted or moved sidecar fails closed; the
 symlink itself is a confidentiality-only surface that same-uid malware can
-replace, an accepted integrity limitation.
+replace, an accepted integrity limitation. The same launch also folds in
+`csec exec`'s ordinary environment injection: each `--set` assignment or
+env-scanned reference becomes a value-in-environment binding whose resolved value
+the helper places directly into the child environment. csecd resolves everything
+once, so a single approval covers both the materialized files and the injected
+values, and the launcher still never holds a plaintext value.
 
 ### Environment compatibility
 
@@ -276,6 +281,14 @@ high or critical risk is rejected before cache/provider resolution because the
 generic complete consumer is unverified. The weak mechanism alone is not the
 integrity failure. Output-guard configuration is part of both the delivery-plan
 and policy digests but does not make the environment private.
+
+When the project also holds `*.csec` sidecars, this identical injection is folded
+into the root-helper launch instead of being applied by the launcher: each
+assignment becomes a value-in-environment binding the helper places in the child
+environment, so the launcher never holds the plaintext. The environment's
+same-UID inspectability is unchanged — it remains weak compatibility delivery
+under the same risk policy — but one approval now delivers both the injected
+values and the materialized files.
 
 When output policy is active, `csec` remains as the process supervisor and uses
 a child PTY or pipes. Terminal output is guarded by default. Non-terminal output

@@ -82,13 +82,25 @@ public enum ProtectedFileDelivery: Codable, Sendable, Equatable {
     /// `relativePath` is the env-visible subpath: the file itself for a raw
     /// payload, or a containing directory for a profile such as `GH_CONFIG_DIR`.
     case environment(name: String, relativePath: String)
+    /// rootd sets `name` in the child environment to the resolved value bytes
+    /// (as a UTF-8 string) themselves — no tmpfs file is surfaced. This folds
+    /// `csec exec`'s ordinary environment injection (`--set` and env-scanned
+    /// references) into the same root launch as sidecar files, so a single
+    /// approval delivers both. The value re-enters the (same-uid-readable)
+    /// environment exactly as plain `csec exec --set` does; it is resolved by
+    /// csecd and placed by rootd, and never touches the launcher or the plan.
+    case environmentValue(name: String)
     /// The launcher — never rootd, which must not write outside its mount — symlinks
     /// `<project>/projectRelativePath` to the tmpfs file at the binding's
     /// `relativePath`. rootd materializes the file and sets no environment entry.
     case symlink(projectRelativePath: String)
 
     private enum CodingKeys: String, CodingKey { case kind, name, relativePath, projectRelativePath }
-    private enum Kind: String, Codable { case environment, symlink }
+    private enum Kind: String, Codable {
+        case environment
+        case environmentValue = "environment_value"
+        case symlink
+    }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -98,6 +110,8 @@ public enum ProtectedFileDelivery: Codable, Sendable, Equatable {
                 name: try container.decode(String.self, forKey: .name),
                 relativePath: try container.decode(String.self, forKey: .relativePath)
             )
+        case .environmentValue:
+            self = .environmentValue(name: try container.decode(String.self, forKey: .name))
         case .symlink:
             self = .symlink(
                 projectRelativePath: try container.decode(String.self, forKey: .projectRelativePath)
@@ -112,6 +126,9 @@ public enum ProtectedFileDelivery: Codable, Sendable, Equatable {
             try container.encode(Kind.environment, forKey: .kind)
             try container.encode(name, forKey: .name)
             try container.encode(relativePath, forKey: .relativePath)
+        case let .environmentValue(name):
+            try container.encode(Kind.environmentValue, forKey: .kind)
+            try container.encode(name, forKey: .name)
         case let .symlink(projectRelativePath):
             try container.encode(Kind.symlink, forKey: .kind)
             try container.encode(projectRelativePath, forKey: .projectRelativePath)
@@ -161,9 +178,15 @@ public struct ProtectedFileBinding: Codable, Sendable, Equatable {
     }
 
     /// The environment variable this binding sets, or nil when it is symlinked.
+    /// Covers both a path-in-environment binding (variable holds the tmpfs file
+    /// path) and a value-in-environment binding (variable holds the value itself);
+    /// they share one namespace so a name cannot be claimed by both.
     public var environmentName: String? {
-        if case let .environment(name, _) = delivery { return name }
-        return nil
+        switch delivery {
+        case let .environment(name, _): return name
+        case let .environmentValue(name): return name
+        case .symlink: return nil
+        }
     }
 
     /// The env-visible tmpfs subpath, or nil when this binding is symlinked.
@@ -220,6 +243,24 @@ public struct ProtectedFileBinding: Codable, Sendable, Equatable {
             delivery: .symlink(projectRelativePath: projectRelativePath)
         )
     }
+
+    /// A value-in-environment binding: the raw resolved value of `reference` is
+    /// placed directly in the child's `environmentName`, with no file surfaced.
+    /// Used to fold `csec exec`'s `--set`/env-scan injection into a sidecar launch.
+    /// `relativePath` only routes the payload to rootd (which reads its bytes and
+    /// writes no file); `index` keeps it distinct from the `files/…` sidecar names.
+    public static func value(
+        environmentName: String,
+        reference: String,
+        index: Int
+    ) -> ProtectedFileBinding {
+        ProtectedFileBinding(
+            relativePath: "env/value-\(index)",
+            reference: reference,
+            rendering: .raw,
+            delivery: .environmentValue(name: environmentName)
+        )
+    }
 }
 
 /// Complete, bounded, plaintext-free root launch request. Both signed parties
@@ -228,6 +269,7 @@ public struct ProtectedFileBinding: Codable, Sendable, Equatable {
 public struct ProtectedLaunchPlan: Codable, Sendable, Equatable {
     public static let maximumArguments = 256
     public static let maximumEnvironmentEntries = 512
+    public static let maximumEnvironmentValueBytes = 256 * 1024
     public static let maximumMetadataBytes = 1024 * 1024
     // A whole project's protected files must fit one launch; a sidecar tree is
     // larger than the handful of `--file` flags the earlier tiers used. This stays
@@ -330,7 +372,7 @@ public struct ProtectedLaunchPlan: Codable, Sendable, Equatable {
                   !name.hasPrefix("CSEC_"),
                   !Self.isLoaderControl(name),
                   !value.utf8.contains(0),
-                  value.utf8.count <= 256 * 1024 else {
+                  value.utf8.count <= Self.maximumEnvironmentValueBytes else {
                 throw ProtectedFileDeliveryError.invalidLaunchPlan
             }
             metadataBytes += name.utf8.count + value.utf8.count
@@ -379,6 +421,23 @@ public struct ProtectedLaunchPlan: Codable, Sendable, Equatable {
                         throw ProtectedFileDeliveryError.invalidGitHubProfile
                     }
                 }
+            case let .environmentValue(name):
+                // The value goes straight into the child environment, so only raw
+                // rendering is meaningful and the name shares the environment
+                // namespace with path-in-environment bindings and the plan's own
+                // entries. Any resolvable scheme is allowed — unlike a symlink
+                // binding, a value is not path-bound to a stored blob. The value's
+                // own size and UTF-8 validity are enforced by rootd, which alone
+                // sees the bytes.
+                guard case .raw = binding.rendering,
+                      Self.validEnvironmentName(name),
+                      !name.hasPrefix("CSEC_"),
+                      !Self.isLoaderControl(name),
+                      environment[name] == nil,
+                      environmentNames.insert(name).inserted else {
+                    throw ProtectedFileDeliveryError.invalidFileBinding
+                }
+                metadataBytes += name.utf8.count
             case let .symlink(projectRelativePath):
                 // A sidecar file is materialized byte-for-byte, so only raw
                 // rendering is meaningful and the tmpfs file is the exact symlink
@@ -416,7 +475,7 @@ public struct ProtectedLaunchPlan: Codable, Sendable, Equatable {
                 && !name.hasPrefix("CSEC_")
                 && !isLoaderControl(name)
                 && !value.utf8.contains(0)
-                && value.utf8.count <= 256 * 1024
+                && value.utf8.count <= maximumEnvironmentValueBytes
         }
     }
 

@@ -311,6 +311,9 @@ public final class ProtectedFileStore: @unchecked Sendable {
                               environmentRelativePath, allowDirectory: true)
                           && (binding.relativePath == environmentRelativePath
                               || binding.relativePath.hasPrefix(environmentRelativePath + "/"))
+                  case let .environmentValue(name):
+                      return ProtectedLaunchPlan.validEnvironmentName(name)
+                          && !name.hasPrefix("CSEC_")
                   case let .symlink(projectRelativePath):
                       return ProtectedLaunchPlan.validProjectRelativePath(projectRelativePath)
                   }
@@ -350,7 +353,13 @@ public final class ProtectedFileStore: @unchecked Sendable {
                 group: group,
                 mode: directoryMode
             )
-            for payload in payloads {
+            // `payloads` is order- and path-aligned with `bindings` (checked
+            // above), so each binding pairs with its own payload. A value-in-
+            // environment binding surfaces no file — its resolved value goes
+            // straight into the child environment below — so only the other
+            // deliveries materialize a tmpfs node.
+            for (binding, payload) in zip(bindings, payloads) {
+                if case .environmentValue = binding.delivery { continue }
                 try createFile(
                     sessionFD: sessionFD,
                     relativePath: payload.relativePath,
@@ -364,21 +373,38 @@ public final class ProtectedFileStore: @unchecked Sendable {
             close(sessionFD)
             sessionFD = -1
             let prefix = (mountPath as NSString).appendingPathComponent(sessionName)
-            // Only environment-delivered bindings set a child variable; a symlink
-            // binding's tmpfs file is reached through the launcher-installed link,
-            // so rootd contributes no environment entry for it.
-            let environment = Dictionary(uniqueKeysWithValues: bindings.compactMap {
-                binding -> (String, String)? in
-                guard case let .environment(name, environmentRelativePath) = binding.delivery else {
-                    return nil
+            // A path-in-environment binding points its variable at the materialized
+            // tmpfs file; a value-in-environment binding carries the resolved value
+            // itself (validated here, where rootd alone sees the bytes); a symlink
+            // binding is reached through the launcher-installed link and sets no
+            // variable.
+            var environment: [String: String] = [:]
+            for (binding, payload) in zip(bindings, payloads) {
+                switch binding.delivery {
+                case let .environment(name, environmentRelativePath):
+                    environment[name] = (prefix as NSString)
+                        .appendingPathComponent(environmentRelativePath)
+                case let .environmentValue(name):
+                    guard let value = String(data: payload.data, encoding: .utf8),
+                          !value.utf8.contains(0),
+                          value.utf8.count <= ProtectedLaunchPlan.maximumEnvironmentValueBytes else {
+                        throw RootHelperRuntimeError.fileCreationFailed
+                    }
+                    environment[name] = value
+                case .symlink:
+                    continue
                 }
-                return (name, (prefix as NSString).appendingPathComponent(environmentRelativePath))
-            })
+            }
+            let relativeFiles = zip(bindings, payloads).compactMap {
+                binding, payload -> String? in
+                if case .environmentValue = binding.delivery { return nil }
+                return payload.relativePath
+            }
             return ProtectedFileSession(
                 nonce: sessionName,
                 gid: gid,
                 environment: environment,
-                relativeFiles: payloads.map(\.relativePath)
+                relativeFiles: relativeFiles
             )
         } catch {
             if sessionFD >= 0 { close(sessionFD) }

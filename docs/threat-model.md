@@ -204,6 +204,16 @@ untrusted, `csecd` binds each value to the project-relative path its blob record
 at import, so a planted or moved sidecar that redirects a value to a different
 path fails closed before any launch.
 
+The same launch folds in `csec exec`'s ordinary environment injection (`--set`
+and env-scanned references) as value-in-environment bindings: csecd resolves each
+value and the helper — not the launcher — places it in the child environment.
+This keeps the plaintext out of the launcher and behind one approval, but the
+value re-enters the same-UID-inspectable environment exactly as plain `csec exec`
+delivers it, so it carries that mechanism's weak-compatibility exposure and risk
+policy, not the sidecar files' tmpfs isolation. Only bindings whose reference is
+a native blob are path-bound; a value binding names any resolvable reference and
+is not surfaced as a file.
+
 ### Keychain cache
 
 The persistent cache uses the data-protection keychain and the daemon's

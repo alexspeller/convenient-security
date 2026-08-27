@@ -1363,13 +1363,17 @@ do {
     let secret = "export SECRET_TOKEN=exec-sidecar-synthetic\nuse_flake\n"
     try Data(secret.utf8).write(to: URL(fileURLWithPath: envrcPath))
 
-    func runInProject(_ arguments: [String]) -> (status: Int32, out: String, err: String) {
+    func runInProject(
+        _ arguments: [String],
+        extraEnv: [String: String] = [:]
+    ) -> (status: Int32, out: String, err: String) {
         let process = Process()
         process.executableURL = csecURL
         process.arguments = arguments
         process.currentDirectoryURL = URL(fileURLWithPath: projectDir)
         var environment = ProcessInfo.processInfo.environment
         environment["CSEC_SOCKET"] = socketPath
+        for (key, value) in extraEnv { environment[key] = value }
         process.environment = environment
         let outPipe = Pipe(), errPipe = Pipe()
         process.standardOutput = outPipe
@@ -1395,6 +1399,25 @@ do {
             + "(status \(execResult.status), out \"\(execResult.out)\", err \"\(execResult.err)\")")
     check((try? FileManager.default.destinationOfSymbolicLink(atPath: envrcPath)) == nil,
           "csec exec tears down the materialized symlink after the child exits")
+
+    // Combined path: with a sidecar present, `csec exec` must ALSO fold in ordinary
+    // environment injection — both an explicit `--set` and an env-scanned reference
+    // exported into the launcher's shell — resolving each into the child's
+    // environment through the same one-approval root launch. The value is placed by
+    // rootd, never by the launcher. (Piped output leaves default tty masking
+    // inactive, so the fake values surface for the assertion.)
+    let combined = runInProject(
+        ["exec", "--set", "INJECTED_URL=op://demo/db/url", "--",
+         "/bin/sh", "-c", "printf '%s|%s' \"$INJECTED_URL\" \"$SCANNED_TOKEN\""],
+        extraEnv: ["SCANNED_TOKEN": "csec://development/NATIVE_TOKEN"]
+    )
+    check(combined.status == 0
+          && combined.out == "postgres://s3cr3t|native-synthetic-token",
+          "csec exec folds --set and env-scanned references into the sidecar launch "
+            + "as value-in-environment (status \(combined.status), out \"\(combined.out)\", "
+            + "err \"\(combined.err)\")")
+    check((try? FileManager.default.destinationOfSymbolicLink(atPath: envrcPath)) == nil,
+          "the combined launch still tears the sidecar symlink down afterwards")
 } catch {
     check(false, "csec exec sidecar materialization end-to-end succeeds (\(error))")
 }

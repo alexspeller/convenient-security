@@ -1298,6 +1298,83 @@ do {
     ])
     checkThrows("duplicate symlink targets are rejected") { try duplicateSymlink.validate() }
 
+    // Value-in-environment bindings — folding `csec exec`'s `--set`/env-scan
+    // injection into a sidecar launch. rootd places the resolved value directly in
+    // the child environment; no file is surfaced and no path binding applies.
+    let valueBinding = ProtectedFileBinding.value(
+        environmentName: "DATABASE_URL",
+        reference: "op://vault/db/url",
+        index: 0
+    )
+    check(valueBinding.environmentName == "DATABASE_URL"
+          && valueBinding.symlinkTarget == nil
+          && valueBinding.environmentRelativePath == nil
+          && valueBinding.relativePath == "env/value-0",
+          "a value binding claims an environment name, no file path, and no symlink target")
+    if case .environmentValue = valueBinding.delivery {} else {
+        check(false, "a value binding uses value-in-environment delivery")
+    }
+    let mixedPlan = try syntheticProtectedLaunchPlan(files: [symlinkBinding, valueBinding])
+    try mixedPlan.validate()
+    let mixedDigest = try mixedPlan.digest()
+    let symlinkDigest = try symlinkPlan.digest()
+    check(mixedPlan.references.sorted() == ["csec://project/env_home", "op://vault/db/url"],
+          "a mixed launch resolves both the sidecar and the value reference")
+    check(mixedDigest != symlinkDigest,
+          "adding a value binding changes the digest a signed party is bound to")
+    let valuePayload = try ProtectedFilePayloadRenderer.render(
+        bindings: [valueBinding],
+        values: [valueBinding.reference: Data("postgres://synthetic".utf8)]
+    )
+    check(valuePayload.count == 1
+          && valuePayload[0].relativePath == "env/value-0"
+          && valuePayload[0].data == Data("postgres://synthetic".utf8),
+          "a value binding renders its raw value as the routed payload")
+    let encodedMixed = try JSONEncoder().encode(mixedPlan)
+    let decodedMixed = try JSONDecoder().decode(ProtectedLaunchPlan.self, from: encodedMixed)
+    let decodedDigest = try decodedMixed.digest()
+    check(decodedMixed == mixedPlan && decodedDigest == mixedDigest,
+          "value-in-environment delivery round-trips through Codable and the plan digest")
+    // Unlike a symlink binding, a value binding is not path-bound to a stored blob,
+    // so any resolvable scheme is accepted.
+    try syntheticProtectedLaunchPlan(files: [
+        symlinkBinding,
+        ProtectedFileBinding.value(environmentName: "API_KEY", reference: "op://vault/api/key", index: 1),
+    ]).validate()
+    let valueCollidesEnv = try syntheticProtectedLaunchPlan(
+        files: [valueBinding],
+        environment: ["PATH": "/usr/bin:/bin", "DATABASE_URL": "already-set"]
+    )
+    checkThrows("a value name cannot duplicate a plan environment entry") {
+        try valueCollidesEnv.validate()
+    }
+    for badName in ["CSEC_SNEAK", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD"] {
+        let bad = try syntheticProtectedLaunchPlan(files: [
+            symlinkBinding,
+            ProtectedFileBinding.value(environmentName: badName, reference: "op://vault/x", index: 1),
+        ])
+        checkThrows("a value binding rejects the reserved name '\(badName)'") { try bad.validate() }
+    }
+    let duplicateValueName = try syntheticProtectedLaunchPlan(files: [
+        ProtectedFileBinding.value(environmentName: "TOKEN", reference: "op://vault/a", index: 0),
+        ProtectedFileBinding.value(environmentName: "TOKEN", reference: "op://vault/b", index: 1),
+    ])
+    checkThrows("duplicate value environment names are rejected") { try duplicateValueName.validate() }
+    let valueClashesRaw = try syntheticProtectedLaunchPlan(files: [
+        ProtectedFileBinding.raw(environmentName: "SHARED", reference: "op://vault/a", index: 0),
+        ProtectedFileBinding.value(environmentName: "SHARED", reference: "op://vault/b", index: 1),
+    ])
+    checkThrows("a value name cannot collide with a path-in-environment name") {
+        try valueClashesRaw.validate()
+    }
+    let valueProfile = try syntheticProtectedLaunchPlan(files: [ProtectedFileBinding(
+        relativePath: "env/value-0",
+        reference: "op://vault/db/url",
+        rendering: .githubHosts(host: "github.com", user: nil, gitProtocol: "https"),
+        delivery: .environmentValue(name: "DATABASE_URL")
+    )])
+    checkThrows("a value binding must render raw, never a profile") { try valueProfile.validate() }
+
     let rootRequestID = UUID().uuidString.lowercased()
     let rootRequest = RootHelperRequest.prepare(
         requestID: rootRequestID,
@@ -1472,6 +1549,51 @@ do {
           && (try? Data(contentsOf: URL(fileURLWithPath: symlinkFilePath))) == symlinkStorePayload.data,
           "a symlink binding materializes its tmpfs file and sets no environment entry")
     try store.cleanup(nonce: symlinkStoreNonce)
+
+    // A value-in-environment binding surfaces no tmpfs file at all — its value goes
+    // straight into the child environment. Mixed with a sidecar it proves both:
+    // the sidecar file is materialized while the value binding writes nothing.
+    let valueStoreNonce = UUID().uuidString.lowercased()
+    let valueStoreSidecar = ProtectedFileBinding.symlink(
+        projectRelativePath: ".envrc",
+        reference: "csec://project/env_home",
+        index: 0
+    )
+    let valueStoreValue = ProtectedFileBinding.value(
+        environmentName: "DATABASE_URL",
+        reference: "op://vault/db/url",
+        index: 0
+    )
+    let valueStoreSession = try store.create(
+        nonce: valueStoreNonce,
+        gid: getgid(),
+        bindings: [valueStoreSidecar, valueStoreValue],
+        payloads: [
+            ProtectedFilePayload(
+                relativePath: valueStoreSidecar.relativePath, data: Data("SECRET=1\n".utf8)),
+            ProtectedFilePayload(
+                relativePath: valueStoreValue.relativePath, data: Data("postgres://synthetic".utf8)),
+        ]
+    )
+    let valueStoreSidecarPath = mountURL.appendingPathComponent(valueStoreNonce)
+        .appendingPathComponent(valueStoreSidecar.relativePath).path
+    let valueStoreValuePath = mountURL.appendingPathComponent(valueStoreNonce)
+        .appendingPathComponent(valueStoreValue.relativePath).path
+    check(valueStoreSession.environment == ["DATABASE_URL": "postgres://synthetic"]
+          && FileManager.default.fileExists(atPath: valueStoreSidecarPath)
+          && !FileManager.default.fileExists(atPath: valueStoreValuePath),
+          "a value binding injects its value into the environment and materializes no file")
+    try store.cleanup(nonce: valueStoreNonce)
+    checkThrows("the file store rejects a non-UTF-8 value-in-environment payload") {
+        _ = try store.create(
+            nonce: UUID().uuidString.lowercased(),
+            gid: getgid(),
+            bindings: [ProtectedFileBinding.value(
+                environmentName: "TOKEN", reference: "op://vault/x", index: 0)],
+            payloads: [ProtectedFilePayload(
+                relativePath: "env/value-0", data: Data([0xFF, 0xFE, 0xFD]))]
+        )
+    }
 
     let traversalNonce = UUID().uuidString.lowercased()
     let traversalBinding = ProtectedFileBinding(

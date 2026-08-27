@@ -30,6 +30,15 @@ attacker-controlled configuration — but the protected bytes stay unreadable.
 csecd independently binds each sidecar value to the project-relative path its
 blob was protected at, so a planted or moved sidecar fails closed before launch.
 
+The same launch also folds in `csec exec`'s ordinary environment injection:
+`--set` assignments and env-scanned references become **value-in-environment**
+bindings whose resolved value the helper places directly into the child
+environment — resolved once by csecd, never held by the launcher and never
+carried in the plan. Those values re-enter the same-UID-inspectable environment
+exactly as plain `csec exec` delivers them (they surface no tmpfs file); only the
+sidecar file bytes keep the stronger `root:<gid>` tmpfs isolation. One approval
+therefore covers both the materialized files and the injected values.
+
 The release claim requires all of these invariants together:
 
 - exact signed `csec` prepares and consumes one launch, while exact signed
@@ -44,9 +53,12 @@ The release claim requires all of these invariants together:
 - expiry, cancellation, launcher death, scanner failure, direct-child exit,
   daemonization, and helper restart fail closed according to the documented
   soft/hard-TTL semantics; and
-- protected payload values never return from `csecd` to `csec`, enter argv or
-  the initial environment, or appear in product diagnostics and supervised
-  output.
+- sidecar (file-delivered) payload values never return from `csecd` to `csec`,
+  enter argv or the initial environment, or appear in product diagnostics and
+  supervised output; a folded-in value-in-environment binding (`--set`/env-scan)
+  is by design placed in the child's initial environment by the helper — the same
+  weak-compatibility delivery as plain `csec exec`, and still never routed through
+  the launcher or the plan.
 
 ## Automated source and synthetic evidence
 

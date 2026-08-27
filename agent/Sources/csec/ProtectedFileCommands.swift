@@ -287,6 +287,7 @@ func runExecFile(_ arguments: [String]) -> Never {
 func runSidecarExec(
     commandLine: [String],
     discoveries: [DiscoveredProtectedFile],
+    environmentAssignments: [(name: String, reference: String)],
     reason: String?,
     ttlSeconds: Int,
     outputGuard: OutputGuardConfiguration
@@ -298,16 +299,36 @@ func runSidecarExec(
     var materialization: ProtectedSymlinkMaterialization?
     do {
         let executable = try conservativeExecutable(command: commandLine[0])
-        let bindings = discoveries.enumerated().map { offset, discovery in
+        // Sidecar files surface via launcher-installed symlinks; folded-in
+        // environment injection (`--set` and env-scanned references) surfaces as
+        // values rootd places directly in the child environment. Both ride the
+        // same approval, so plaintext is resolved once by csecd and never touches
+        // the launcher.
+        let symlinkBindings = discoveries.enumerated().map { offset, discovery in
             ProtectedFileBinding.symlink(
                 projectRelativePath: discovery.targetRelativePath,
                 reference: discovery.reference.uri,
                 index: offset
             )
         }
-        let environment = ProtectedLaunchPlan.sanitizedEnvironment(
+        let valueBindings = environmentAssignments.enumerated().map { offset, assignment in
+            ProtectedFileBinding.value(
+                environmentName: assignment.name,
+                reference: assignment.reference,
+                index: offset
+            )
+        }
+        let bindings = symlinkBindings + valueBindings
+        var environment = ProtectedLaunchPlan.sanitizedEnvironment(
             ProcessInfo.processInfo.environment
         )
+        // A value-in-environment binding owns its variable; drop any inherited
+        // entry (e.g. the literal `DATABASE_URL=csec://…` an env-scan matched) so
+        // the plan validator's "name not already in the base environment" rule
+        // holds and the resolved value is what the child sees.
+        for binding in bindings {
+            if let name = binding.environmentName { environment.removeValue(forKey: name) }
+        }
         let io = try ProtectedLaunchIO(outputMode: outputGuard.mode)
         let operation = reason
             ?? "csec exec (\(discoveries.count) protected file(s)) "
@@ -371,12 +392,16 @@ func runSidecarExec(
             materialization = session
             let sessionPrefix = (RootHelperSocket.defaultMountPath() as NSString)
                 .appendingPathComponent(prepared.nonce)
-            try session.install(bindings.map { binding in
-                ProtectedSymlinkMaterialization.Link(
-                    projectRelativePath: binding.symlinkTarget ?? "",
-                    tmpfsPath: (sessionPrefix as NSString)
-                        .appendingPathComponent(binding.relativePath)
-                )
+            // Only sidecar bindings carry a symlink target; value-in-environment
+            // bindings surface no file, so they install no link.
+            try session.install(bindings.compactMap { binding in
+                binding.symlinkTarget.map { target in
+                    ProtectedSymlinkMaterialization.Link(
+                        projectRelativePath: target,
+                        tmpfsPath: (sessionPrefix as NSString)
+                            .appendingPathComponent(binding.relativePath)
+                    )
+                }
             })
 
             let scanner: AgentOutputRedactionSession?
