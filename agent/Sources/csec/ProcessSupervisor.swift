@@ -4,7 +4,7 @@ import CSecuritySupport
 import Darwin
 
 struct OutputGuardConfiguration {
-    var mode: OutputGuardMode = .tty
+    var mode: OutputGuardMode = .always
     var labelStyle: OutputRedactionLabelStyle = .opaque
     var includeShortValues = false
 

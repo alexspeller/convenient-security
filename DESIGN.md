@@ -294,8 +294,9 @@ under the same risk policy — but one approval now delivers both the injected
 values and the materialized files.
 
 When output policy is active, `csec` remains as the process supervisor and uses
-a child PTY or pipes. Terminal output is guarded by default. Non-terminal output
-remains byte-exact with a warning unless `--redact-output=always` is selected.
+a child PTY or pipes. All owned output — terminal and non-terminal — is guarded
+by default (`--redact-output=always`). `--redact-output=tty` narrows guarding to
+terminal streams, leaving non-terminal output byte-exact with a warning.
 `--redact-output=never` is an explicit bypass.
 
 ### Raw output

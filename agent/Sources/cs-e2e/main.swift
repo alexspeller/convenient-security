@@ -1393,26 +1393,43 @@ do {
           && FileManager.default.fileExists(atPath: envrcPath + ".csec"),
           "sidecar exec setup: protect replaces .envrc with a sidecar (err: \(protectResult.err))")
 
-    let execResult = runInProject(["exec", "/bin/cat", ".envrc"])
-    check(execResult.status == 0 && execResult.out == secret,
+    let execResult = runInProject([
+        "exec", "--", "/bin/sh", "-c",
+        "test \"$(cat .envrc)\" = 'export SECRET_TOKEN=exec-sidecar-synthetic\nuse_flake' "
+            + "&& printf sidecar-ok",
+    ])
+    check(execResult.status == 0 && execResult.out == "sidecar-ok",
           "csec exec materializes a *.csec file at its project path for the child "
             + "(status \(execResult.status), out \"\(execResult.out)\", err \"\(execResult.err)\")")
     check((try? FileManager.default.destinationOfSymbolicLink(atPath: envrcPath)) == nil,
           "csec exec tears down the materialized symlink after the child exits")
 
+    // The default guard covers pipes: a materialized file printed straight to a
+    // captured stdout must come back as a label, never plaintext.
+    let pipedDefault = runInProject(["exec", "/bin/cat", ".envrc"])
+    check(pipedDefault.status == 0
+          && pipedDefault.out.contains("[csec:secret-")
+          && !pipedDefault.out.contains("exec-sidecar-synthetic")
+          && !pipedDefault.err.contains("exec-sidecar-synthetic"),
+          "the default output guard redacts a materialized file printed to a pipe "
+            + "(status \(pipedDefault.status), out \"\(pipedDefault.out)\", "
+            + "err \"\(pipedDefault.err)\")")
+
     // Combined path: with a sidecar present, `csec exec` must ALSO fold in ordinary
     // environment injection — both an explicit `--set` and an env-scanned reference
     // exported into the launcher's shell — resolving each into the child's
     // environment through the same one-approval root launch. The value is placed by
-    // rootd, never by the launcher. (Piped output leaves default tty masking
-    // inactive, so the fake values surface for the assertion.)
+    // rootd, never by the launcher. (The comparison happens inside the child, so
+    // the default output guard has nothing to redact.)
     let combined = runInProject(
         ["exec", "--set", "INJECTED_URL=op://demo/db/url", "--",
-         "/bin/sh", "-c", "printf '%s|%s' \"$INJECTED_URL\" \"$SCANNED_TOKEN\""],
+         "/bin/sh", "-c",
+         "test \"$INJECTED_URL\" = 'postgres://s3cr3t' "
+            + "&& test \"$SCANNED_TOKEN\" = 'native-synthetic-token' && printf combined-ok"],
         extraEnv: ["SCANNED_TOKEN": "csec://development/NATIVE_TOKEN"]
     )
     check(combined.status == 0
-          && combined.out == "postgres://s3cr3t|native-synthetic-token",
+          && combined.out == "combined-ok",
           "csec exec folds --set and env-scanned references into the sidecar launch "
             + "as value-in-environment (status \(combined.status), out \"\(combined.out)\", "
             + "err \"\(combined.err)\")")
@@ -1430,8 +1447,12 @@ do {
     try FileManager.default.createSymbolicLink(atPath: envrcPath, withDestinationPath: deadTarget)
     check(!FileManager.default.fileExists(atPath: envrcPath),
           "stale-link fixture: the planted link dangles into a vanished session")
-    let reclaimed = runInProject(["exec", "/bin/cat", ".envrc"])
-    check(reclaimed.status == 0 && reclaimed.out == secret,
+    let reclaimed = runInProject([
+        "exec", "--", "/bin/sh", "-c",
+        "test \"$(cat .envrc)\" = 'export SECRET_TOKEN=exec-sidecar-synthetic\nuse_flake' "
+            + "&& printf reclaimed-ok",
+    ])
+    check(reclaimed.status == 0 && reclaimed.out == "reclaimed-ok",
           "csec exec reclaims a dangling protected link from a hard-killed run and still "
             + "materializes the file (status \(reclaimed.status), out \"\(reclaimed.out)\", "
             + "err \"\(reclaimed.err)\")")
@@ -2606,13 +2627,29 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
         check(false, "unrelated-process inherited-fd probe runs (\(error))")
     }
 
-    // Explicit --set injects a named reference into the child.
+    // Explicit --set injects a named reference into the child. The comparison
+    // happens inside the child so the default output guard has nothing to redact.
     let explicit = runCsec(
+        ["exec", "--set", "TESTVAR=op://demo/db/url", "--", "/bin/sh", "-c",
+         "test \"$TESTVAR\" = 'postgres://s3cr3t' && printf explicit-ok"],
+        extraEnv: [:]
+    )
+    check(explicit.status == 0 && explicit.out == "explicit-ok",
+          "csec exec --set injects the resolved value (got status \(explicit.status), out \"\(explicit.out)\", err \"\(explicit.err)\")")
+
+    // Without any --redact-output flag, a resolved value printed to a captured
+    // stdout must come back as a label: `always` is the default, not `tty`.
+    let defaultGuarded = runCsec(
         ["exec", "--set", "TESTVAR=op://demo/db/url", "--", "/bin/sh", "-c", "printf %s \"$TESTVAR\""],
         extraEnv: [:]
     )
-    check(explicit.status == 0 && explicit.out == "postgres://s3cr3t",
-          "csec exec --set injects the resolved value (got status \(explicit.status), out \"\(explicit.out)\", err \"\(explicit.err)\")")
+    check(defaultGuarded.status == 0
+          && defaultGuarded.out == "[csec:secret-1]"
+          && defaultGuarded.err.contains("protected output detected and redacted")
+          && !defaultGuarded.out.contains("postgres://s3cr3t")
+          && !defaultGuarded.err.contains("postgres://s3cr3t"),
+          "the default output guard redacts piped output without an explicit flag "
+            + "(status \(defaultGuarded.status), out \"\(defaultGuarded.out)\", err \"\(defaultGuarded.err)\")")
 
     let mixedProviders = runCsec(
         [
@@ -2846,15 +2883,16 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
         + "event=\(automaticTTY.out.contains("protected output detected and redacted")), "
         + "raw=\(automaticTTY.out.contains("postgres://s3cr3t")))"
     check(automaticTTYPassed,
-          "default tty mode allocates a child PTY and automatically redacts terminal output"
+          "the default guard allocates a child PTY and automatically redacts terminal output"
               + automaticTTYDiagnostics)
 
     // Env-scan: a reference already in the environment is resolved in place.
     let scanned = runCsec(
-        ["exec", "--", "/bin/sh", "-c", "printf %s \"$TESTVAR\""],
+        ["exec", "--", "/bin/sh", "-c",
+         "test \"$TESTVAR\" = 'postgres://s3cr3t' && printf scanned-ok"],
         extraEnv: ["TESTVAR": "op://demo/db/url"]
     )
-    check(scanned.status == 0 && scanned.out == "postgres://s3cr3t",
+    check(scanned.status == 0 && scanned.out == "scanned-ok",
           "csec exec env-scan resolves an op:// value already in the environment (got status \(scanned.status), out \"\(scanned.out)\", err \"\(scanned.err)\")")
 
     // A plain URL in the environment must be passed through untouched.

@@ -56,7 +56,7 @@ func usage() -> Never {
     usage:
       csec get <reference> [--reason <text>] [--for <seconds>]
       csec exec [--reason <text>] [--for <seconds>] [--set NAME=<reference>]…
-                [--redact-output=tty|always|never]
+                [--redact-output=always|tty|never]
                 [--redact-output-label=opaque|reference] [--redact-short-values]
                 -- <cmd> [args…]
       csec session -- <cmd> [args…]
@@ -70,14 +70,14 @@ func usage() -> Never {
       csec exec-fd [--reason <text>] [--for <seconds>]
                    (--fd ENV_NAME=<reference> |
                     --preset {pgpass|kubeconfig|aws-shared-credentials|google-service-account}=<reference>)…
-                   [--redact-output=tty|always|never]
+                   [--redact-output=always|tty|never]
                    [--redact-output-label=opaque|reference] [--redact-short-values]
                    -- <cmd> [args…]
       csec exec-file [--reason <text>] [--for <seconds>] [--hard-ttl]
                      (--file ENV_NAME=<reference> | --gh-config <reference>)…
                      [--github-host <host>] [--github-user <login>]
                      [--github-git-protocol https|ssh]
-                     [--redact-output=tty|always|never]
+                     [--redact-output=always|tty|never]
                      [--redact-output-label=opaque|reference] [--redact-short-values]
                      -- <cmd> [args…]
       csec bridge
@@ -119,11 +119,11 @@ func usage() -> Never {
                *.csec sidecars (from csec protect), csec instead materializes each
                protected file back at its original path for the wrapped tree on
                root-owned tmpfs (the same boundary as exec-file). Resolved values
-               appearing in the child's output are masked when stdout/stderr is a
-               terminal (the default, --redact-output=tty); piped or redirected
-               output passes through unmasked, with a warning. Pass
-               --redact-output=always to also mask output captured by pipes,
-               files, and logs.
+               appearing in the child's output are masked everywhere by default
+               (--redact-output=always): terminals, pipes, and captured logs.
+               --redact-output=tty limits masking to terminal output, and
+               --redact-output=never disables masking for an explicitly
+               byte-exact stream.
     session    Register a kernel-verified broad grant root, then run <cmd> at the same PID.
     creds      Serve AWS credential_process or Git credential-helper output via a private pipe.
     exec-fd    Give a child anonymous single-open secret files at /dev/fd/N. Presets set

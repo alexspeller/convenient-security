@@ -339,9 +339,10 @@ Files are unlinked when the complete capability-GID process tree exits or the
 authorization expires. `--hard-ttl` also terminates the complete tree at expiry;
 without it, expiry cannot revoke a descriptor the authorized consumer already
 opened. Launcher death, explicit cancellation, and output-scanner failure
-terminate the capability tree. Terminal output is supervised and masked by
-default; use `--redact-output=always` for captured stdout/stderr. An authorized
-consumer can always disclose what it reads.
+terminate the capability tree. Supervised output is masked everywhere by
+default — terminals, pipes, and captured stdout/stderr (`--redact-output=tty`
+limits masking to terminals; `never` disables it). An authorized consumer can
+always disclose what it reads.
 
 The GitHub mode creates only a protected `GH_CONFIG_DIR/hosts.yml`, refuses
 ambient GitHub token variables or existing config/keyring authority before
@@ -467,12 +468,13 @@ policy-capped sessions (15 minutes for high and 5 for critical).
 ## Keeping secrets out of AI tool output
 
 If you use Claude Code or Codex, a stray `echo $TOKEN` or a verbose log line can
-feed a live secret straight into an AI context. Two opt-in controls guard against
+feed a live secret straight into an AI context. Two controls guard against
 that:
 
 ```sh
-# Mask resolved values from a supervised command's stdout/stderr:
-csec exec --redact-output=always -- bin/rspec
+# Resolved values are masked from a supervised command's stdout/stderr by
+# default, whether it writes to a terminal, a pipe, or a captured log:
+csec exec -- bin/rspec
 
 # Scan an AI-issued Bash command's output against the daemon's registry of
 # recently-released values, failing closed if scanning can't run:
