@@ -72,15 +72,76 @@ public enum ProtectedFileRendering: Codable, Sendable, Equatable {
     }
 }
 
-/// One value-to-file mapping. `relativePath` and `environmentRelativePath` are
-/// interpreted only beneath the already-open tmpfs launch directory.
+/// How a materialized `tmpfs` file is surfaced to the launched process tree. The
+/// tmpfs bytes and their `root:<launch-gid>` isolation are identical either way;
+/// only the naming the tool sees differs. Modelled as an enum so a binding cannot
+/// simultaneously claim both an environment variable and a symlink target, or
+/// neither — the privileged validators never have to reject an impossible combo.
+public enum ProtectedFileDelivery: Codable, Sendable, Equatable {
+    /// rootd points `name` at `<session>/relativePath` in the child environment.
+    /// `relativePath` is the env-visible subpath: the file itself for a raw
+    /// payload, or a containing directory for a profile such as `GH_CONFIG_DIR`.
+    case environment(name: String, relativePath: String)
+    /// The launcher — never rootd, which must not write outside its mount — symlinks
+    /// `<project>/projectRelativePath` to the tmpfs file at the binding's
+    /// `relativePath`. rootd materializes the file and sets no environment entry.
+    case symlink(projectRelativePath: String)
+
+    private enum CodingKeys: String, CodingKey { case kind, name, relativePath, projectRelativePath }
+    private enum Kind: String, Codable { case environment, symlink }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Kind.self, forKey: .kind) {
+        case .environment:
+            self = .environment(
+                name: try container.decode(String.self, forKey: .name),
+                relativePath: try container.decode(String.self, forKey: .relativePath)
+            )
+        case .symlink:
+            self = .symlink(
+                projectRelativePath: try container.decode(String.self, forKey: .projectRelativePath)
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .environment(name, relativePath):
+            try container.encode(Kind.environment, forKey: .kind)
+            try container.encode(name, forKey: .name)
+            try container.encode(relativePath, forKey: .relativePath)
+        case let .symlink(projectRelativePath):
+            try container.encode(Kind.symlink, forKey: .kind)
+            try container.encode(projectRelativePath, forKey: .projectRelativePath)
+        }
+    }
+}
+
+/// One value-to-file mapping. `relativePath` (the actual tmpfs file) and, for
+/// environment delivery, its env-visible subpath are interpreted only beneath the
+/// already-open tmpfs launch directory. `delivery` decides how the launched tree
+/// reaches the file.
 public struct ProtectedFileBinding: Codable, Sendable, Equatable {
     public let relativePath: String
-    public let environmentName: String
-    public let environmentRelativePath: String
     public let reference: String
     public let rendering: ProtectedFileRendering
+    public let delivery: ProtectedFileDelivery
 
+    public init(
+        relativePath: String,
+        reference: String,
+        rendering: ProtectedFileRendering = .raw,
+        delivery: ProtectedFileDelivery
+    ) {
+        self.relativePath = relativePath
+        self.reference = reference
+        self.rendering = rendering
+        self.delivery = delivery
+    }
+
+    /// Back-compatible convenience for an environment-delivered binding.
     public init(
         relativePath: String,
         environmentName: String,
@@ -88,11 +149,33 @@ public struct ProtectedFileBinding: Codable, Sendable, Equatable {
         reference: String,
         rendering: ProtectedFileRendering = .raw
     ) {
-        self.relativePath = relativePath
-        self.environmentName = environmentName
-        self.environmentRelativePath = environmentRelativePath ?? relativePath
-        self.reference = reference
-        self.rendering = rendering
+        self.init(
+            relativePath: relativePath,
+            reference: reference,
+            rendering: rendering,
+            delivery: .environment(
+                name: environmentName,
+                relativePath: environmentRelativePath ?? relativePath
+            )
+        )
+    }
+
+    /// The environment variable this binding sets, or nil when it is symlinked.
+    public var environmentName: String? {
+        if case let .environment(name, _) = delivery { return name }
+        return nil
+    }
+
+    /// The env-visible tmpfs subpath, or nil when this binding is symlinked.
+    public var environmentRelativePath: String? {
+        if case let .environment(_, relativePath) = delivery { return relativePath }
+        return nil
+    }
+
+    /// The project-relative path the launcher symlinks, or nil for env delivery.
+    public var symlinkTarget: String? {
+        if case let .symlink(projectRelativePath) = delivery { return projectRelativePath }
+        return nil
     }
 
     public static func raw(
@@ -121,6 +204,22 @@ public struct ProtectedFileBinding: Codable, Sendable, Equatable {
             rendering: .githubHosts(host: host, user: user, gitProtocol: gitProtocol)
         )
     }
+
+    /// A sidecar-materialized whole file: rendered raw into `tmpfs` at `files/…`
+    /// and surfaced to the tree by a launcher-installed symlink at its project
+    /// path. `index` keeps each launch's tmpfs file names distinct.
+    public static func symlink(
+        projectRelativePath: String,
+        reference: String,
+        index: Int
+    ) -> ProtectedFileBinding {
+        ProtectedFileBinding(
+            relativePath: "files/protected-\(index)",
+            reference: reference,
+            rendering: .raw,
+            delivery: .symlink(projectRelativePath: projectRelativePath)
+        )
+    }
 }
 
 /// Complete, bounded, plaintext-free root launch request. Both signed parties
@@ -130,7 +229,10 @@ public struct ProtectedLaunchPlan: Codable, Sendable, Equatable {
     public static let maximumArguments = 256
     public static let maximumEnvironmentEntries = 512
     public static let maximumMetadataBytes = 1024 * 1024
-    public static let maximumFiles = 16
+    // A whole project's protected files must fit one launch; a sidecar tree is
+    // larger than the handful of `--file` flags the earlier tiers used. This stays
+    // far below the tmpfs node bound (2048) even with per-file intermediate dirs.
+    public static let maximumFiles = 64
 
     public let protocolVersion: Int
     public let launcherPID: pid_t
@@ -239,39 +341,54 @@ public struct ProtectedLaunchPlan: Codable, Sendable, Equatable {
 
         var paths = Set<String>()
         var environmentNames = Set<String>()
+        var symlinkTargets = Set<String>()
         for binding in files {
             guard Self.validRelativePath(binding.relativePath, allowDirectory: false),
-                  Self.validRelativePath(binding.environmentRelativePath, allowDirectory: true),
-                  binding.relativePath == binding.environmentRelativePath
-                    || binding.relativePath.hasPrefix(binding.environmentRelativePath + "/"),
-                  Self.validEnvironmentName(binding.environmentName),
-                  !binding.environmentName.hasPrefix("CSEC_"),
-                  environment[binding.environmentName] == nil,
                   paths.insert(binding.relativePath).inserted,
-                  environmentNames.insert(binding.environmentName).inserted,
                   binding.reference.utf8.count <= 4_096,
                   !binding.reference.utf8.contains(0),
                   (try? SecretRef(binding.reference)) != nil else {
                 throw ProtectedFileDeliveryError.invalidFileBinding
             }
-            metadataBytes += binding.relativePath.utf8.count
-                + binding.environmentName.utf8.count
-                + binding.environmentRelativePath.utf8.count
-                + binding.reference.utf8.count
-            switch binding.rendering {
-            case .raw:
-                guard binding.environmentRelativePath == binding.relativePath else {
+            metadataBytes += binding.relativePath.utf8.count + binding.reference.utf8.count
+
+            switch binding.delivery {
+            case let .environment(name, environmentRelativePath):
+                guard Self.validRelativePath(environmentRelativePath, allowDirectory: true),
+                      binding.relativePath == environmentRelativePath
+                        || binding.relativePath.hasPrefix(environmentRelativePath + "/"),
+                      Self.validEnvironmentName(name),
+                      !name.hasPrefix("CSEC_"),
+                      environment[name] == nil,
+                      environmentNames.insert(name).inserted else {
                     throw ProtectedFileDeliveryError.invalidFileBinding
                 }
-            case let .githubHosts(host, user, gitProtocol):
-                guard binding.relativePath == "github/hosts.yml",
-                      binding.environmentName == "GH_CONFIG_DIR",
-                      binding.environmentRelativePath == "github",
-                      Self.validGitHubHost(host),
-                      user.map(Self.validGitHubUser) ?? true,
-                      gitProtocol == "https" || gitProtocol == "ssh" else {
-                    throw ProtectedFileDeliveryError.invalidGitHubProfile
+                metadataBytes += name.utf8.count + environmentRelativePath.utf8.count
+                switch binding.rendering {
+                case .raw:
+                    guard environmentRelativePath == binding.relativePath else {
+                        throw ProtectedFileDeliveryError.invalidFileBinding
+                    }
+                case let .githubHosts(host, user, gitProtocol):
+                    guard binding.relativePath == "github/hosts.yml",
+                          name == "GH_CONFIG_DIR",
+                          environmentRelativePath == "github",
+                          Self.validGitHubHost(host),
+                          user.map(Self.validGitHubUser) ?? true,
+                          gitProtocol == "https" || gitProtocol == "ssh" else {
+                        throw ProtectedFileDeliveryError.invalidGitHubProfile
+                    }
                 }
+            case let .symlink(projectRelativePath):
+                // A sidecar file is materialized byte-for-byte, so only raw
+                // rendering is meaningful and the tmpfs file is the exact symlink
+                // target; a profile rendering here is a misconfigured binding.
+                guard case .raw = binding.rendering,
+                      Self.validProjectRelativePath(projectRelativePath),
+                      symlinkTargets.insert(projectRelativePath).inserted else {
+                    throw ProtectedFileDeliveryError.invalidFileBinding
+                }
+                metadataBytes += projectRelativePath.utf8.count
             }
         }
         let orderedPaths = paths.sorted()
@@ -318,6 +435,26 @@ public struct ProtectedLaunchPlan: Codable, Sendable, Equatable {
                     asciiAlpha($0) || (48...57).contains($0)
                         || $0 == 45 || $0 == 46 || $0 == 95
                 }
+        }
+    }
+
+    /// A project-relative symlink target — where a sidecar-materialized file must
+    /// reappear for the launched tree. Unlike the tmpfs `relativePath`, this names
+    /// a real file in the user's project, so it permits a single component
+    /// (`.envrc`) and a wider character set, but still forbids absolute paths,
+    /// empty components, `.`/`..` traversal, NUL and control characters, and bounds
+    /// length and depth. The launcher additionally creates it descriptor-relative
+    /// to the project root with no symlink following, so a valid path still cannot
+    /// escape the subtree.
+    public static func validProjectRelativePath(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 1024,
+              !value.hasPrefix("/"), !value.utf8.contains(0) else { return false }
+        let components = value.split(separator: "/", omittingEmptySubsequences: false)
+        guard !components.isEmpty, components.count <= 8 else { return false }
+        return components.allSatisfy { component in
+            !component.isEmpty && component != "." && component != ".."
+                && component.utf8.count <= 255
+                && component.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value != 0x7f }
         }
     }
 

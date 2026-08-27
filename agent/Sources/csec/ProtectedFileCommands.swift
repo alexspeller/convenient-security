@@ -153,7 +153,9 @@ func runExecFile(_ arguments: [String]) -> Never {
         var environment = ProtectedLaunchPlan.sanitizedEnvironment(
             ProcessInfo.processInfo.environment
         )
-        for binding in bindings { environment.removeValue(forKey: binding.environmentName) }
+        for binding in bindings {
+            if let name = binding.environmentName { environment.removeValue(forKey: name) }
+        }
         if githubReference != nil {
             for name in [
                 "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",

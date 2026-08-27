@@ -285,27 +285,35 @@ public final class ProtectedFileStore: @unchecked Sendable {
         bindings: [ProtectedFileBinding],
         payloads: [ProtectedFilePayload]
     ) throws -> ProtectedFileSession {
+        // Env names and symlink targets each occupy their own namespace; a name
+        // is only unique among the bindings that actually use it. This mirrors the
+        // plan validator but is re-run here so the file store rejects a malformed
+        // batch even when called without plan validation.
+        let environmentNames = bindings.compactMap(\.environmentName)
+        let symlinkTargets = bindings.compactMap(\.symlinkTarget)
         guard UUID(uuidString: nonce) != nil,
               !bindings.isEmpty,
               bindings.count <= ProtectedLaunchPlan.maximumFiles,
               payloads.map(\.relativePath) == bindings.map(\.relativePath),
               Set(payloads.map(\.relativePath)).count == payloads.count,
-              Set(bindings.map(\.environmentName)).count == bindings.count,
+              Set(environmentNames).count == environmentNames.count,
+              Set(symlinkTargets).count == symlinkTargets.count,
               bindings.allSatisfy({ binding in
-                  ProtectedLaunchPlan.validRelativePath(
+                  guard ProtectedLaunchPlan.validRelativePath(
                       binding.relativePath,
                       allowDirectory: false
-                  )
-                      && ProtectedLaunchPlan.validRelativePath(
-                          binding.environmentRelativePath,
-                          allowDirectory: true
-                      )
-                      && (binding.relativePath == binding.environmentRelativePath
-                          || binding.relativePath.hasPrefix(
-                              binding.environmentRelativePath + "/"
-                      ))
-                      && ProtectedLaunchPlan.validEnvironmentName(binding.environmentName)
-                      && !binding.environmentName.hasPrefix("CSEC_")
+                  ) else { return false }
+                  switch binding.delivery {
+                  case let .environment(name, environmentRelativePath):
+                      return ProtectedLaunchPlan.validEnvironmentName(name)
+                          && !name.hasPrefix("CSEC_")
+                          && ProtectedLaunchPlan.validRelativePath(
+                              environmentRelativePath, allowDirectory: true)
+                          && (binding.relativePath == environmentRelativePath
+                              || binding.relativePath.hasPrefix(environmentRelativePath + "/"))
+                  case let .symlink(projectRelativePath):
+                      return ProtectedLaunchPlan.validProjectRelativePath(projectRelativePath)
+                  }
               }),
               payloads.allSatisfy({
                   !$0.data.isEmpty
@@ -356,8 +364,15 @@ public final class ProtectedFileStore: @unchecked Sendable {
             close(sessionFD)
             sessionFD = -1
             let prefix = (mountPath as NSString).appendingPathComponent(sessionName)
-            let environment = Dictionary(uniqueKeysWithValues: bindings.map {
-                ($0.environmentName, (prefix as NSString).appendingPathComponent($0.environmentRelativePath))
+            // Only environment-delivered bindings set a child variable; a symlink
+            // binding's tmpfs file is reached through the launcher-installed link,
+            // so rootd contributes no environment entry for it.
+            let environment = Dictionary(uniqueKeysWithValues: bindings.compactMap {
+                binding -> (String, String)? in
+                guard case let .environment(name, environmentRelativePath) = binding.delivery else {
+                    return nil
+                }
+                return (name, (prefix as NSString).appendingPathComponent(environmentRelativePath))
             })
             return ProtectedFileSession(
                 nonce: sessionName,

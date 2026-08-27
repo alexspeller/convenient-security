@@ -1181,6 +1181,60 @@ do {
         )
     }
 
+    // Symlink-delivered bindings — the *.csec sidecar whole-file materialization
+    // path. rootd materializes the tmpfs file; the launcher installs the symlink.
+    let symlinkBinding = ProtectedFileBinding.symlink(
+        projectRelativePath: ".envrc",
+        reference: "csec://project/env_home",
+        index: 0
+    )
+    let symlinkPlan = try syntheticProtectedLaunchPlan(files: [symlinkBinding])
+    try symlinkPlan.validate()
+    check(symlinkBinding.environmentName == nil && symlinkBinding.symlinkTarget == ".envrc",
+          "a symlink binding carries a project target and sets no environment name")
+    check(try symlinkPlan.digest() != plan.digest(),
+          "symlink delivery is digest-bound distinctly from environment delivery")
+    let symlinkPayloads = try ProtectedFilePayloadRenderer.render(
+        bindings: [symlinkBinding],
+        values: [symlinkBinding.reference: Data("SECRET=1\n".utf8)]
+    )
+    check(symlinkPayloads.count == 1
+          && symlinkPayloads[0].relativePath == symlinkBinding.relativePath
+          && symlinkPayloads[0].data == Data("SECRET=1\n".utf8),
+          "a symlink binding renders its whole file byte-for-byte")
+    let nestedSymlink = try syntheticProtectedLaunchPlan(files: [
+        ProtectedFileBinding.symlink(
+            projectRelativePath: "config/master.key",
+            reference: "csec://project/master_key",
+            index: 0
+        ),
+    ])
+    try nestedSymlink.validate()
+    for badTarget in ["../escape", "/etc/passwd", "a//b", "with\u{0}nul", "a/../b", "."] {
+        let bad = try syntheticProtectedLaunchPlan(files: [
+            ProtectedFileBinding.symlink(
+                projectRelativePath: badTarget,
+                reference: "csec://project/env_home",
+                index: 0
+            ),
+        ])
+        checkThrows("a symlink target '\(badTarget)' is rejected") { try bad.validate() }
+    }
+    let symlinkProfile = try syntheticProtectedLaunchPlan(files: [ProtectedFileBinding(
+        relativePath: "files/protected-0",
+        reference: "csec://project/env_home",
+        rendering: .githubHosts(host: "github.com", user: nil, gitProtocol: "https"),
+        delivery: .symlink(projectRelativePath: ".envrc")
+    )])
+    checkThrows("a symlink binding must render raw, never a profile") {
+        try symlinkProfile.validate()
+    }
+    let duplicateSymlink = try syntheticProtectedLaunchPlan(files: [
+        ProtectedFileBinding.symlink(projectRelativePath: ".envrc", reference: "csec://project/a", index: 0),
+        ProtectedFileBinding.symlink(projectRelativePath: ".envrc", reference: "csec://project/b", index: 1),
+    ])
+    checkThrows("duplicate symlink targets are rejected") { try duplicateSymlink.validate() }
+
     let rootRequestID = UUID().uuidString.lowercased()
     let rootRequest = RootHelperRequest.prepare(
         requestID: rootRequestID,
@@ -1330,6 +1384,32 @@ do {
     check(!FileManager.default.fileExists(atPath: sessionPath),
           "protected file-store cleanup removes the complete session")
 
+    // A symlink-delivered binding still materializes an isolated tmpfs file but
+    // contributes no child environment entry — the launcher reaches it by symlink.
+    let symlinkStoreNonce = UUID().uuidString.lowercased()
+    let symlinkStoreBinding = ProtectedFileBinding.symlink(
+        projectRelativePath: ".envrc",
+        reference: "csec://project/env_home",
+        index: 0
+    )
+    let symlinkStorePayload = ProtectedFilePayload(
+        relativePath: symlinkStoreBinding.relativePath,
+        data: Data("SECRET=materialized\n".utf8)
+    )
+    let symlinkStoreSession = try store.create(
+        nonce: symlinkStoreNonce,
+        gid: getgid(),
+        bindings: [symlinkStoreBinding],
+        payloads: [symlinkStorePayload]
+    )
+    let symlinkFilePath = mountURL.appendingPathComponent(symlinkStoreNonce)
+        .appendingPathComponent(symlinkStoreBinding.relativePath).path
+    check(symlinkStoreSession.environment.isEmpty
+          && FileManager.default.fileExists(atPath: symlinkFilePath)
+          && (try? Data(contentsOf: URL(fileURLWithPath: symlinkFilePath))) == symlinkStorePayload.data,
+          "a symlink binding materializes its tmpfs file and sets no environment entry")
+    try store.cleanup(nonce: symlinkStoreNonce)
+
     let traversalNonce = UUID().uuidString.lowercased()
     let traversalBinding = ProtectedFileBinding(
         relativePath: "../outside",
@@ -1353,7 +1433,7 @@ do {
 
     let duplicateEnvironmentNonce = UUID().uuidString.lowercased()
     let secondBinding = ProtectedFileBinding.raw(
-        environmentName: binding.environmentName,
+        environmentName: "PROTECTED_FILE",
         reference: "op://regular-file/store/other",
         index: 1
     )
