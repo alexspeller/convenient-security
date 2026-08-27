@@ -204,7 +204,7 @@ Task { @MainActor in
         fail("could not write \(outputPath): \(error)")
     }
     if ProcessInfo.processInfo.environment["CSEC_PREVIEW_DUMP"] != nil {
-        func dump(_ view: NSView, depth: Int) {
+        @MainActor func dump(_ view: NSView, depth: Int) {
             let indent = String(repeating: "  ", count: depth)
             let field = (view as? NSTextField).map { " “\($0.stringValue.prefix(40))”" } ?? ""
             print("\(indent)\(type(of: view)) \(NSIntegralRect(view.frame))\(field)")
