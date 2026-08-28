@@ -5,19 +5,28 @@ import Darwin
 #endif
 
 /// `csec protect [--store NAME] [--keep-plaintext] [--dry-run] <path>...`
+/// `csec protect --env [--store NAME | --dest DEST] [--dry-run] <file>`
 ///
 /// Imports whole plaintext secret files under the current project directory into
 /// the native store's encrypted file/blob tier, replaces each with a tiny
 /// `<name>.csec` sidecar pointing at its `csec://store/key` value, and removes the
 /// now-redundant plaintext.
 ///
-/// Safe by construction: the batch is committed to the encrypted store (durable,
-/// biometric-gated) *before* anything on disk is touched, so the value always
-/// exists in the store before its plaintext is unlinked. Sidecars are then written
-/// atomically, and only after every sidecar is durable is any plaintext removed.
-/// A failure at any point leaves the imported values intact and recoverable.
+/// `--env` instead treats the file as an env file (direnv/.envrc semantics):
+/// an interactive picker chooses which variables to import into a selectable
+/// destination (the native store or 1Password), and the file is rewritten in
+/// place with `csec://`/`op://` references where the plaintext values were.
+/// The file stays a normal non-secret file — no sidecar, nothing unlinked.
+///
+/// Safe by construction: the batch is committed to the destination store
+/// (durable, biometric-gated) *before* anything on disk is touched, so the value
+/// always exists in the store before its plaintext is unlinked or rewritten.
+/// Sidecars and rewrites are written atomically. A failure at any point leaves
+/// the imported values intact and the plaintext recoverable.
 func runProtect(_ arguments: [String]) -> Never {
     var storeOverride: String?
+    var destOverride: String?
+    var envMode = false
     var keepPlaintext = false
     var dryRun = false
     var paths: [String] = []
@@ -29,6 +38,12 @@ func runProtect(_ arguments: [String]) -> Never {
             index += 1
             guard index < arguments.count else { usage() }
             storeOverride = arguments[index]
+        case "--dest":
+            index += 1
+            guard index < arguments.count else { usage() }
+            destOverride = arguments[index]
+        case "--env":
+            envMode = true
         case "--keep-plaintext":
             keepPlaintext = true
         case "--dry-run":
@@ -39,6 +54,23 @@ func runProtect(_ arguments: [String]) -> Never {
             paths.append(arguments[index])
         }
         index += 1
+    }
+    if envMode {
+        guard paths.count == 1 else {
+            protectFail("--env takes exactly one env file")
+        }
+        guard !keepPlaintext else {
+            protectFail("--keep-plaintext does not apply to --env (the file is rewritten in place, never removed)")
+        }
+        guard storeOverride == nil || destOverride == nil else {
+            protectFail("use either --store or --dest, not both")
+        }
+        runProtectEnv(
+            rawPath: paths[0], storeOverride: storeOverride,
+            destOverride: destOverride, dryRun: dryRun)
+    }
+    guard destOverride == nil else {
+        protectFail("--dest requires --env")
     }
     guard !paths.isEmpty else { usage() }
 
@@ -126,6 +158,212 @@ func runProtect(_ arguments: [String]) -> Never {
     }
 }
 
+/// `csec protect --env`: parse the env file, pick variables interactively,
+/// commit them to the chosen destination (Touch ID for the native store,
+/// 1Password's own authorization for op), and only then rewrite the file in
+/// place with references. Any failure before the commit succeeds leaves the
+/// file byte-identical; a failure after it leaves the plaintext file intact
+/// with the values already safely imported (re-running finishes the rewrite).
+private func runProtectEnv(
+    rawPath: String, storeOverride: String?, destOverride: String?, dryRun: Bool
+) -> Never {
+    guard let projectDirectory = canonicalPath(FileManager.default.currentDirectoryPath),
+          projectDirectory.hasPrefix("/") else {
+        protectFail("the current directory could not be determined")
+    }
+
+    // Same containment discipline as blob protect: canonicalize the parent
+    // (never follow a symlinked target), rejoin the base name, require the
+    // result inside the project.
+    let absolute = (rawPath as NSString).isAbsolutePath
+        ? rawPath
+        : (projectDirectory as NSString).appendingPathComponent(rawPath)
+    let parent = (absolute as NSString).deletingLastPathComponent
+    let baseName = (absolute as NSString).lastPathComponent
+    guard let canonicalParent = canonicalPath(parent) else {
+        protectFail("\(rawPath): could not be located")
+    }
+    let canonicalFile = (canonicalParent as NSString).appendingPathComponent(baseName)
+    guard canonicalFile.hasPrefix(projectDirectory + "/") else {
+        protectFail("\(rawPath): must be inside the current project directory")
+    }
+    let relative = String(canonicalFile.dropFirst(projectDirectory.count).drop(while: { $0 == "/" }))
+    guard !relative.isEmpty else {
+        protectFail("\(rawPath): is the project directory, not a file")
+    }
+    guard !relative.hasSuffix(ProtectedFileSidecar.suffix) else {
+        protectFail("\(rawPath): is a csec sidecar, not an env file")
+    }
+
+    let data: Data
+    let original: stat
+    do {
+        (data, original) = try readRegularFile(atPath: canonicalFile)
+    } catch let error as ProtectError {
+        protectFail("\(rawPath): \(error.message)")
+    } catch {
+        protectFail("\(rawPath): \(error.localizedDescription)")
+    }
+    guard !data.isEmpty else {
+        protectFail("\(rawPath): is empty; nothing to protect")
+    }
+
+    let document: EnvFileDocument
+    do {
+        document = try EnvFileDocument(data: data)
+    } catch {
+        protectFail("\(rawPath): \(error)")
+    }
+    guard !document.candidates.isEmpty else {
+        FileHandle.standardOutput.write(Data(
+            "csec protect --env: no env assignments found in \(relative); nothing to do\n".utf8))
+        exit(0)
+    }
+
+    let projectItemTitle = (projectDirectory as NSString).lastPathComponent
+    let defaultSpec: SecretDestinationSpec
+    do {
+        if let destOverride {
+            defaultSpec = try SecretDestinationSpec.parse(
+                destOverride, defaultItemTitle: projectItemTitle)
+        } else if let storeOverride {
+            defaultSpec = .native(try NativeStoreName(storeOverride))
+        } else {
+            defaultSpec = .native(
+                try ProtectedFileImportPlanner.storeName(forProjectDirectory: projectDirectory))
+        }
+    } catch {
+        protectFail("invalid destination (\(error))")
+    }
+
+    let (rows, initiallySelected) = EnvSelectModel.rows(for: document.candidates)
+
+    if dryRun {
+        var out = "csec protect --env (dry run): \(relative)  ->  \(defaultSpec.displayString)\n"
+        for (index, row) in rows.enumerated() {
+            let mark = row.selectable
+                ? (initiallySelected.contains(index) ? "[x]" : "[ ]")
+                : " - "
+            out += "  \(mark) \(row.name)  (\(row.annotation))\n"
+        }
+        out += "  nothing imported, nothing rewritten (dry run)\n"
+        FileHandle.standardOutput.write(Data(out.utf8))
+        exit(0)
+    }
+
+    guard isatty(STDIN_FILENO) == 1, isatty(STDERR_FILENO) == 1 else {
+        protectFail("--env needs an interactive terminal for the picker (use --dry-run to preview)")
+    }
+
+    guard let selectedNames = EnvSelectView.run(rows: rows, initiallySelected: initiallySelected)
+    else {
+        protectFail("cancelled; nothing changed")
+    }
+    guard !selectedNames.isEmpty else {
+        FileHandle.standardOutput.write(Data(
+            "csec protect --env: nothing selected; \(relative) unchanged\n".utf8))
+        exit(0)
+    }
+
+    var values: [String: String] = [:]
+    let candidatesByName = Dictionary(
+        uniqueKeysWithValues: document.candidates.map { ($0.name, $0) })
+    for name in selectedNames {
+        guard let candidate = candidatesByName[name], candidate.kind == .importable else {
+            protectFail("internal error: selected variable \(name) is not importable")
+        }
+        values[name] = candidate.importValue
+    }
+
+    var spec = defaultSpec
+    if destOverride == nil, storeOverride == nil {
+        spec = promptEnvDestination(default: defaultSpec, projectItemTitle: projectItemTitle)
+    }
+
+    let destination: SecretWriteDestination
+    do {
+        destination = try makeSecretWriteDestination(spec: spec, client: makeAgentClient())
+    } catch {
+        protectFail(error.localizedDescription)
+    }
+
+    let selectedSet = Set(selectedNames)
+    let rewriteLineCount = document.assignments.filter {
+        selectedSet.contains($0.name) && !($0.value ?? "").isEmpty
+    }.count
+
+    FileHandle.standardError.write(Data((
+        "\nImport \(values.count) variable(s) into \(destination.summaryLine),\n"
+            + "then rewrite \(relative) in place: \(rewriteLineCount) line(s) get references"
+            + " and their plaintext values are removed from the file.\n").utf8))
+    guard envConfirm("Proceed?") else {
+        protectFail("cancelled; nothing changed")
+    }
+
+    // Commit first. The file is untouched until every value is durable at the
+    // destination.
+    let references: [String: String]
+    do {
+        references = try destination.commit(values: values)
+    } catch {
+        protectFail("import failed; \(relative) was not modified: \(error.localizedDescription)")
+    }
+
+    do {
+        try writeFileAtomically(
+            path: canonicalFile,
+            data: document.rewritten(references: references),
+            mode: mode_t(original.st_mode & 0o7777),
+            guardAgainst: original)
+    } catch let error as ProtectError {
+        protectFail(
+            "the secrets were imported, but \(relative) was not rewritten: \(error.message)\n"
+                + "re-run `csec protect --env \(rawPath)` to finish replacing the plaintext")
+    } catch {
+        protectFail(
+            "the secrets were imported, but \(relative) was not rewritten: "
+                + error.localizedDescription)
+    }
+
+    var report = "csec protect --env: imported \(values.count) variable(s) into "
+        + "\(destination.summaryLine); rewrote \(relative) in place\n"
+    for name in selectedNames {
+        if let reference = references[name] {
+            report += "  \(name)  ->  \(reference)\n"
+        }
+    }
+    FileHandle.standardOutput.write(Data(report.utf8))
+    exit(0)
+}
+
+/// Cooked-mode destination prompt on stderr; Enter accepts the default.
+private func promptEnvDestination(
+    default defaultSpec: SecretDestinationSpec, projectItemTitle: String
+) -> SecretDestinationSpec {
+    for _ in 0..<3 {
+        FileHandle.standardError.write(Data(
+            "Destination [\(defaultSpec.displayString)] (csec://STORE or op://VAULT[/ITEM]): ".utf8))
+        guard let line = readLine(strippingNewline: true) else {
+            protectFail("cancelled; nothing changed")
+        }
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return defaultSpec }
+        do {
+            return try SecretDestinationSpec.parse(trimmed, defaultItemTitle: projectItemTitle)
+        } catch {
+            FileHandle.standardError.write(Data("  \(error)\n".utf8))
+        }
+    }
+    protectFail("no valid destination given; nothing changed")
+}
+
+/// y/N confirmation on stderr (stdout stays clean for the report), default No.
+private func envConfirm(_ prompt: String) -> Bool {
+    FileHandle.standardError.write(Data("\(prompt) [y/N]: ".utf8))
+    guard let line = readLine(strippingNewline: true) else { return false }
+    return line.lowercased() == "y" || line.lowercased() == "yes"
+}
+
 private struct ProtectPlannedFile {
     let originalPath: String
     let relativePath: String
@@ -166,7 +404,8 @@ private func planProtectedFile(
         throw ProtectError(message: "is itself a csec sidecar")
     }
 
-    let (data, mode) = try readRegularFile(atPath: canonicalFile)
+    let (data, info) = try readRegularFile(atPath: canonicalFile)
+    let mode = UInt16(info.st_mode & 0o7777)
     guard !data.isEmpty else {
         throw ProtectError(message: "is empty; nothing to protect")
     }
@@ -183,8 +422,10 @@ private func planProtectedFile(
     )
 }
 
-/// Read a regular, caller-owned, non-symlink file's bytes and POSIX mode.
-private func readRegularFile(atPath path: String) throws -> (data: Data, mode: UInt16) {
+/// Read a regular, caller-owned, non-symlink file's bytes and its stat record
+/// (mode for re-creation, identity/size/mtime for change detection before an
+/// in-place rewrite).
+private func readRegularFile(atPath path: String) throws -> (data: Data, info: stat) {
     let fd = path.withCString { open($0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
     guard fd >= 0 else { throw ProtectError(message: "could not be opened (not a regular file?)") }
     defer { close(fd) }
@@ -208,12 +449,17 @@ private func readRegularFile(atPath path: String) throws -> (data: Data, mode: U
         guard count > 0 else { throw ProtectError(message: "could not be read completely") }
         offset += count
     }
-    return (Data(bytes), UInt16(info.st_mode & 0o7777))
+    return (Data(bytes), info)
 }
 
 /// Write `data` to `path` atomically: a private temp file in the same directory,
-/// fsync'd, then renamed over the destination.
-private func writeFileAtomically(path: String, data: Data, mode: mode_t) throws {
+/// fsync'd, then renamed over the destination. When `guardAgainst` carries the
+/// stat record the content was derived from, the rename is refused if the file
+/// at `path` has changed identity, size, or mtime since — a concurrent editor's
+/// work must not be silently overwritten.
+private func writeFileAtomically(
+    path: String, data: Data, mode: mode_t, guardAgainst original: stat? = nil
+) throws {
     let directory = (path as NSString).deletingLastPathComponent
     let temporary = (directory as NSString)
         .appendingPathComponent(".csec-protect-\(UUID().uuidString.lowercased())")
@@ -237,6 +483,17 @@ private func writeFileAtomically(path: String, data: Data, mode: mode_t) throws 
     }
     guard fchmod(fd, mode) == 0, fsync(fd) == 0 else {
         throw ProtectError(message: "the sidecar could not be persisted")
+    }
+    if let original {
+        var current = stat()
+        guard path.withCString({ stat($0, &current) }) == 0,
+              current.st_dev == original.st_dev,
+              current.st_ino == original.st_ino,
+              current.st_size == original.st_size,
+              current.st_mtimespec.tv_sec == original.st_mtimespec.tv_sec,
+              current.st_mtimespec.tv_nsec == original.st_mtimespec.tv_nsec else {
+            throw ProtectError(message: "the file changed while csec was working; it was left untouched")
+        }
     }
     let renamed = temporary.withCString { source in
         path.withCString { destination in rename(source, destination) }

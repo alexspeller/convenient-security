@@ -3552,6 +3552,11 @@ await hostAuditStreamingTests()
 hostAuditStreamingSocketTests()
 hostAuditRootProtocolTests()
 hostAuditTriageTests()
+secretHeuristicsTests()
+envFileDocumentTests()
+envSelectModelTests()
+secretDestinationSpecTests()
+onePasswordItemWriteTests()
 
 if failures == 0 {
     print("\nAll checks passed.")

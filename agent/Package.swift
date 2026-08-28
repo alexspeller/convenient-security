@@ -37,7 +37,9 @@ let package = Package(
         // The resident agent.
         .executableTarget(name: "csecd", dependencies: ["ConvenientSecurity", "OnePasswordAdapter"]),
         // The signed launcher / CLI.
-        .executableTarget(name: "csec", dependencies: ["ConvenientSecurity"]),
+        // OnePasswordAdapter powers CLI-direct 1Password writes
+        // (protect --env, edit op://…); reads stay in csecd.
+        .executableTarget(name: "csec", dependencies: ["ConvenientSecurity", "OnePasswordAdapter"]),
         // Narrow privileged launcher. It has no Keychain/Touch ID/provider
         // dependencies and accepts only the authenticated two-party protocol.
         .executableTarget(

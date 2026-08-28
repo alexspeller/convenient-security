@@ -140,8 +140,34 @@ public enum OnePasswordCLI {
 
     /// Run `op` with `arguments`, capturing stdout/stderr. Executed off the
     /// cooperative pool so it never blocks an actor. Arguments are passed as an
-    /// array (no shell), so a reference can't cause shell injection.
-    public static func run(_ path: String, _ arguments: [String]) async throws -> Result {
+    /// array (no shell), so a reference can't cause shell injection. `stdin`
+    /// carries anything sensitive (e.g. an item JSON template with field
+    /// values) — argv is visible to every process on the machine, a pipe is
+    /// not.
+    public static func run(
+        _ path: String, _ arguments: [String], stdin input: Data? = nil
+    ) async throws -> Result {
+        try verifyTrusted(path)
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(with: Swift.Result {
+                    try execute(path, arguments, stdin: input)
+                })
+            }
+        }
+    }
+
+    /// Synchronous variant for the CLI's sequential command flows (e.g.
+    /// `csec protect --env` writing to 1Password). Same trust re-check and
+    /// sanitized environment; blocks the calling thread until `op` exits.
+    public static func runSync(
+        _ path: String, _ arguments: [String], stdin input: Data? = nil
+    ) throws -> Result {
+        try verifyTrusted(path)
+        return try execute(path, arguments, stdin: input)
+    }
+
+    private static func verifyTrusted(_ path: String) throws {
         #if DEBUG
         let isExplicitTestOverride = ProcessInfo.processInfo.environment["OP_CLI_PATH"] == path
         #else
@@ -150,36 +176,51 @@ public enum OnePasswordCLI {
         guard isExplicitTestOverride || trustReport(for: path).trusted else {
             throw OnePasswordCLIError.untrustedExecutable
         }
-        return try await withCheckedThrowingContinuation { continuation in
+    }
+
+    private static func execute(
+        _ path: String, _ arguments: [String], stdin input: Data?
+    ) throws -> Result {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.environment = sanitizedEnvironment()
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        let inPipe: Pipe?
+        if input != nil {
+            let pipe = Pipe()
+            process.standardInput = pipe
+            inPipe = pipe
+        } else {
+            inPipe = nil
+        }
+
+        try process.run()
+
+        if let input, let inPipe {
+            // Feed stdin from another queue while this one drains the outputs,
+            // so a template larger than the pipe buffer can't deadlock. If op
+            // exits without reading, the write must fail with EPIPE, not raise
+            // SIGPIPE.
+            let writeHandle = inPipe.fileHandleForWriting
+            _ = fcntl(writeHandle.fileDescriptor, F_SETNOSIGPIPE, 1)
             DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: path)
-                process.arguments = arguments
-                process.environment = sanitizedEnvironment()
-
-                let outPipe = Pipe()
-                let errPipe = Pipe()
-                process.standardOutput = outPipe
-                process.standardError = errPipe
-
-                do {
-                    try process.run()
-                } catch {
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                // op's output (a secret value, or a short error) is small, so
-                // draining stdout then stderr to EOF cannot fill the pipe buffers.
-                let out = outPipe.fileHandleForReading.readDataToEndOfFile()
-                let err = errPipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-
-                continuation.resume(returning: Result(
-                    status: process.terminationStatus, stdout: out, stderr: err
-                ))
+                try? writeHandle.write(contentsOf: input)
+                try? writeHandle.close()
             }
         }
+
+        // op's output (a secret value, or a short error) is small, so
+        // draining stdout then stderr to EOF cannot fill the pipe buffers.
+        let out = outPipe.fileHandleForReading.readDataToEndOfFile()
+        let err = errPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+
+        return Result(status: process.terminationStatus, stdout: out, stderr: err)
     }
 }
 

@@ -1357,6 +1357,303 @@ do {
     check(false, "csec protect end-to-end succeeds (\(error))")
 }
 
+// `csec protect --env` end to end: drive the real picker through a PTY with
+// scripted keystrokes, and prove the safety ordering — values durable in the
+// store, then an in-place rewrite that leaves every untouched byte identical.
+func runCsecPipedAt(
+    cwd: String, _ arguments: [String], input: Data, extraEnv: [String: String] = [:]
+) -> (status: Int32, out: String, err: String) {
+    let process = Process()
+    process.executableURL = csecURL
+    process.arguments = arguments
+    process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+    var environment = ProcessInfo.processInfo.environment
+    environment["CSEC_SOCKET"] = socketPath
+    for (key, value) in extraEnv { environment[key] = value }
+    process.environment = environment
+    let inputPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
+    process.standardInput = inputPipe
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+    do {
+        try process.run()
+    } catch {
+        return (-1, "", "spawn failed: \(error)")
+    }
+    inputPipe.fileHandleForWriting.write(input)
+    inputPipe.fileHandleForWriting.closeFile()
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return (
+        process.terminationStatus,
+        String(data: outData, encoding: .utf8) ?? "",
+        String(data: errData, encoding: .utf8) ?? ""
+    )
+}
+
+/// Like `runCsecInPTY` but with a working directory and scripted keystrokes:
+/// the bytes land in the PTY input queue, so the raw-mode picker, the cooked
+/// destination prompt, and the y/N confirmation all consume them in turn.
+/// stdout and stderr are merged by the PTY.
+func runCsecInPTYAt(
+    cwd: String, _ arguments: [String], keystrokes: String
+) -> (status: Int32, out: String, err: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
+    process.arguments = [
+        "-q", "/dev/null", "/bin/sh", "-c",
+        "stty rows 37 cols 113; exec \"$@\"", "csec-pty", csecURL.path,
+    ] + arguments
+    process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+    var environment = ProcessInfo.processInfo.environment
+    environment["CSEC_SOCKET"] = socketPath
+    process.environment = environment
+    let inputPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
+    process.standardInput = inputPipe
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+    do {
+        try process.run()
+    } catch {
+        return (-1, "", "spawn failed: \(error)")
+    }
+    inputPipe.fileHandleForWriting.write(Data(keystrokes.utf8))
+    inputPipe.fileHandleForWriting.closeFile()
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return (
+        process.terminationStatus,
+        String(data: outData, encoding: .utf8) ?? "",
+        String(data: errData, encoding: .utf8) ?? ""
+    )
+}
+
+/// Expect-style PTY driver for prompts that must never echo: each step's
+/// `send` bytes are written only after its `expect` marker has appeared in the
+/// merged PTY output — by which point the command has already turned echo off.
+/// stdin stays open until the process exits, so script(1) never relays an
+/// early EOF (^D) into the input queue mid-flow.
+func runCsecExpectInPTY(
+    cwd: String, _ arguments: [String], steps: [(expect: String, send: String)]
+) -> (status: Int32, out: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
+    process.arguments = [
+        "-q", "/dev/null", "/bin/sh", "-c",
+        "stty rows 37 cols 113; exec \"$@\"", "csec-pty", csecURL.path,
+    ] + arguments
+    process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+    var environment = ProcessInfo.processInfo.environment
+    environment["CSEC_SOCKET"] = socketPath
+    process.environment = environment
+    let inputPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
+    process.standardInput = inputPipe
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+    do {
+        try process.run()
+    } catch {
+        return (-1, "spawn failed: \(error)")
+    }
+    let watchdog = DispatchWorkItem { process.terminate() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: watchdog)
+    var collected = Data()
+    var remaining = steps
+    while true {
+        let chunk = outPipe.fileHandleForReading.availableData
+        if chunk.isEmpty { break }
+        collected.append(chunk)
+        while let step = remaining.first,
+              String(decoding: collected, as: UTF8.self).contains(step.expect) {
+            remaining.removeFirst()
+            inputPipe.fileHandleForWriting.write(Data(step.send.utf8))
+        }
+    }
+    inputPipe.fileHandleForWriting.closeFile()
+    process.waitUntilExit()
+    watchdog.cancel()
+    return (process.terminationStatus, String(decoding: collected, as: UTF8.self))
+}
+
+do {
+    let projectDir = NSTemporaryDirectory()
+        + "csec-protect-env-e2e-\(UUID().uuidString.lowercased())"
+    try FileManager.default.createDirectory(
+        atPath: projectDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: projectDir) }
+    let envPath = projectDir + "/.envrc"
+    let fixture = """
+    # Service configuration
+    PORT=3000
+    export SLACK_TOKEN=xoxb-e2e-1234567890abcdef
+    # DB_PASSWORD=commented-out-password
+    API_KEY="quoted-secret-value" # trailing note
+    EXISTING_REF=csec://somestore/EXISTING_REF
+    BAD_INTERP="$HOME/creds"
+    use_flake
+    """
+    let fixtureData = Data(fixture.utf8)
+    try fixtureData.write(to: URL(fileURLWithPath: envPath))
+    let store = "protect-env-e2e"
+
+    // Dry run: metadata only, nothing touched, no value ever printed.
+    let dryRun = runCsecPipedAt(
+        cwd: projectDir, ["protect", "--env", "--store", store, "--dry-run", ".envrc"],
+        input: Data())
+    check(dryRun.status == 0
+          && dryRun.out.contains("[x] SLACK_TOKEN")
+          && dryRun.out.contains("[x] API_KEY")
+          && dryRun.out.contains("[ ] PORT")
+          && dryRun.out.contains("[ ] DB_PASSWORD")
+          && dryRun.out.contains("commented")
+          && dryRun.out.contains("already csec://")
+          && dryRun.out.contains("unsupported value")
+          && !dryRun.out.contains("xoxb-e2e")
+          && !dryRun.out.contains("quoted-secret-value")
+          && !dryRun.out.contains("commented-out-password"),
+          "protect --env --dry-run lists metadata only, with heuristic preselection")
+    check((try? Data(contentsOf: URL(fileURLWithPath: envPath))) == fixtureData,
+          "protect --env --dry-run leaves the file byte-identical")
+
+    // Without a terminal the picker refuses rather than guessing.
+    let nonTTY = runCsecPipedAt(
+        cwd: projectDir, ["protect", "--env", "--store", store, ".envrc"], input: Data())
+    check(nonTTY.status == 1 && nonTTY.err.contains("interactive terminal"),
+          "protect --env without a TTY fails with a clear message")
+    check((try? Data(contentsOf: URL(fileURLWithPath: envPath))) == fixtureData,
+          "protect --env without a TTY leaves the file byte-identical")
+
+    // Cancelling the picker changes nothing.
+    let cancelled = runCsecInPTYAt(
+        cwd: projectDir, ["protect", "--env", "--store", store, ".envrc"], keystrokes: "q")
+    check(cancelled.status == 1 && cancelled.out.contains("cancelled"),
+          "protect --env picker cancel exits nonzero and reports it")
+    check((try? Data(contentsOf: URL(fileURLWithPath: envPath))) == fixtureData,
+          "protect --env picker cancel leaves the file byte-identical")
+
+    // Happy path: accept the preselection (enter), confirm (y). --store is
+    // preset so there is no destination prompt.
+    let imported = runCsecInPTYAt(
+        cwd: projectDir, ["protect", "--env", "--store", store, ".envrc"],
+        keystrokes: "\ry\n")
+    check(imported.status == 0 && imported.out.contains("imported 2 variable(s)"),
+          "protect --env imports the preselected variables (out: \(imported.out.suffix(200)))")
+
+    let expected = """
+    # Service configuration
+    PORT=3000
+    export SLACK_TOKEN="csec://\(store)/SLACK_TOKEN"
+    # DB_PASSWORD=commented-out-password
+    API_KEY="csec://\(store)/API_KEY" # trailing note
+    EXISTING_REF=csec://somestore/EXISTING_REF
+    BAD_INTERP="$HOME/creds"
+    use_flake
+    """
+    let rewritten = try Data(contentsOf: URL(fileURLWithPath: envPath))
+    check(rewritten == Data(expected.utf8),
+          "protect --env rewrites only the selected values; every other byte is identical")
+
+    let resolved = try client.access(
+        references: ["csec://\(store)/SLACK_TOKEN", "csec://\(store)/API_KEY"],
+        reason: "protect --env e2e resolve",
+        ttlSeconds: 3600)
+    check(resolved["csec://\(store)/SLACK_TOKEN"] == Data("xoxb-e2e-1234567890abcdef".utf8)
+          && resolved["csec://\(store)/API_KEY"] == Data("quoted-secret-value".utf8),
+          "the imported env values resolve back through csec:// with full fidelity")
+
+    // The rewritten reference composes with `csec exec` (as direnv would
+    // export it): the child sees the real value in its environment.
+    let execRoundTrip = runCsecPipedAt(
+        cwd: projectDir,
+        ["exec", "--", "/bin/sh", "-c",
+         "test \"$SLACK_TOKEN\" = xoxb-e2e-1234567890abcdef && echo ENV-RESOLVED"],
+        input: Data(),
+        extraEnv: ["SLACK_TOKEN": "csec://\(store)/SLACK_TOKEN"])
+    check(execRoundTrip.status == 0 && execRoundTrip.out.contains("ENV-RESOLVED"),
+          "csec exec resolves the rewritten reference into the child environment "
+              + "(err: \(execRoundTrip.err.suffix(200)))")
+
+    // Re-running now shows the vars as already-references; nothing importable
+    // is preselected.
+    let rerun = runCsecPipedAt(
+        cwd: projectDir, ["protect", "--env", "--store", store, "--dry-run", ".envrc"],
+        input: Data())
+    check(rerun.status == 0
+          && rerun.out.contains("SLACK_TOKEN  (line 3 · already csec://")
+          && !rerun.out.contains("[x]"),
+          "a re-run treats rewritten variables as references, not candidates")
+
+    // The interactive destination prompt: default declined, explicit
+    // csec://STORE typed in.
+    let promptDir = NSTemporaryDirectory()
+        + "csec-protect-env-prompt-\(UUID().uuidString.lowercased())"
+    try FileManager.default.createDirectory(
+        atPath: promptDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: promptDir) }
+    let promptEnvPath = promptDir + "/.env"
+    try Data("SECRET_TOKEN=prompt-e2e-value-123\n".utf8)
+        .write(to: URL(fileURLWithPath: promptEnvPath))
+    let promptStore = "protect-env-e2e-prompt"
+    let prompted = runCsecInPTYAt(
+        cwd: promptDir, ["protect", "--env", ".env"],
+        keystrokes: "\rcsec://\(promptStore)\ny\n")
+    let promptedRewrite = try Data(contentsOf: URL(fileURLWithPath: promptEnvPath))
+    check(prompted.status == 0
+          && promptedRewrite == Data("SECRET_TOKEN=\"csec://\(promptStore)/SECRET_TOKEN\"\n".utf8),
+          "the destination prompt accepts a typed csec:// store "
+              + "(out: \(prompted.out.suffix(200)))")
+
+    // `csec edit <reference>` — stdin pipe: rotate an imported value, create a
+    // brand-new key, and refuse an empty value.
+    let rotated = runCsecPipedAt(
+        cwd: projectDir, ["edit", "csec://\(store)/SLACK_TOKEN"],
+        input: Data("rotated-e2e-value\n".utf8))
+    check(rotated.status == 0 && rotated.out.contains("csec://\(store)/SLACK_TOKEN"),
+          "csec edit <reference> accepts a piped value (err: \(rotated.err.suffix(200)))")
+    let created = runCsecPipedAt(
+        cwd: projectDir, ["edit", "csec://\(store)/BRAND_NEW"],
+        input: Data("fresh-secret-value\n".utf8))
+    check(created.status == 0, "csec edit <reference> creates a missing key")
+    let emptied = runCsecPipedAt(
+        cwd: projectDir, ["edit", "csec://\(store)/SLACK_TOKEN"], input: Data("\n".utf8))
+    check(emptied.status == 1 && emptied.err.contains("empty"),
+          "csec edit <reference> refuses an empty value")
+
+    // `csec edit <reference>` — hidden terminal prompt: typed twice, never
+    // echoed, wrong confirmation refused. Expect-driven so each line is sent
+    // only once its prompt (and therefore echo-off) is in effect.
+    let hidden = runCsecExpectInPTY(
+        cwd: projectDir, ["edit", "csec://\(store)/SLACK_TOKEN"],
+        steps: [
+            (expect: "New value", send: "pty-hidden-value\r"),
+            (expect: "Confirm value", send: "pty-hidden-value\r"),
+        ])
+    check(hidden.status == 0 && !hidden.out.contains("pty-hidden-value"),
+          "the hidden prompt never echoes the value "
+              + "(status \(hidden.status), out: \(hidden.out.suffix(300)))")
+    let mismatch = runCsecExpectInPTY(
+        cwd: projectDir, ["edit", "csec://\(store)/SLACK_TOKEN"],
+        steps: [
+            (expect: "New value", send: "first-attempt\r"),
+            (expect: "Confirm value", send: "second-attempt\r"),
+        ])
+    check(mismatch.status == 1 && mismatch.out.contains("did not match"),
+          "the hidden prompt refuses a mismatched confirmation "
+              + "(status \(mismatch.status), out: \(mismatch.out.suffix(300)))")
+
+    let afterEdits = try client.access(
+        references: ["csec://\(store)/SLACK_TOKEN", "csec://\(store)/BRAND_NEW"],
+        reason: "edit reference e2e resolve",
+        ttlSeconds: 3600)
+    check(afterEdits["csec://\(store)/SLACK_TOKEN"] == Data("pty-hidden-value".utf8)
+          && afterEdits["csec://\(store)/BRAND_NEW"] == Data("fresh-secret-value".utf8),
+          "edited values resolve back with full fidelity")
+} catch {
+    check(false, "csec protect --env end-to-end succeeds (\(error))")
+}
+
 // Full sidecar materialization: protect a file, then `csec exec` in the same
 // project must surface it at its original path so the wrapped child reads the
 // protected bytes — and must tear the link down afterwards.

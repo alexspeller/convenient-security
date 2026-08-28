@@ -88,7 +88,10 @@ func usage() -> Never {
       csec hook claude|codex
       csec hook-config claude|codex
       csec edit [--editor] <store>
+      csec edit <reference>
       csec protect [--store <store>] [--keep-plaintext] [--dry-run] <path>…
+      csec protect --env [--store <store> | --dest <csec://STORE|op://VAULT[/ITEM]>]
+                   [--dry-run] <file>
       csec risk inspect <reference>
       csec risk classify low|standard|high|critical <reference>
       csec risk raise low|standard|high|critical <reference>
@@ -143,12 +146,24 @@ func usage() -> Never {
                each with a tiny <name>.csec sidecar; a later csec exec materializes
                them. The value is durable in the store before any plaintext is removed.
                --keep-plaintext leaves the original in place; --dry-run only reports.
+               --env instead treats one file as an env file (direnv semantics):
+               an interactive picker chooses which variables to import into the
+               native store or 1Password (--dest op://VAULT[/ITEM]), then the file
+               is rewritten in place with csec://-/op://-references — values are
+               durable at the destination before the file is touched, and
+               csec exec resolves the references at run time.
     bridge     Private framed stdin/stdout protocol for language clients; not for terminals.
     tool-exec  Fail-closed AI command broker using csecd's active-value scanner.
     hook       PreToolUse stdin/stdout adapter for Claude Code or Codex.
     hook-config  Print a hook JSON fragment using this exact csec executable.
     edit       Edit a csec:// store as strict JSON. The default built-in editor is
                fileless; --editor uses $EDITOR with a temporary plaintext file.
+               With a full reference (csec://STORE/KEY or op://VAULT/ITEM/FIELD)
+               it sets that one secret instead: on a terminal the value is typed
+               into a hidden prompt (entered twice, never echoed); otherwise it
+               is read from stdin (one trailing newline stripped), so
+               `printf %s VALUE | csec edit csec://store/KEY` works. A missing
+               csec:// key is created; the value never appears in argv or output.
     risk       Inspect or change a logical credential's value-free risk policy.
                classify may set any level; raise cannot lower one; forget resets
                it to fail-safe unknown. Downgrades and forget require Touch ID.
@@ -441,6 +456,14 @@ func runRisk(_ arguments: [String]) -> Never {
 // MARK: - native encrypted store editor
 
 func runEdit(_ arguments: [String]) -> Never {
+    // A full reference selects the single-secret editor; a bare store name
+    // opens the whole-document editor. Store names can never contain "://",
+    // so the two forms are unambiguous. --editor applies only to the
+    // document editor.
+    if arguments.contains(where: { $0.contains("://") }) {
+        guard arguments.count == 1 else { usage() }
+        runEditReference(arguments[0])
+    }
     var useExternalEditor = false
     var storeArgument: String?
     for argument in arguments {

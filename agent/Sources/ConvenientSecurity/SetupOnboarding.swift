@@ -1235,25 +1235,11 @@ public enum LocalSecretDiscoveryEngine {
     }
 
     private static func looksSecretLike(_ name: String) -> Bool {
-        let upper = name.uppercased()
-        let markers = [
-            "TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "PRIVATE_KEY",
-            "ACCESS_KEY", "CREDENTIAL", "AUTH", "SIGNING_KEY", "ENCRYPTION_KEY",
-            "COOKIE", "WEBHOOK", "DATABASE_URL", "REDIS_URL", "DSN",
-        ]
-        return markers.contains { upper.contains($0) }
+        SecretHeuristics.nameLooksSecretLike(name)
     }
 
     private static func isEnvironmentName(_ value: String) -> Bool {
-        let bytes = Array(value.utf8)
-        guard !bytes.isEmpty, bytes.count <= 128 else { return false }
-        guard (bytes[0] >= 65 && bytes[0] <= 90)
-                || (bytes[0] >= 97 && bytes[0] <= 122)
-                || bytes[0] == 95 else { return false }
-        return bytes.allSatisfy {
-            ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
-                || ($0 >= 48 && $0 <= 57) || $0 == 95
-        }
+        SecretHeuristics.isEnvironmentName(value)
     }
 
     private static func isSafeRelativePath(_ value: String) -> Bool {

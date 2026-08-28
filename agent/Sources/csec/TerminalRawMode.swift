@@ -110,6 +110,37 @@ final class TerminalRawMode {
         return poll(&fds, 1, timeoutMillis) > 0
     }
 
+    /// Read a single line without echoing anything (secret entry): no glyphs,
+    /// no masking dots, nothing on screen until the final newline. Collected
+    /// byte-accurately (unlike `readKey`, which drops non-ASCII), so pasted
+    /// UTF-8 secrets survive; backspace removes one UTF-8 scalar. Escape
+    /// sequences (arrows etc.) are swallowed rather than captured into the
+    /// secret. Returns nil on Ctrl-D/EOF with nothing typed.
+    func readHiddenLine(maxBytes: Int) -> Data? {
+        var bytes: [UInt8] = []
+        while true {
+            var byte: UInt8 = 0
+            guard read(STDIN_FILENO, &byte, 1) == 1 else { return nil }
+            switch byte {
+            case 0x0D, 0x0A:
+                FileHandle.standardError.write(Data("\n".utf8))
+                return Data(bytes)
+            case 0x7F, 0x08:
+                while let last = bytes.last, last & 0xC0 == 0x80 { bytes.removeLast() }
+                if !bytes.isEmpty { bytes.removeLast() }
+            case 0x04:
+                if bytes.isEmpty { return nil }
+            case 0x1B:
+                while byteAvailable(timeoutMillis: 25) {
+                    var discarded: UInt8 = 0
+                    guard read(STDIN_FILENO, &discarded, 1) == 1 else { return nil }
+                }
+            default:
+                if bytes.count < maxBytes { bytes.append(byte) }
+            }
+        }
+    }
+
     /// Read a single cooked line (for a triage note): echoes printable characters
     /// and handles backspace, bounded to `maxLength`. Returns nil on Ctrl-C/EOF.
     func readLine(maxLength: Int) -> String? {
