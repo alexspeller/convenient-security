@@ -12,15 +12,25 @@ public enum OutputRedactionRepresentation: String, Codable, Sendable, Hashable {
     case jsonEscaped = "json_escaped"
 }
 
-/// Value-free metadata returned when output was replaced. It is safe to use in
-/// a warning or audit event: neither the secret nor its reference is present.
+/// Metadata returned when output was replaced. The secret value is never
+/// present. The originating reference — value-free metadata the user already
+/// holds in their sidecar/environment — is carried so an opt-in warning can name
+/// which reference was redacted rather than an opaque ordinal.
 public struct OutputRedactionMatch: Codable, Sendable, Hashable {
     public let opaqueID: String
     public let representation: OutputRedactionRepresentation
+    /// Prompt-safe reference URI when the agent knows which reference produced
+    /// this value, else `nil` (opaque ordinal only).
+    public let reference: String?
 
-    public init(opaqueID: String, representation: OutputRedactionRepresentation) {
+    public init(
+        opaqueID: String,
+        representation: OutputRedactionRepresentation,
+        reference: String? = nil
+    ) {
         self.opaqueID = opaqueID
         self.representation = representation
+        self.reference = reference
     }
 }
 
@@ -29,17 +39,23 @@ public struct OutputRedactionMatch: Codable, Sendable, Hashable {
 public struct OutputRedactionPattern: Sendable {
     public let opaqueID: String
     public let representation: OutputRedactionRepresentation
+    /// Prompt-safe reference URI this value resolved from, when known. Surfaced
+    /// only in an opt-in warning; never used to build the replacement bytes for
+    /// an opaque label.
+    public let reference: String?
     fileprivate let bytes: [UInt8]
     fileprivate let replacement: [UInt8]
 
     public init(
         opaqueID: String,
         representation: OutputRedactionRepresentation,
+        reference: String? = nil,
         bytes: Data,
         replacement: Data
     ) {
         self.opaqueID = opaqueID
         self.representation = representation
+        self.reference = reference
         self.bytes = Array(bytes)
         self.replacement = Array(replacement)
     }
@@ -93,14 +109,17 @@ public struct OutputRedactionCatalog: Sendable {
             }
 
             let opaqueID = "secret-\(offset + 1)"
+            // Prompt-safe reference when the entry key is a real reference (the
+            // agent's active-secret registry supplies these); a synthetic
+            // registry key yields nil so callers fall back to the ordinal.
+            let safeReference = (try? SecretRef(entry.reference))?.safeInlineURI
             let replacement: Data
             switch labelStyle {
             case .opaque:
                 replacement = Data("[csec:\(opaqueID)]".utf8)
             case .reference:
-                let safeReference = (try? SecretRef(entry.reference))?.safeInlineURI
-                    ?? "[csec:\(opaqueID)]"
-                replacement = Data(safeReference.utf8)
+                replacement = safeReference.map { Data("[redacted: \($0)]".utf8) }
+                    ?? Data("[csec:\(opaqueID)]".utf8)
             }
 
             for variant in Self.variants(of: entry.bytes) {
@@ -110,6 +129,7 @@ public struct OutputRedactionCatalog: Sendable {
                 let pattern = OutputRedactionPattern(
                     opaqueID: opaqueID,
                     representation: variant.representation,
+                    reference: safeReference,
                     bytes: variant.bytes,
                     replacement: replacement
                 )
@@ -272,7 +292,8 @@ public struct StreamingOutputRedactor: Sendable {
                         output.append(contentsOf: candidate.replacement)
                         matches.append(OutputRedactionMatch(
                             opaqueID: candidate.opaqueID,
-                            representation: candidate.representation
+                            representation: candidate.representation,
+                            reference: candidate.reference
                         ))
                         index = end
                         continue scan

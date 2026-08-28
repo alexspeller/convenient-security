@@ -5,8 +5,15 @@ import Darwin
 
 struct OutputGuardConfiguration {
     var mode: OutputGuardMode = .always
-    var labelStyle: OutputRedactionLabelStyle = .opaque
+    // Default: name the redacted reference in-band as `[redacted: <ref>]`. The
+    // reference is value-free metadata the user already holds in the sidecar or
+    // environment. `--redact-output-label=opaque` restores `[csec:secret-N]`.
+    var labelStyle: OutputRedactionLabelStyle = .reference
     var includeShortValues = false
+    // Per-match "protected output detected and redacted" stderr warnings are
+    // opt-in; the in-band label already shows what was redacted. Enable with
+    // `--redact-output-warn` for scripted/auditable visibility.
+    var emitWarnings = false
 
     var plan: OutputGuardPlan {
         OutputGuardPlan(
@@ -174,10 +181,16 @@ private struct IncidentKey: Hashable {
 }
 
 private final class IncidentReporter {
+    private let emitWarnings: Bool
     private var reported = Set<IncidentKey>()
     private var pending: [GuardedStream: [OutputRedactionMatch]] = [:]
 
+    init(emitWarnings: Bool) {
+        self.emitWarnings = emitWarnings
+    }
+
     func record(_ matches: [OutputRedactionMatch], stream: GuardedStream) {
+        guard emitWarnings else { return }
         for match in matches {
             let key = IncidentKey(stream: stream, match: match)
             guard reported.insert(key).inserted else { continue }
@@ -189,13 +202,14 @@ private final class IncidentReporter {
     /// warning generated after withholding a possible prefix can be inserted in
     /// the middle of an otherwise unrelated terminal line.
     func flush(stream: GuardedStream, addLeadingNewline: Bool = false) {
+        guard emitWarnings else { return }
         guard let matches = pending.removeValue(forKey: stream), !matches.isEmpty else { return }
         if addLeadingNewline {
             _ = writeAll(fd: STDERR_FILENO, data: Data("\n".utf8))
         }
         for match in matches {
             let message = "csec: warning: protected output detected and redacted "
-                + "(\(match.opaqueID), \(stream.rawValue), \(match.representation.rawValue))\n"
+                + "(\(match.reference ?? match.opaqueID), \(stream.rawValue), \(match.representation.rawValue))\n"
             _ = writeAll(fd: STDERR_FILENO, data: Data(message.utf8))
         }
     }
@@ -261,6 +275,7 @@ enum ProcessSupervisor {
         catalog: OutputRedactionCatalog? = nil,
         agentSession: AgentOutputRedactionSession? = nil,
         mode: OutputGuardMode,
+        emitWarnings: Bool = false,
         inheritedFiles: [InheritedSecretFile] = []
     ) throws -> Int32 {
         precondition(inheritedFiles.count <= 32)
@@ -438,7 +453,7 @@ enum ProcessSupervisor {
             ))
         }
 
-        let reporter = IncidentReporter()
+        let reporter = IncidentReporter(emitWarnings: emitWarnings)
         var relayInput = stdinUsesPTY
         var terminalStatus: Int32?
 

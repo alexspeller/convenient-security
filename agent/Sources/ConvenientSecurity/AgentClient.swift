@@ -298,13 +298,15 @@ public struct AgentClient {
     public func beginOutputRedaction(
         destination: DestinationClass,
         streams: [OutputRedactionStream],
-        includeShortValues: Bool = false
+        includeShortValues: Bool = false,
+        labelStyle: OutputRedactionLabelStyle = .opaque
     ) throws -> AgentOutputRedactionSession {
         let connection = try AgentConnection(path: path, serverTrustPolicy: serverTrustPolicy)
         let request = BeginOutputRedactionRequest(
             destination: destination,
             streams: streams,
-            includeShortValues: includeShortValues
+            includeShortValues: includeShortValues,
+            labelStyle: labelStyle
         )
         let response = try connection.send(.beginOutputRedaction(request))
         try Self.check(response: response, requestID: request.requestID)

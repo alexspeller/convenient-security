@@ -70,7 +70,12 @@ The release claim requires all of these invariants together:
   supervised output; a folded-in value-in-environment binding (`--set`/env-scan)
   is by design placed in the child's initial environment by the helper — the same
   weak-compatibility delivery as plain `csec exec`, and still never routed through
-  the launcher or the plan.
+  the launcher or the plan. A redaction that replaces such a value in supervised
+  output substitutes an `[redacted: <reference>]` label naming the reference the
+  value resolved from (or an opaque ordinal under `--redact-output-label=opaque`);
+  the reference is value-free metadata `csecd` already holds — the value itself
+  never appears. The `csec tool-exec` AI broker keeps opaque labels so a redaction
+  does not disclose reference metadata to the AI recipient.
 
 ## Automated source and synthetic evidence
 

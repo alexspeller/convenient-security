@@ -154,17 +154,20 @@ public struct BeginOutputRedactionRequest: Codable, Sendable {
     public let destination: DestinationClass
     public let streams: [OutputRedactionStream]
     public let includeShortValues: Bool
+    public let labelStyle: OutputRedactionLabelStyle
 
     public init(
         destination: DestinationClass,
         streams: [OutputRedactionStream],
         includeShortValues: Bool = false,
+        labelStyle: OutputRedactionLabelStyle = .opaque,
         requestID: UUID = UUID()
     ) {
         self.requestID = requestID.uuidString.lowercased()
         self.destination = destination
         self.streams = streams
         self.includeShortValues = includeShortValues
+        self.labelStyle = labelStyle
     }
 }
 
@@ -398,7 +401,7 @@ extension Request: Codable {
     private enum CodingKeys: String, CodingKey {
         case version, type, requestID, references, reason, ttlSeconds
         case deliveryPlan, deliveryPlanDigest
-        case destination, streams, includeShortValues, sessionID, stream, data, finish
+        case destination, streams, includeShortValues, labelStyle, sessionID, stream, data, finish
         case store, editSessionID, document, mode, externalEditorPath, blobs
         case operation, reference, level
         case protectedLaunchApproval
@@ -444,6 +447,10 @@ extension Request: Codable {
                     Bool.self,
                     forKey: .includeShortValues
                 ) ?? false,
+                labelStyle: try container.decodeIfPresent(
+                    OutputRedactionLabelStyle.self,
+                    forKey: .labelStyle
+                ) ?? .opaque,
                 requestID: try Self.decodeUUID(container, forKey: .requestID)
             ))
         case "redact_output_chunk":
@@ -574,6 +581,7 @@ extension Request: Codable {
             try container.encode(request.destination, forKey: .destination)
             try container.encode(request.streams, forKey: .streams)
             try container.encode(request.includeShortValues, forKey: .includeShortValues)
+            try container.encode(request.labelStyle, forKey: .labelStyle)
         case let .redactOutputChunk(request):
             try container.encode("redact_output_chunk", forKey: .type)
             try container.encode(WireProtocol.version, forKey: .version)

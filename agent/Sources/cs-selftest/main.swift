@@ -2876,8 +2876,10 @@ let referenceRedaction = redact(
     patterns: referenceCatalog.patterns,
     chunks: [Data("synthetic-output-token".utf8)]
 )
-check(referenceRedaction.data == Data("op://Synthetic/Output/token".utf8),
-      "reference-shaped replacement is available only through the opt-in catalog style")
+check(referenceRedaction.data == Data("[redacted: op://Synthetic/Output/token]".utf8),
+      "the default reference-shaped label names the redacted reference in-band")
+check(referenceRedaction.matches.first?.reference == "op://Synthetic/Output/token",
+      "a reference-styled match carries the reference so an opt-in warning can name it")
 
 let unsafeReferenceCatalog = OutputRedactionCatalog(
     valuesByReference: ["op://Synthetic/item/field\nforged\u{202e}": Data("synthetic-control-token".utf8)],
@@ -2887,8 +2889,22 @@ let unsafeReferenceRedaction = redact(
     patterns: unsafeReferenceCatalog.patterns,
     chunks: [Data("synthetic-control-token".utf8)]
 )
-check(unsafeReferenceRedaction.data == Data("op://Synthetic/item/field�forged�".utf8),
+check(unsafeReferenceRedaction.data == Data("[redacted: op://Synthetic/item/field�forged�]".utf8),
       "reference-shaped output cannot inject lines or bidirectional controls")
+
+// An opaque label never carries the reference into the output stream, even
+// though the match metadata still knows it for an opt-in warning.
+let opaqueLabelCatalog = OutputRedactionCatalog(
+    valuesByReference: ["op://Synthetic/Output/token": Data("synthetic-output-token".utf8)],
+    labelStyle: .opaque
+)
+let opaqueLabelRedaction = redact(
+    patterns: opaqueLabelCatalog.patterns,
+    chunks: [Data("synthetic-output-token".utf8)]
+)
+check(opaqueLabelRedaction.data == Data("[csec:secret-1]".utf8)
+      && opaqueLabelRedaction.matches.first?.reference == "op://Synthetic/Output/token",
+      "an opaque label keeps the reference out of output but still in the match metadata")
 
 let collisionSource = "synthetic-collision-source"
 let collisionExact = Data(collisionSource.utf8).base64EncodedString()
@@ -2903,7 +2919,7 @@ let collisionRedaction = redact(
     patterns: collisionCatalog.patterns,
     chunks: [Data(collisionExact.utf8)]
 )
-check(collisionRedaction.data == Data("op://Synthetic/b-exact".utf8)
+check(collisionRedaction.data == Data("[redacted: op://Synthetic/b-exact]".utf8)
       && collisionRedaction.matches.first?.representation == .exact,
       "an exact credential wins over another credential's colliding encoded form")
 

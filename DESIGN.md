@@ -396,15 +396,24 @@ the values it resolved. It replaces exact values and supported canonical
 base64, base64url, percent-encoded, and JSON-escaped representations before
 forwarding owned stdout, stderr, or PTY bytes. Matches spanning read boundaries
 are handled. Values shorter than eight bytes are excluded unless explicitly
-enabled. Opaque labels are the default; reference-shaped labels deliberately
-expose reference metadata.
+enabled. By default a match is replaced in-band with `[redacted: <reference>]`,
+naming the reference the value resolved from — value-free metadata the user
+already holds in the sidecar or environment, so no reference the redaction names
+is new to a reader with access to that output. `--redact-output-label=opaque`
+restores an ordinal `[csec:secret-N]` that keeps the reference out of the output
+stream entirely. Per-match stderr warnings are opt-in (`--redact-output-warn`);
+when enabled they also name the reference. The `csec tool-exec` AI broker is the
+exception: its output recipient is the AI tool rather than the operator's own
+terminal, so it keeps opaque labels and does not hand the AI reference metadata.
 
-`csecd` also keeps a memory-only registry of values released during its current
-lifetime. `csec tool-exec --destination ai` opens a caller-bound streaming
-session before launching a command and sends each output chunk to the daemon.
-Scanner loss stops forwarding and terminates the child. Generated Claude Code
-and Codex PreToolUse adapters rewrite Bash commands through this broker when the
-user installs their configuration fragment.
+`csecd` also keeps a memory-only registry of the values released during its
+current lifetime, each tagged with the reference it resolved from so an
+agent-side redaction (where the plaintext never returns to the launcher) can
+name the reference too. `csec tool-exec --destination ai` opens a caller-bound
+streaming session before launching a command and sends each output chunk to the
+daemon. Scanner loss stops forwarding and terminates the child. Generated Claude
+Code and Codex PreToolUse adapters rewrite Bash commands through this broker when
+the user installs their configuration fragment.
 
 These controls reduce accidental stdout/stderr disclosure. They do not stop
 local reads, network or file writes, alternate descriptors, partial or arbitrary

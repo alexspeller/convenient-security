@@ -47,6 +47,7 @@ public actor Agent {
         var finishedStreams: Set<OutputRedactionStream>
         var registryGeneration: UInt64
         let includeShortValues: Bool
+        let labelStyle: OutputRedactionLabelStyle
         var lastUsedAt: Date
     }
 
@@ -643,7 +644,7 @@ public actor Agent {
             }
         }
         if let activeUntil {
-            activeSecrets.register(values: Array(values.values), expiresAt: activeUntil)
+            activeSecrets.register(valuesByReference: values, expiresAt: activeUntil)
         }
         return Response(
             requestID: requestID,
@@ -1046,7 +1047,8 @@ public actor Agent {
 
         let snapshot = activeSecrets.snapshot(now: now)
         let catalog = OutputRedactionCatalog(
-            valuesByReference: snapshot.valuesByOpaqueID,
+            valuesByReference: snapshot.valuesByReference,
+            labelStyle: request.labelStyle,
             includeShortValues: request.includeShortValues
         )
         let sessionID = UUID().uuidString.lowercased()
@@ -1059,6 +1061,7 @@ public actor Agent {
             finishedStreams: [],
             registryGeneration: snapshot.generation,
             includeShortValues: request.includeShortValues,
+            labelStyle: request.labelStyle,
             lastUsedAt: now
         )
         return Response(
@@ -1096,7 +1099,8 @@ public actor Agent {
         let snapshot = activeSecrets.snapshot(now: now)
         if snapshot.generation != session.registryGeneration {
             let catalog = OutputRedactionCatalog(
-                valuesByReference: snapshot.valuesByOpaqueID,
+                valuesByReference: snapshot.valuesByReference,
+                labelStyle: session.labelStyle,
                 includeShortValues: session.includeShortValues
             )
             for stream in Array(session.redactors.keys) {

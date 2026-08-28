@@ -347,6 +347,8 @@ func runExecFD(_ arguments: [String]) -> Never {
             outputGuard.labelStyle = style
         case "--redact-short-values":
             outputGuard.includeShortValues = true
+        case "--redact-output-warn":
+            outputGuard.emitWarnings = true
         default:
             usage()
         }
@@ -430,6 +432,7 @@ func runExecFD(_ arguments: [String]) -> Never {
             environment: childEnvironment,
             catalog: catalog,
             mode: outputGuard.mode,
+            emitWarnings: outputGuard.emitWarnings,
             inheritedFiles: files
         )
         cs_terminate_like_wait_status(status)
@@ -574,11 +577,6 @@ private func warnForOutputGuard(
                 + "\(OutputRedactionCatalog.minimumAutomaticSecretBytes) bytes are not matched; "
                 + "use --redact-short-values to accept possible false positives\n"
         )
-    }
-    if guardConfiguration.mode != .never,
-       guardConfiguration.labelStyle == .reference,
-       !catalog.patterns.isEmpty {
-        writeError("csec exec-fd: warning: redaction labels will expose secret-reference metadata\n")
     }
 }
 

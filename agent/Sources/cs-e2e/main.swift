@@ -1414,10 +1414,11 @@ do {
     // captured stdout must come back as a label, never plaintext.
     let pipedDefault = runInProject(["exec", "/bin/cat", ".envrc"])
     check(pipedDefault.status == 0
-          && pipedDefault.out.contains("[csec:secret-")
+          && pipedDefault.out.contains("[redacted: csec://")
           && !pipedDefault.out.contains("exec-sidecar-synthetic")
           && !pipedDefault.err.contains("exec-sidecar-synthetic"),
-          "the default output guard redacts a materialized file printed to a pipe "
+          "the default output guard redacts a materialized file printed to a pipe, "
+            + "naming its csec:// reference in-band "
             + "(status \(pipedDefault.status), out \"\(pipedDefault.out)\", "
             + "err \"\(pipedDefault.err)\")")
 
@@ -2526,11 +2527,11 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
     let consentAfterRegularFiles = await consent.calls()
     let resolutionsAfterRegularFiles = await resolutionCounter.calls()
     check(regularFileLeak.status == 0
-          && regularFileLeak.out.hasPrefix("[csec:secret-")
-          && regularFileLeak.out.hasSuffix("]")
+          && regularFileLeak.out.contains("[redacted: op://file-delivery/config/content]")
           && !regularFileLeak.out.contains("regular-file-synthetic-secret")
           && !regularFileLeak.err.contains("regular-file-synthetic-secret"),
-          "exec-file output scanning redacts a protected file deliberately printed by its target "
+          "exec-file output scanning redacts a protected file deliberately printed by its target, "
+            + "naming the reference in-band "
             + "(status=\(regularFileLeak.status), out=\(regularFileLeak.out.debugDescription), "
             + "err=\(regularFileLeak.err.debugDescription))")
     check(consentAfterRegularFiles == consentBeforeRegularFiles + 2
@@ -2548,7 +2549,7 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
     )
     check(regularFilePTY.status == 0
           && regularFilePTY.out.contains("37 113")
-          && regularFilePTY.out.contains("[csec:secret-")
+          && regularFilePTY.out.contains("[redacted: op://file-delivery/config/content]")
           && !regularFilePTY.out.contains("regular-file-synthetic-secret")
           && !regularFilePTY.err.contains("regular-file-synthetic-secret"),
           "exec-file preserves a controlling PTY, terminal size, and guarded output")
@@ -2632,7 +2633,7 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
     )
     check(redactedFD.status != 0
           && redactedFDViaShell.status == 0
-          && redactedFDViaShell.out == "[csec:secret-1]"
+          && redactedFDViaShell.out == "[redacted: op://fd-presets/pgpass/content]"
           && !redactedFDViaShell.out.contains("pgpass-synthetic-secret")
           && !redactedFDViaShell.err.contains("pgpass-synthetic-secret"),
           "exec-fd keeps argv literal and masks a child that deliberately prints the delivered file")
@@ -2691,12 +2692,27 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
         extraEnv: [:]
     )
     check(defaultGuarded.status == 0
-          && defaultGuarded.out == "[csec:secret-1]"
-          && defaultGuarded.err.contains("protected output detected and redacted")
+          && defaultGuarded.out == "[redacted: op://demo/db/url]"
+          && !defaultGuarded.err.contains("protected output detected and redacted")
           && !defaultGuarded.out.contains("postgres://s3cr3t")
           && !defaultGuarded.err.contains("postgres://s3cr3t"),
-          "the default output guard redacts piped output without an explicit flag "
+          "the default output guard names the redacted reference in-band and stays silent on stderr "
             + "(status \(defaultGuarded.status), out \"\(defaultGuarded.out)\", err \"\(defaultGuarded.err)\")")
+
+    // Opting in restores the per-match stderr warning, which now names the
+    // reference rather than an opaque ordinal.
+    let warnedGuarded = runCsec(
+        ["exec", "--redact-output-warn", "--set", "TESTVAR=op://demo/db/url", "--",
+         "/bin/sh", "-c", "printf %s \"$TESTVAR\""],
+        extraEnv: [:]
+    )
+    check(warnedGuarded.status == 0
+          && warnedGuarded.out == "[redacted: op://demo/db/url]"
+          && warnedGuarded.err.contains("protected output detected and redacted")
+          && warnedGuarded.err.contains("op://demo/db/url")
+          && !warnedGuarded.err.contains("postgres://s3cr3t"),
+          "--redact-output-warn emits a stderr warning naming the redacted reference "
+            + "(status \(warnedGuarded.status), out \"\(warnedGuarded.out)\", err \"\(warnedGuarded.err)\")")
 
     let mixedProviders = runCsec(
         [
@@ -2722,9 +2738,9 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
         extraEnv: [:]
     )
     check(guarded.status == 0
-          && guarded.out == "[csec:secret-1]"
-          && guarded.err.contains("[csec:secret-1]")
-          && guarded.err.contains("protected output detected and redacted")
+          && guarded.out == "[redacted: op://demo/db/url]"
+          && guarded.err.contains("[redacted: op://demo/db/url]")
+          && !guarded.err.contains("protected output detected and redacted")
           && !guarded.out.contains("postgres://s3cr3t")
           && !guarded.err.contains("postgres://s3cr3t"),
           "always mode redacts split matches on stdout and stderr before forwarding")
@@ -2741,12 +2757,11 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
     )
     check(crossLaunch.status == 0
           && crossLaunch.out.hasPrefix("[csec:secret-")
-          && crossLaunch.err.contains("protected output detected and redacted")
+          && !crossLaunch.err.contains("protected output detected and redacted")
           && !crossLaunch.out.contains("postgres://s3cr3t")
           && !crossLaunch.err.contains("postgres://s3cr3t"),
-          "AI tool broker redacts another launch's active value before returning output "
+          "AI tool broker redacts another launch's active value with opaque labels and no warning "
               + "(status=\(crossLaunch.status), label=\(crossLaunch.out.hasPrefix("[csec:secret-")), "
-              + "event=\(crossLaunch.err.contains("protected output detected and redacted")), "
               + "raw=\(crossLaunch.out.contains("postgres://s3cr3t") || crossLaunch.err.contains("postgres://s3cr3t")), "
               + "err=\(crossLaunch.err.contains("postgres://s3cr3t") ? "<contained synthetic marker>" : crossLaunch.err))")
 
@@ -2839,9 +2854,9 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
         ],
         extraEnv: [:]
     )
-    check(longest.status == 0 && longest.out == "[csec:secret-2]"
+    check(longest.status == 0 && longest.out == "[redacted: op://demo/db/url-extended]"
           && !longest.out.contains("postgres://s3cr3t"),
-          "supervised output uses the longest matching protected value")
+          "supervised output uses the longest matching protected value and names its reference")
 
     let encoded = runCsec(
         [
@@ -2850,21 +2865,25 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
         ],
         extraEnv: [:]
     )
-    check(encoded.status == 0 && encoded.out == "[csec:secret-1]\n"
+    check(encoded.status == 0 && encoded.out == "[redacted: op://demo/db/url]\n"
           && !encoded.out.contains("cG9zdGdyZXM"),
           "supervised output recognizes canonical base64 secret output")
 
-    let referenceLabel = runCsec(
+    // Opting out with `--redact-output-label=opaque` restores the ordinal label
+    // and keeps the reference out of the output stream entirely.
+    let opaqueLabel = runCsec(
         [
-            "exec", "--redact-output=always", "--redact-output-label=reference",
+            "exec", "--redact-output=always", "--redact-output-label=opaque",
             "--set", "TESTVAR=op://demo/db/url", "--",
             "/bin/sh", "-c", "printf %s \"$TESTVAR\"",
         ],
         extraEnv: [:]
     )
-    check(referenceLabel.status == 0 && referenceLabel.out == "op://demo/db/url"
-          && referenceLabel.err.contains("reference metadata"),
-          "reference-shaped redaction is explicit and warns about metadata exposure")
+    check(opaqueLabel.status == 0 && opaqueLabel.out == "[csec:secret-1]"
+          && !opaqueLabel.out.contains("op://demo/db/url")
+          && !opaqueLabel.out.contains("postgres://s3cr3t"),
+          "--redact-output-label=opaque restores an ordinal label with no reference in output "
+            + "(status \(opaqueLabel.status), out \"\(opaqueLabel.out)\")")
 
     let byteExact = runCsec(
         [
@@ -2903,7 +2922,7 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
     let stopAndContinue = runCsecThroughStopAndContinue()
     check(stopAndContinue.observedStop
           && stopAndContinue.status == 0
-          && stopAndContinue.out.hasSuffix("[csec:secret-1]")
+          && stopAndContinue.out.hasSuffix("[redacted: op://demo/db/url]")
           && !stopAndContinue.out.contains("postgres://s3cr3t"),
           "the supervisor mirrors child stop/continue and resumes guarded output")
 
@@ -2920,12 +2939,12 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
         .split(whereSeparator: { !$0.isNumber })
         .compactMap { Int($0) }
     let automaticTTYPassed = automaticTTY.status == 0
-        && automaticTTY.out.contains("[csec:secret-1]")
+        && automaticTTY.out.contains("[redacted: op://demo/db/url]")
         && automaticTTY.out.contains("37 113")
-        && automaticTTY.out.contains("protected output detected and redacted")
+        && !automaticTTY.out.contains("protected output detected and redacted")
         && !automaticTTY.out.contains("postgres://s3cr3t")
     let automaticTTYDiagnostics = automaticTTYPassed ? "" : " "
-        + "(status=\(automaticTTY.status), label=\(automaticTTY.out.contains("[csec:secret-1]")), "
+        + "(status=\(automaticTTY.status), label=\(automaticTTY.out.contains("[redacted: op://demo/db/url]")), "
         + "size=\(automaticTTY.out.contains("37 113")), numbers=\(ptyNumbers), "
         + "event=\(automaticTTY.out.contains("protected output detected and redacted")), "
         + "raw=\(automaticTTY.out.contains("postgres://s3cr3t")))"

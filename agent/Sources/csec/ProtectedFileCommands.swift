@@ -105,6 +105,8 @@ func runExecFile(_ arguments: [String]) -> Never {
             outputGuard.labelStyle = style
         case "--redact-short-values":
             outputGuard.includeShortValues = true
+        case "--redact-output-warn":
+            outputGuard.emitWarnings = true
         default:
             usage()
         }
@@ -234,7 +236,8 @@ func runExecFile(_ arguments: [String]) -> Never {
             scanner = try makeAgentClient().beginOutputRedaction(
                 destination: .localDevelopment,
                 streams: io.streams,
-                includeShortValues: outputGuard.includeShortValues
+                includeShortValues: outputGuard.includeShortValues,
+                labelStyle: outputGuard.labelStyle
             )
         } else {
             scanner = nil
@@ -251,11 +254,6 @@ func runExecFile(_ arguments: [String]) -> Never {
                 "csec exec-file: warning: output detection and masking explicitly disabled\n"
             )
         }
-        if outputGuard.labelStyle == .reference {
-            writeProtectedFileError(
-                "csec exec-file: reference-shaped labels are unavailable because plaintext stays in csecd/rootd; using opaque labels\n"
-            )
-        }
 
         let child = try rootClient.start(
             nonce: prepared.nonce,
@@ -268,7 +266,8 @@ func runExecFile(_ arguments: [String]) -> Never {
             prepared: prepared,
             childPID: child.pid,
             childStartTime: child.startTime,
-            scanner: scanner
+            scanner: scanner,
+            emitWarnings: outputGuard.emitWarnings
         )
         cs_terminate_like_wait_status(status)
     } catch {
@@ -410,7 +409,8 @@ func runSidecarExec(
                 scanner = try makeAgentClient().beginOutputRedaction(
                     destination: .localDevelopment,
                     streams: io.streams,
-                    includeShortValues: outputGuard.includeShortValues
+                    includeShortValues: outputGuard.includeShortValues,
+                    labelStyle: outputGuard.labelStyle
                 )
             } else {
                 scanner = nil
@@ -427,7 +427,8 @@ func runSidecarExec(
                 prepared: prepared,
                 childPID: child.pid,
                 childStartTime: child.startTime,
-                scanner: scanner
+                scanner: scanner,
+                emitWarnings: outputGuard.emitWarnings
             )
             materialization?.removeAll()
             cs_terminate_like_wait_status(status)
@@ -623,7 +624,8 @@ private enum RemoteRootProcessSupervisor {
         prepared: PreparedRootLaunch,
         childPID: pid_t,
         childStartTime: UInt64,
-        scanner: AgentOutputRedactionSession?
+        scanner: AgentOutputRedactionSession?,
+        emitWarnings: Bool = false
     ) throws -> Int32 {
         guard childPID > 1, childStartTime > 0 else {
             throw ProtectedFileCommandError.supervisionFailed
@@ -695,11 +697,14 @@ private enum RemoteRootProcessSupervisor {
             if let scanner {
                 let result = try scanner.process(data, stream: capture.stream)
                 output = result.data
-                for match in result.matches {
-                    writeProtectedFileError(
-                        "csec: warning: protected output detected and redacted "
-                            + "(\(match.opaqueID), \(capture.stream.rawValue), \(match.representation.rawValue))\n"
-                    )
+                if emitWarnings {
+                    for match in result.matches {
+                        writeProtectedFileError(
+                            "csec: warning: protected output detected and redacted "
+                                + "(\(match.reference ?? match.opaqueID), \(capture.stream.rawValue), "
+                                + "\(match.representation.rawValue))\n"
+                        )
+                    }
                 }
             } else {
                 output = data
@@ -722,11 +727,14 @@ private enum RemoteRootProcessSupervisor {
                     capture.isOpen = false
                     return
                 }
-                for match in result.matches {
-                    writeProtectedFileError(
-                        "csec: warning: protected output detected and redacted "
-                            + "(\(match.opaqueID), \(capture.stream.rawValue), \(match.representation.rawValue))\n"
-                    )
+                if emitWarnings {
+                    for match in result.matches {
+                        writeProtectedFileError(
+                            "csec: warning: protected output detected and redacted "
+                                + "(\(match.reference ?? match.opaqueID), \(capture.stream.rawValue), "
+                                + "\(match.representation.rawValue))\n"
+                        )
+                    }
                 }
             }
             close(capture.fd)

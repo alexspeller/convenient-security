@@ -57,7 +57,8 @@ func usage() -> Never {
       csec get <reference> [--reason <text>] [--for <seconds>]
       csec exec [--reason <text>] [--for <seconds>] [--set NAME=<reference>]…
                 [--redact-output=always|tty|never]
-                [--redact-output-label=opaque|reference] [--redact-short-values]
+                [--redact-output-label=reference|opaque] [--redact-short-values]
+                [--redact-output-warn]
                 -- <cmd> [args…]
       csec session -- <cmd> [args…]
       csec creds aws (--item <reference> |
@@ -71,14 +72,16 @@ func usage() -> Never {
                    (--fd ENV_NAME=<reference> |
                     --preset {pgpass|kubeconfig|aws-shared-credentials|google-service-account}=<reference>)…
                    [--redact-output=always|tty|never]
-                   [--redact-output-label=opaque|reference] [--redact-short-values]
+                   [--redact-output-label=reference|opaque] [--redact-short-values]
+                [--redact-output-warn]
                    -- <cmd> [args…]
       csec exec-file [--reason <text>] [--for <seconds>] [--hard-ttl]
                      (--file ENV_NAME=<reference> | --gh-config <reference>)…
                      [--github-host <host>] [--github-user <login>]
                      [--github-git-protocol https|ssh]
                      [--redact-output=always|tty|never]
-                     [--redact-output-label=opaque|reference] [--redact-short-values]
+                     [--redact-output-label=reference|opaque] [--redact-short-values]
+                [--redact-output-warn]
                      -- <cmd> [args…]
       csec bridge
       csec tool-exec --destination ai -- <cmd> [args…]
@@ -123,7 +126,10 @@ func usage() -> Never {
                (--redact-output=always): terminals, pipes, and captured logs.
                --redact-output=tty limits masking to terminal output, and
                --redact-output=never disables masking for an explicitly
-               byte-exact stream.
+               byte-exact stream. A masked value is replaced in-band with
+               [redacted: <reference>] naming the reference it came from;
+               --redact-output-label=opaque restores an opaque [csec:secret-N].
+               A per-match stderr warning is opt-in via --redact-output-warn.
     session    Register a kernel-verified broad grant root, then run <cmd> at the same PID.
     creds      Serve AWS credential_process or Git credential-helper output via a private pipe.
     exec-fd    Give a child anonymous single-open secret files at /dev/fd/N. Presets set
@@ -316,7 +322,11 @@ func runToolExec(_ arguments: [String]) -> Never {
     do {
         session = try makeAgentClient().beginOutputRedaction(
             destination: .aiTool,
-            streams: OutputRedactionStream.allCases
+            streams: OutputRedactionStream.allCases,
+            // The AI tool is the output recipient here, not the operator's own
+            // terminal. Keep opaque `[csec:secret-N]` labels so a redaction does
+            // not hand the AI the reference metadata a `csec exec` user would see.
+            labelStyle: .opaque
         )
     } catch {
         // The original command has not run. This is the ordinary fail-closed
@@ -760,6 +770,8 @@ func runExec(_ arguments: [String]) -> Never {
             outputGuard.labelStyle = style
         case "--redact-short-values":
             outputGuard.includeShortValues = true
+        case "--redact-output-warn":
+            outputGuard.emitWarnings = true
         default:
             // First non-flag token starts the command (`--` optional, like `env`).
             commandLine = Array(arguments[index...])
@@ -938,12 +950,6 @@ func runExec(_ arguments: [String]) -> Never {
              + "use --redact-short-values to accept possible false positives\n").utf8
         ))
     }
-    if guardOwnsOutput, outputGuard.labelStyle == .reference, !catalog.patterns.isEmpty {
-        FileHandle.standardError.write(Data(
-            "csec exec: warning: redaction labels will expose secret-reference metadata\n".utf8
-        ))
-    }
-
     if guardOwnsOutput, !catalog.patterns.isEmpty, let executablePath = resolvedExecutablePath {
         var childEnvironment = ProcessInfo.processInfo.environment
         for (name, value) in injected { childEnvironment[name] = value }
@@ -953,7 +959,8 @@ func runExec(_ arguments: [String]) -> Never {
                 commandLine: commandLine,
                 environment: childEnvironment,
                 catalog: catalog,
-                mode: outputGuard.mode
+                mode: outputGuard.mode,
+                emitWarnings: outputGuard.emitWarnings
             )
             cs_terminate_like_wait_status(status)
         } catch {
