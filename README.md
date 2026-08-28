@@ -355,39 +355,30 @@ path for real credentials until the signed, installed root-helper matrix in
 [`docs/regular-file-security-matrix.md`](docs/regular-file-security-matrix.md)
 has passed on the target macOS release.
 
-### Classify delivery risk
+### One tap authorizes a release
 
-The first access to a logical credential opens a trusted, value-free review in
-`csecd`. For 1Password, fields under the same vault/item are grouped together;
-for the native store, all keys in one store share a judgment. Unknown credentials
-fail closed until you choose a level:
+The first access to a credential opens a trusted, value-free review in `csecd`:
+it shows the references, where the value is going, and a warning if that
+destination is same-user-inspectable — then a single Touch ID authorizes it.
+There is no risk classification and no separate compatibility checkbox; the tap
+is the decision. One approval covers the requesting shell and its descendants for
+up to 12 hours (override with `--for`, capped at 24h), so a loop of `csec get` in
+the same terminal does not re-prompt.
 
-| Level | Current policy |
-|-------|----------------|
-| `low` | Up to 12 hours; normal approval and normal capped reuse, including compatibility delivery. |
-| `standard` | Up to 4 hours; compatibility delivery needs a separate, exact-shape acceptance. |
-| `high` | Up to 15 minutes; strong warning, fresh Touch ID, and compatibility acceptance limited to the resulting live grant. AI destinations and insufficiently assured consumers still fail. |
-| `critical` | Up to 5 minutes; strongest warning, fresh Touch ID, and compatibility acceptance limited to the resulting live grant. Scope and consumer-integrity requirements still apply. |
+`csec get` prints a raw value, so it is gated by where that value would land:
 
-Inspect or change policy metadata without resolving the secret value:
+| `csec get SECRET …` | stdout is | behavior |
+|---|---|---|
+| bare | your terminal | refused — it would sit in scrollback (an agent or logger could capture it); pass `--reveal` to echo it deliberately |
+| `\| cmd` | a pipe to a command | allowed — you are handing bytes to a tool, not displaying them |
+| `> file` | a file | refused — durable plaintext on disk; pass `--allow-plaintext-file` |
+| (no terminal) | an agent/script capture | refused and steered to `csec exec`/`exec-file`/`creds`; the same flags override under Touch ID |
 
-```sh
-csec risk inspect 'op://Engineering/Postgres/url'
-csec risk classify standard 'op://Engineering/Postgres/url'
-csec risk raise high 'csec://production-admin/*'
-csec risk forget 'op://Engineering/Postgres/url'
-```
-
-`raise` cannot lower a classification. Lowering one with `classify`, or
-forgetting it back to fail-safe unknown, requires Touch ID. Risk records contain
-only HMAC-derived logical identities and value-free metadata. A compatibility
-choice is warn-and-confirm, not a permanent denial solely because it is weaker.
-Acceptance is bound to mechanism, destination, scope, emitter/requester
-assurance, and recipient assurance. Standard acceptance can be remembered for
-30 days; high and critical acceptance is represented only by the short-lived,
-exact live-shell grant. Malformed metadata, unverifiable requesters, stale
-process incarnations, insufficient consumer assurance, and unavailable or
-denied authentication still fail closed before provider resolution.
+For anything a program consumes, prefer the injection commands (`csec exec`,
+`csec exec-file`, `csec creds`) over `csec get` — they hand the value to the tool
+without it ever passing through your terminal or an agent's context. Malformed
+metadata, unverifiable requesters, stale process incarnations, and denied or
+unavailable authentication still fail closed before provider resolution.
 
 ### Deliver secrets to Ruby and Node.js apps without touching the environment
 

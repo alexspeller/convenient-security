@@ -14,8 +14,6 @@ public enum WireCapability: String, Codable, Sendable, CaseIterable {
     case outputGuardBinding = "output_guard_binding"
     case activeOutputRedaction = "active_output_redaction"
     case nativeEncryptedStore = "native_encrypted_store"
-    case riskPolicyV2 = "risk_policy_v2"
-    case riskManagement = "risk_management"
     case nativeEditorPolicy = "native_editor_policy"
     case registeredSessionRoots = "registered_session_roots"
     case credentialProtocols = "credential_protocols"
@@ -283,97 +281,6 @@ public struct CommitNativeStoreBlobsRequest: Codable, Sendable {
     }
 }
 
-public enum RiskOperation: String, Codable, Sendable, CaseIterable {
-    case inspect
-    case classify
-    case raise
-    case forget
-}
-
-public struct RiskOperationRequest: Codable, Sendable {
-    public let requestID: String
-    public let operation: RiskOperation
-    public let reference: String
-    public let level: RiskLevel?
-
-    public init(
-        operation: RiskOperation,
-        reference: String,
-        level: RiskLevel? = nil,
-        requestID: UUID = UUID()
-    ) {
-        self.requestID = requestID.uuidString.lowercased()
-        self.operation = operation
-        self.reference = reference
-        self.level = level
-    }
-}
-
-public struct RiskAcceptanceInspection: Codable, Sendable, Equatable {
-    public let mechanism: DeliveryMechanism
-    public let destination: DestinationClass
-    public let descendantScope: DescendantScope
-    public let emitterAssurance: ConsumerAssurance
-    public let requesterAssurance: ConsumerAssurance?
-    public let recipientAssurance: RecipientAssurance?
-    public let reviewAfter: Date
-
-    public init(
-        mechanism: DeliveryMechanism,
-        destination: DestinationClass,
-        descendantScope: DescendantScope,
-        emitterAssurance: ConsumerAssurance,
-        requesterAssurance: ConsumerAssurance?,
-        recipientAssurance: RecipientAssurance?,
-        reviewAfter: Date
-    ) {
-        self.mechanism = mechanism
-        self.destination = destination
-        self.descendantScope = descendantScope
-        self.emitterAssurance = emitterAssurance
-        self.requesterAssurance = requesterAssurance
-        self.recipientAssurance = recipientAssurance
-        self.reviewAfter = reviewAfter
-    }
-}
-
-/// Value-free result for one caller-supplied reference. Opaque credential keys,
-/// provider values, and the other raw members of its logical group never cross
-/// the socket.
-public struct RiskInspection: Codable, Sendable, Equatable {
-    public let provider: String
-    public let level: RiskLevel
-    public let effectiveLevel: RiskLevel
-    public let decidedAt: Date?
-    public let reviewAfter: Date?
-    public let policyVersion: Int
-    public let knownMemberCount: Int
-    public let referenceInKnownScope: Bool
-    public let acceptances: [RiskAcceptanceInspection]
-
-    public init(
-        provider: String,
-        level: RiskLevel,
-        effectiveLevel: RiskLevel,
-        decidedAt: Date?,
-        reviewAfter: Date?,
-        policyVersion: Int,
-        knownMemberCount: Int,
-        referenceInKnownScope: Bool,
-        acceptances: [RiskAcceptanceInspection]
-    ) {
-        self.provider = provider
-        self.level = level
-        self.effectiveLevel = effectiveLevel
-        self.decidedAt = decidedAt
-        self.reviewAfter = reviewAfter
-        self.policyVersion = policyVersion
-        self.knownMemberCount = knownMemberCount
-        self.referenceInKnownScope = referenceInKnownScope
-        self.acceptances = acceptances
-    }
-}
-
 /// Requests retain the v1 flat discriminator so an upgraded agent can return a
 /// typed migration error instead of misinterpreting an old access as secure.
 public enum Request: Sendable {
@@ -388,7 +295,6 @@ public enum Request: Sendable {
     case commitNativeStoreEdit(CommitNativeStoreEditRequest)
     case commitNativeStoreBlobs(CommitNativeStoreBlobsRequest)
     case cancelNativeStoreEdit(CancelNativeStoreEditRequest)
-    case risk(RiskOperationRequest)
     case approveProtectedLaunch(ProtectedLaunchApprovalRequest)
     case hostAudit(HostAuditRequest)
     case hostAuditStart(HostAuditRequest)
@@ -403,7 +309,6 @@ extension Request: Codable {
         case deliveryPlan, deliveryPlanDigest
         case destination, streams, includeShortValues, labelStyle, sessionID, stream, data, finish
         case store, editSessionID, document, mode, externalEditorPath, blobs
-        case operation, reference, level
         case protectedLaunchApproval
         case scanFilesystem, selectedKeys, jobID
         case exemptions, todos, cleared
@@ -494,13 +399,6 @@ extension Request: Codable {
         case "cancel_native_store_edit":
             self = .cancelNativeStoreEdit(CancelNativeStoreEditRequest(
                 editSessionID: try container.decode(String.self, forKey: .editSessionID),
-                requestID: try Self.decodeUUID(container, forKey: .requestID)
-            ))
-        case "risk":
-            self = .risk(RiskOperationRequest(
-                operation: try container.decode(RiskOperation.self, forKey: .operation),
-                reference: try container.decode(String.self, forKey: .reference),
-                level: try container.decodeIfPresent(RiskLevel.self, forKey: .level),
                 requestID: try Self.decodeUUID(container, forKey: .requestID)
             ))
         case "approve_protected_launch":
@@ -619,13 +517,6 @@ extension Request: Codable {
             try container.encode(WireProtocol.version, forKey: .version)
             try container.encode(request.requestID, forKey: .requestID)
             try container.encode(request.editSessionID, forKey: .editSessionID)
-        case let .risk(request):
-            try container.encode("risk", forKey: .type)
-            try container.encode(WireProtocol.version, forKey: .version)
-            try container.encode(request.requestID, forKey: .requestID)
-            try container.encode(request.operation, forKey: .operation)
-            try container.encode(request.reference, forKey: .reference)
-            try container.encodeIfPresent(request.level, forKey: .level)
         case let .approveProtectedLaunch(request):
             try container.encode("approve_protected_launch", forKey: .type)
             try container.encode(WireProtocol.version, forKey: .version)
@@ -698,7 +589,6 @@ public struct Response: Codable, Sendable {
     public let document: Data?
     public let generation: UInt64?
     public let secretCount: Int?
-    public let riskInspection: RiskInspection?
     public let protectedLaunchApproved: Bool?
     public let accessExpiresAt: Date?
     public let hostAuditReport: HostAuditReport?
@@ -723,7 +613,6 @@ public struct Response: Codable, Sendable {
         document: Data? = nil,
         generation: UInt64? = nil,
         secretCount: Int? = nil,
-        riskInspection: RiskInspection? = nil,
         protectedLaunchApproved: Bool? = nil,
         accessExpiresAt: Date? = nil,
         hostAuditReport: HostAuditReport? = nil,
@@ -747,7 +636,6 @@ public struct Response: Codable, Sendable {
         self.document = document
         self.generation = generation
         self.secretCount = secretCount
-        self.riskInspection = riskInspection
         self.protectedLaunchApproved = protectedLaunchApproved
         self.accessExpiresAt = accessExpiresAt
         self.hostAuditReport = hostAuditReport

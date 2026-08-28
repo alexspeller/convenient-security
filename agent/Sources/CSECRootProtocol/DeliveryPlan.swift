@@ -166,6 +166,17 @@ public struct DeliveryPlan: Codable, Sendable, Equatable {
     /// Output behavior declared and digest-bound for this launch. It is required
     /// for unrestricted environment exec and nil for unrelated mechanisms.
     public let outputGuard: OutputGuardPlan?
+    /// Whether the requesting launcher observed a controlling terminal on its
+    /// own std descriptors (a human is interactively present). Value-free and
+    /// digest-bound; the agent uses it to distinguish an interactive human `csec
+    /// get` (pipe to a command is fine) from an automated/agent capture, which is
+    /// steered toward injection and requires an explicit acknowledgment.
+    public let interactive: Bool
+    /// Whether the user passed the shape-appropriate override flag (`--reveal`
+    /// for an observing sink, `--allow-plaintext-file` for a persistent file) to
+    /// accept raw-plaintext exposure. The launcher only sets this when the exact
+    /// matching flag is present; the agent re-derives whether it is required.
+    public let plaintextExposureAcknowledged: Bool
 
     public init(
         mechanism: DeliveryMechanism,
@@ -178,7 +189,9 @@ public struct DeliveryPlan: Codable, Sendable, Equatable {
         requestedTTLSeconds: Int,
         operationContext: String,
         commandDigest: String? = nil,
-        outputGuard: OutputGuardPlan? = nil
+        outputGuard: OutputGuardPlan? = nil,
+        interactive: Bool = false,
+        plaintextExposureAcknowledged: Bool = false
     ) {
         self.mechanism = mechanism
         self.executable = executable
@@ -191,6 +204,8 @@ public struct DeliveryPlan: Codable, Sendable, Equatable {
         self.operationContext = operationContext
         self.commandDigest = commandDigest
         self.outputGuard = outputGuard
+        self.interactive = interactive
+        self.plaintextExposureAcknowledged = plaintextExposureAcknowledged
     }
 
     /// Stable digest used in grants and decision/release binding.

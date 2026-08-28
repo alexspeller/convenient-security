@@ -57,37 +57,32 @@ launcher becomes the requested shell or command. Its inherited random ID is
 non-secret and does not authorize anything by possession: each use must come
 from the authenticated signed helper and pass a fresh ancestry walk to that
 exact live process incarnation. Copying the ID to a sibling, racing PID reuse,
-or inventing an ID fails closed. Low/standard grants may span descendants;
-policy rejection retries only with the helper's ordinary per-command root, so a
-high-impact credential does not inherit broad session scope.
+or inventing an ID fails closed. A grant may span descendants of the approved
+root, bounded by the delivery-plan digest and a fresh ancestry walk to that exact
+live root incarnation.
 
-### Risk policy and stale authorization
+### Release authorization and stale authorization
 
-Before it consults a plaintext cache or provider, the daemon groups each
-reference into a logical credential, loads only opaque value-free judgment
-metadata, and evaluates the complete delivery plan. Unknown credentials require
-classification in a daemon-owned window. Weak compatibility acceptance is a
-separate decision. The selected risk, delivery, scope, destination, consumer
-assurance, and requested duration are summarized in that same window. Embedded
-Touch ID starts when the window becomes visible; on success the exact visible
-selection is frozen, then the agent validates it before any new choice is
-persisted, any authenticated context is released, or any reference is resolved.
+Before it consults a plaintext cache or provider, the daemon evaluates the
+complete delivery plan: a bounded grant lifetime (`--for`, default 12h, capped at
+24h), a mechanism-derived output policy, and the one hard `csec get`
+plaintext-exposure gate. There is no risk classification and no compatibility
+acceptance — the value-free review shows the references, delivery, scope,
+destination, and any inspectable-shape warning, and embedded Touch ID starts when
+the window becomes visible; a successful biometric is itself the authorization.
 
-Every grant is bound to the delivery-plan digest and the exact effective-risk,
-policy-version, policy-decision, and output-policy snapshot. A raised or
-forgotten classification revokes matching grants, known cache entries, and open
-native edit sessions. Reuse recomputes the binding; expired metadata and a policy
-version change fail closed. Protocol-v1 access is recognized only to return
-`upgrade_required`, so an older or hand-written client cannot omit a plan to
-select the legacy authorization path.
+Every grant is bound to the delivery-plan digest and the requesting process
+subtree. Grants expire by TTL and drop when their root exits; a caller reuses one
+only when it descends from that root and presents the same plan digest. There is
+no risk-shaped binding left to recompute. Protocol-v1 access is recognized only to
+return `upgrade_required`, so an older or hand-written client cannot omit a plan
+to select the legacy authorization path.
 
-Weakness alone is warn-and-confirm rather than an integrity failure. Low uses
-normal approval; standard requires exact-shape compatibility acceptance; high
-and critical require fresh Touch ID and retain acceptance only as the resulting
-15-minute or 5-minute live grant. Policy still fails closed on malformed or
-spoofed metadata, unverifiable/stale/reparented/replaced requesters, invalid
-scope or consumer assurance, denial, and unavailable required authentication.
-It cannot turn an approved environment, named-file, raw-output, or authorized-
+An inspectable delivery is warn-and-confirm rather than an integrity failure: the
+review warns and one Touch ID authorizes it. Authorization still fails closed on
+malformed or spoofed metadata, unverifiable/stale/reparented/replaced requesters,
+invalid scope, denial, unavailable biometrics, and an unacknowledged raw `csec
+get` shape. It cannot turn an approved environment, named-file, raw-output, or authorized-
 consumer path into a confidentiality boundary. The production Keychain stores
 HMAC-derived logical identifiers and value-free metadata, not raw references or
 values.
@@ -161,8 +156,8 @@ digest. Four stdio/cwd descriptors arrive only with prepare. A random nonce and
 canonical plan digest bind the two independent requests; only the original
 launcher audit token can consume them.
 
-`csecd` does not return values to `csec` for this mechanism. It applies current
-risk policy, requires fresh consent, resolves the exact set, renders bounded
+`csecd` does not return values to `csec` for this mechanism. It applies the
+release policy, requires fresh consent, resolves the exact set, renders bounded
 payloads, and transmits them directly to the authenticated helper. The helper
 revalidates plan/path/size constraints, uses descriptor-relative no-follow and
 exclusive creation on verified bounded `nodev,nosuid,noexec` tmpfs, and closes
@@ -337,8 +332,8 @@ Import accepts only an exact plaintext candidate selected in argv by its
 value-free locator. The value itself is re-read into the signed launcher's heap,
 bound to the dotenv file version observed in the same apply process,
 reclassified, and sent only over the authenticated native-store edit protocol;
-references are not resolved or copied. Touch ID and current risk policy gate the
-store edit, and existing keys require explicit replacement. The source remains
+references are not resolved or copied. Touch ID gates the store edit, and
+existing keys require explicit replacement. The source remains
 ordinary plaintext and readable by the same-UID attacker until the user verifies
 the new consumer and separately removes every original/copy. Setup does not
 rotate a provider credential, prove the old source is unused, or make deletion

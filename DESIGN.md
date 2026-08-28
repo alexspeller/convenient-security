@@ -12,9 +12,10 @@ running as the same login user. It provides per-reference Touch ID consent,
 process-scoped grants, a code-identity-gated at-rest cache, heap delivery for
 integrated Ruby and Node.js clients, tool-native AWS/Git credential adapters,
 anonymous inherited-fd files, capability-GID regular files, an environment
-compatibility launcher, and exact-value output redaction. A value-free risk
-policy gates each delivery before provider or cache resolution. It can resolve
-from the official 1Password CLI and from device-bound native encrypted files.
+compatibility launcher, and exact-value output redaction. Every delivery is
+gated by a single Touch-ID-approved, value-free review before provider or cache
+resolution. It can resolve from the official 1Password CLI and from device-bound
+native encrypted files.
 
 It does not protect a value from root, from code already executing inside an
 authorized consumer, from a consumer the user deliberately launches, or from a
@@ -88,8 +89,7 @@ value-free failures, and a canonical digest of the delivery plan. See
 
 A grant is held only in `csecd` memory. It records a root PID and process start
 time, the approved references, reason, expiry, the originating protocol-v2
-delivery binding, and the credential's effective risk level, policy version,
-policy-decision digest, and output policy.
+delivery binding, and the delivery-plan digest that bounds its reuse.
 
 The daemon obtains the caller PID from the kernel rather than JSON. A grant is
 usable only when kernel parent traversal reaches the recorded root with the same
@@ -97,46 +97,43 @@ start time, which prevents PID reuse from reviving it. References already
 covered by a compatible live grant are returned without another prompt. Adding
 a reference prompts for the delta and then expands the grant. Grants expire by
 TTL and disappear when the daemon exits; orphaned descendants no longer satisfy
-the ancestry check. Reuse also requires the current delivery-plan and policy
-bindings to match exactly. A risk change revokes affected grants and resolver
-entries; a policy-version change invalidates grants created under the old table.
+the ancestry check. Reuse also requires the current delivery-plan digest to
+match exactly.
 
 The subtree model intentionally gives descendants of an approved root access to
 the same granted references. Code running inside that subtree is therefore part
 of the trusted consumer boundary.
 
-## Policy review and consent
+## Trusted review and consent
 
-The production daemon owns one AppKit policy-and-authentication window. It
-contains no values: it shows the logical credential references, stored risk,
-delivery mechanism, requester/grant owner, emitter, recipient assurance,
-destination, scope, and requested duration. A newly observed logical credential must be
-classified as low, standard, high, or critical. Acceptance of a weak
-compatibility delivery is a separate, initially unchecked decision rather than
-part of the classification.
+The production daemon owns one AppKit review-and-authentication window. It
+contains no secret values and no editable policy controls: it shows the logical
+credential references, the delivery mechanism, requester/emitter, recipient,
+scope, destination, and requested duration, plus a plain-language warning
+whenever the delivery is same-user-inspectable — terminal output, an unverified
+pipe reader, a persistent plaintext file, or a non-interactive capture that a
+coding agent or logger would receive. Because there is nothing to configure — no
+risk classification and no separate compatibility checkbox — a successful
+biometric is itself the authorization.
 
-That window creates a fresh `LAContext`, pairs it with Apple's embedded
+The window creates a fresh `LAContext`, pairs it with Apple's embedded
 `LAAuthenticationView`, and starts Touch ID as soon as the rendered panel is
-visible—there is no preliminary button or Enter-key gate. Policy controls remain
-editable while Touch ID is active. On biometric success the daemon freezes the
-exact visible choices and returns only that value-free snapshot to the agent
-while retaining the evaluated context. The agent applies the authoritative risk
-policy before persisting a choice, releasing a value, or handing out the context;
-a denial closes and invalidates the session. The localized reason carries the
-bounded requested details as defense in depth, while the trusted window is the
-authoritative display of the selected risk and delivery. Dynamic text is bounded
-and control, newline, and bidirectional-formatting characters are neutralized.
+visible; there is no preliminary button or Enter-key gate. On biometric success
+the daemon retains the evaluated context and hands the agent a plain approval;
+the agent mints the subtree grant and calls back to release that context so a
+cold cached value or cold native-store key is unlocked by the same tap. A denial,
+unavailable biometrics, or lockout fails closed. The localized Touch ID reason
+carries the same bounded, value-free delivery details as defense in depth, and
+all dynamic text is bounded with control, newline, and bidirectional-formatting
+characters neutralized.
 
-Approval returns the evaluated context to the cache read so a cold cached value
-or cold native-store key can be unlocked by the same biometric action. Editing
-a native file is a separate exact-launcher operation that always asks for fresh
-Touch ID and displays that every key in the named store will be exposed to the
-editor. It does not create a reusable secret grant. Denial, unavailable
-biometrics, or lockout fails closed. The shipping daemon has no runtime
-auto-approval switch; automatic consent exists only in separate test
+Editing a native file is a separate exact-launcher operation that asks for fresh
+Touch ID and shows that every key in the named store will be exposed to the
+editor; it does not create a reusable secret grant. The shipping daemon has no
+runtime auto-approval switch; automatic consent exists only in separate test
 executables and injected test dependencies. A provider may still require its own
-independent authorization—for example, the 1Password app can display a separate
-account-access request—which csecd cannot merge into its window.
+independent authorization — for example, the 1Password app can display a separate
+account-access request — which csecd cannot merge into its window.
 
 ## Delivery
 
@@ -164,12 +161,10 @@ requires the caller's audit session to match and a fresh kernel ancestry walk to
 reach the registered PID/start-time pair. The ID is therefore a lookup hint,
 not a bearer capability; copying or forging it outside the subtree fails.
 
-The delivery plan and consent UI distinguish a registered `broad_session` root
-from an ordinary per-command root. Low and standard credentials can reuse a
-compatible grant across sibling descendants. If policy rejects the broad plan,
-the launcher retries with its ordinary narrow root; high-impact credentials do
-not gain wider session authority. Grant TTLs, plan/policy digests, risk changes,
-and live ancestry checks still apply independently of registration lifetime.
+The delivery plan and review distinguish a registered `broad_session` root from
+an ordinary per-command root; a grant is reused across sibling descendants when
+the delivery-plan digest matches. Grant TTLs, plan digests, and live ancestry
+checks apply independently of registration lifetime.
 
 ### Credential protocols
 
@@ -222,8 +217,8 @@ audit token plus live product code identity before reading a body.
 
 Authorization is a two-party rendezvous. The exact original `csec` prepares the
 plan and passes only cwd/stdin/stdout/stderr descriptors with `SCM_RIGHTS`.
-`csecd` separately receives a digest-bound approval request, evaluates current
-risk policy, obtains fresh Touch ID, resolves the exact reference set, renders
+`csecd` separately receives a digest-bound approval request, evaluates the
+release policy, obtains fresh Touch ID, resolves the exact reference set, renders
 bounded payloads, and sends those bytes directly to the root helper. It returns
 only a boolean approval to `csec`; neither values nor rendered files travel back
 through the launcher. Only the original launcher's audit token can consume the
@@ -288,19 +283,18 @@ values, and the launcher still never holds a plaintext value.
 explicit `--set NAME=<reference>` assignments. It then places plaintext in the
 child's initial environment. This works with unmodified tools, but macOS process
 inspection can expose that original environment to unrelated same-UID
-processes. Risk policy treats this as weak compatibility delivery: low risk is
-allowed, standard risk requires a separate 30-day compatibility acceptance, and
-high or critical risk is rejected before cache/provider resolution because the
-generic complete consumer is unverified. The weak mechanism alone is not the
-integrity failure. Output-guard configuration is part of both the delivery-plan
-and policy digests but does not make the environment private.
+processes. This is weak compatibility delivery: the trusted review shows a
+warning that the child's initial environment is inspectable by other same-user
+processes, and one Touch ID authorizes it. There is no risk tier and no separate
+acceptance — running the command is the intent. Output-guard configuration is
+part of the delivery-plan digest but does not make the environment private.
 
 When the project also holds `*.csec` sidecars, this identical injection is folded
 into the root-helper launch instead of being applied by the launcher: each
 assignment becomes a value-in-environment binding the helper places in the child
 environment, so the launcher never holds the plaintext. The environment's
 same-UID inspectability is unchanged — it remains weak compatibility delivery
-under the same risk policy — but one approval now delivers both the injected
+under the same one-Touch-ID review — but one approval now delivers both the injected
 values and the materialized files.
 
 When output policy is active, `csec` remains as the process supervisor and uses
@@ -311,44 +305,46 @@ terminal streams, leaving non-terminal output byte-exact with a warning.
 
 ### Raw output
 
-`csec get` writes requested plaintext to standard output in three explicitly
-modelled shapes: interactive terminal output, a shell-delegated pipe, or an
-ordinary persistent plaintext file. In every shape, the signed launcher records
-its real direct parent's PID, process start time, canonical executable identity,
-signature metadata, and writable-path assurance separately from signed `csec`,
-which remains the byte emitter. The daemon independently recomputes that parent
-identity and roots a digest-bound subtree grant there. It repeats the
-PID/start-time/ancestry/executable check immediately after approval and before
-provider resolution, and `csec` checks the parent incarnation again immediately
-before output. Consecutive compatible gets from that same live shell can reuse
-the risk-capped grant; a different shell process cannot.
+`csec get` writes a requested plaintext value to standard output. Because an
+echoed value lands in terminal scrollback — which a coding-agent session, logger,
+or screen capture can later retain — the launcher gates the shape by what stdout
+is and whether an interactive terminal is present (any of stdin/stdout/stderr a
+tty):
 
-For a pipeline, the reader is normally a sibling process and cannot be recovered
-or authenticated from the write descriptor. The plan and review therefore name
-the shell as requester/grant owner, `csec` as emitter, and an **unverified pipe
-reader** as recipient. Command substitution is the same shell-delegated pipe
-shape. The pipe itself expresses user intent, so no second unsafe CLI flag is
-required, but a new exact plan still requires normal trusted review and consent.
+- **interactive terminal** — refused by default; `--reveal` echoes it deliberately.
+- **pipe to a command** (`csec get x | tool`, and command substitution) with a
+  human present — allowed: the pipe expresses intent and the reader consumes the
+  bytes rather than displaying them. The reader is a sibling process that cannot
+  be authenticated from the write descriptor, so the plan names an **unverified
+  pipe reader** as recipient and the review still warns.
+- **persistent file** (`csec get x > file`) — refused by default;
+  `--allow-plaintext-file` writes it. No pathname is resolved, logged, or sent to
+  the daemon; the review warns that plaintext persists on disk and recommends
+  `csec exec-file`.
+- **non-interactive** (no controlling terminal — an agent, script, or logger is
+  capturing the output) — refused by default and steered to `csec exec`/
+  `exec-file`/`creds`, which hand the value to the consuming tool without
+  returning it; the same shape-matched flag overrides under Touch ID.
 
-When `fstat(STDOUT_FILENO)` identifies a regular file, the plan instead declares
-`named_plaintext_file` delivery to `persistent_plaintext_file` with an
-`ordinary_persistent_file` recipient. No pathname is resolved, logged, or sent
-to the daemon. The trusted review warns that plaintext persists, may be readable
-by same-UID processes, and can be copied, synchronized, backed up, or accessed
-later outside csec's control; it recommends `csec exec-file`. The shell can
-create or truncate the target before launching csec, but denial occurs before
-provider resolution and csec writes no plaintext unless approval succeeds.
-
-Terminal, pipe, and ordinary-file shapes have different canonical plan and
-policy digests. Compatibility acceptance is additionally keyed by mechanism,
-destination, descendant scope, emitter/requester assurance, and recipient
-assurance, so one shape cannot silently authorize another.
+The launcher records a value-free `interactive` flag and, only when the
+shape-matched override flag is present, a `plaintextExposureAcknowledged` flag,
+both digest-bound in the delivery plan. csecd independently re-derives whether an
+acknowledgment is required from the mechanism, recipient, and `interactive` flag,
+and refuses a raw-output shape that needs one but lacks it — so a launcher cannot
+skip the gate by omitting it. In every shape the signed launcher records its real
+direct parent's PID, start time, and canonical executable identity separately
+from signed `csec`, which remains the byte emitter; the daemon independently
+recomputes that parent, roots a digest-bound subtree grant there, and rechecks
+the parent incarnation after approval and before provider resolution, and `csec`
+rechecks it again immediately before output. Consecutive compatible gets from
+that same live shell reuse the grant; a different shell process cannot. Terminal,
+pipe, and file shapes have different canonical plan digests, so one cannot
+silently authorize another.
 
 ### Native store editing
 
-`csec edit <store>` asks `csecd` to begin a caller-bound edit session, requesting
-30 minutes but accepting the risk-policy cap (15 minutes for high and 5 minutes
-for critical). After Touch ID, the complete strict-JSON document crosses the
+`csec edit <store>` asks `csecd` to begin a caller-bound edit session for a
+bounded 30-minute lifetime. After Touch ID, the complete strict-JSON document crosses the
 mutually authenticated socket into the signed launcher. By default a built-in
 AppKit `NSTextView` edits it without a plaintext filesystem object. Automatic spelling,
 grammar, replacement, data detection, smart punctuation, and window restoration
@@ -379,11 +375,9 @@ behind. These controls reduce accidents and cross-account access; they do not
 restore a same-UID boundary. The editor, plugins, same-UID malware, swap,
 autosave, backup, recovery, and filesystem snapshots can retain plaintext, and
 unlinking is not secure erasure on APFS/SSD storage. Copies outside the
-workspace cannot be removed. Risk policy allows this mode for low-risk stores,
-requires a separate compatibility acceptance for standard-risk stores, and
-rejects it for high and critical stores because an arbitrary external editor is
-an unverified complete consumer. A risk change revokes an open edit session,
-and commit recomputes the policy binding before writing.
+workspace cannot be removed. The trusted review warns that this mode creates a
+named plaintext file, and one Touch ID authorizes it; commit re-checks that the
+session has not expired before writing.
 
 The built-in editor still authorizes the user and AppKit/input stack to see the
 plaintext; copying, screenshots, accessibility/screen-capture privileges, or a
@@ -602,48 +596,26 @@ provisioned build enables persistence. An unsigned development build reports
 `at-rest cache OFF` and uses a null persistent cache rather than weakening or
 emulating the entitlement.
 
-## Risk policy
+## Release policy
 
-`RiskPolicyV2` is a deterministic pre-resolution decision table. Logical
-credentials are grouped independently of provider: 1Password fields share their
-vault/item judgment, and native references share their store judgment. The
-production judgment backend stores only agent-HMAC-derived account, credential,
-and member identifiers in a ThisDeviceOnly Keychain item; raw references and
-secret values are not persisted there. Unsigned development builds use an
-in-memory backend.
+`ReleasePolicy` is a deterministic pre-resolution decision reduced to what the
+threat model actually needs. It computes a bounded grant lifetime — the requested
+`--for` duration, defaulting to 12 hours and capped at 24 — a mechanism-derived
+output policy (redact-and-warn, or an intentional-credential-channel for the
+AWS/Git helpers), and the single hard `csec get` plaintext-exposure gate
+described under Raw output. There is no risk classification, no per-credential
+judgment store, no compatibility-acceptance ledger, and no destination or
+evidence escalation.
 
-Unknown credentials have an effective high floor and require classification in
-the agent-owned review. Low, standard, high, and critical cap access at 12 hours,
-4 hours, 15 minutes, and 5 minutes respectively. Destination evidence may raise
-the effective level: production and unknown destinations floor at high, while
-staging and AI floor at standard. High/critical disallow AI destinations and
-require a verified, independently protected, or sealed complete consumer;
-critical also normally requires exact-process scope. The narrow exception is
-signed `csec get`: its independently verified direct-parent shell may own a
-subtree grant while signed `csec` remains the emitter and the terminal, pipe, or
-file recipient is described separately. Generic Ruby, Node.js, shell, and
-checkout-driven complete consumers conservatively report unverified assurance
-even when their executable is root-owned.
-
-The agent loads judgments and any exact delivery-shape acceptance before
-consulting a cache or provider. Low compatibility delivery follows normal
-approval. Standard requires a separate compatibility acceptance, which can be
-remembered for 30 days. High and critical show stronger warnings, require fresh
-Touch ID, and do not persist that acceptance: only the resulting 15-minute or
-5-minute exact live grant can be reused. A weaker choice is not itself an
-integrity failure, but malformed metadata, requester verification failure,
-stale/reparented/replaced processes, invalid scope/assurance, denial, or required
-authentication failure remain hard pre-resolution failures.
-
-Compatibility acceptance matches the mechanism, destination, descendant scope,
-emitter assurance, requester assurance, and recipient assurance. The policy
-version is 2, which invalidates old judgments, grants, and compatibility
-acceptances rather than broadening their prior meaning. `csec risk
-inspect|classify|raise|forget` operates on this metadata without resolving a
-value. `raise` is monotonic; a downgrade or forget requires an additional
-biometric authentication. Any change clears weak acceptances when appropriate,
-revokes matching grants and native edit sessions, and invalidates known resolver
-entries.
+Those were removed deliberately. Against an automated, opportunistic same-user
+supply-chain attacker, the load-bearing control is a physically-present Touch ID
+over a value-free review bound to the process subtree — not a five-level taxonomy
+that mostly produced confusing prompts (a first `csec get` used to demand a
+classification popup *and* a compatibility checkbox *and* the tap, to print a
+value the user had just asked for). Malformed metadata, requester-verification
+failure, stale/reparented/replaced processes, an invalid scope, denial, or
+unavailable biometrics remain hard pre-resolution failures; the structural
+integrity of the delivery plan is still enforced before any value is resolved.
 
 ## Security requirements
 
@@ -674,11 +646,11 @@ clean consumer heap, through a process-local inherited descriptor, or to a
 root-owned regular file traversable only by one capability-GID process tree.
 The environment launcher is a compatibility feature with an acknowledged
 same-UID disclosure channel. Output redaction is an egress safeguard, not a
-repair for any authorized consumer's ability to disclose a value. Risk policy
-uses warnings, fresh authentication, shorter grants, assurance, and scope rather
-than treating weakness alone as an irrevocable prohibition. It still rejects
-unverified complete consumers and invalid broad scopes; approving a compatibility
-shape does not strengthen that path or make an authorized recipient safe.
+repair for any authorized consumer's ability to disclose a value. Release policy
+uses a value-free warning plus a single Touch ID rather than a risk taxonomy; the
+only categorical refusals left are an unacknowledged raw `csec get` shape and the
+structural integrity checks. Approving an inspectable delivery does not make an
+authorized recipient safe.
 Native ciphertext and its rollback record protect durable data, while decrypted
 editor buffers and values released to consumers remain subject to the
 authorized-consumer boundary. The precise attacker capabilities and limits are

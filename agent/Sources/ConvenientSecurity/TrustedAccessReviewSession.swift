@@ -28,9 +28,6 @@
     private let context: LAContext
     private var state = State.ready
     private var selectionContinuation: CheckedContinuation<AccessPolicyReviewOutcome, Never>?
-    private var selectors: [String: NSPopUpButton] = [:]
-    private var acceptanceButtons: [String: NSButton] = [:]
-    private var policyControls: [NSControl] = []
     private var biometricsAvailable = false
 
     private var window: NSPanel!
@@ -136,8 +133,7 @@
 
       let footnote = NSTextField(
         wrappingLabelWithString:
-          "Risk classification describes the credential itself; a weaker compatibility "
-          + "delivery is accepted separately. No secret values are shown in this window."
+          "Touch ID authorizes this exact release. No secret values are shown in this window."
       )
       footnote.font = .systemFont(ofSize: 11)
       footnote.textColor = .tertiaryLabelColor
@@ -301,32 +297,6 @@
       )
     }
 
-    private static func badge(_ text: String, tint: NSColor) -> NSView {
-      let label = NSTextField(labelWithString: text.uppercased())
-      label.font = .systemFont(ofSize: 10, weight: .bold)
-      label.textColor = tint
-      let box = paddedBox(
-        content: label,
-        cornerRadius: 8.5,
-        fill: tint.withAlphaComponent(0.14),
-        border: nil,
-        horizontalPadding: 8,
-        verticalPadding: 2.5
-      )
-      box.setContentHuggingPriority(.required, for: .horizontal)
-      box.setContentCompressionResistancePriority(.required, for: .horizontal)
-      return box
-    }
-
-    private static func riskTint(_ level: RiskLevel) -> NSColor {
-      switch level {
-      case .low: return .systemGreen
-      case .standard: return .systemBlue
-      case .high, .unknown: return .systemOrange
-      case .critical: return .systemRed
-      }
-    }
-
     private static func assuranceTint(_ assurance: ConsumerAssurance) -> NSColor {
       switch assurance {
       case .verifiedProduct, .independentlyProtected: return .systemGreen
@@ -398,13 +368,6 @@
       headerRow.orientation = .horizontal
       headerRow.alignment = .centerY
       headerRow.spacing = 7
-      if credential.storedLevel != .unknown {
-        headerRow.addArrangedSubview(
-          Self.badge(
-            "\(ReviewDisplay.riskLabel(credential.storedLevel)) risk",
-            tint: Self.riskTint(credential.storedLevel)
-          ))
-      }
       stack.addArrangedSubview(headerRow)
       headerRow.widthAnchor.constraint(equalToConstant: innerWidth).isActive = true
 
@@ -440,48 +403,6 @@
         row.maximumNumberOfLines = 3
         row.preferredMaxLayoutWidth = innerWidth
         stack.addArrangedSubview(row)
-      }
-
-      if credential.storedLevel == .unknown {
-        let prompt = NSTextField(labelWithString: "Classify this credential’s risk:")
-        prompt.font = .systemFont(ofSize: 13)
-        let selector = NSPopUpButton()
-        selector.addItems(withTitles: ["Low", "Standard", "High", "Critical"])
-        selector.selectItem(withTitle: "Standard")
-        let row = NSStackView(views: [prompt, selector])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 8
-        stack.addArrangedSubview(row)
-        selectors[credential.identity.credentialKey] = selector
-        policyControls.append(selector)
-      }
-
-      if credential.scopeExpanded {
-        let scope = NSTextField(
-          wrappingLabelWithString:
-            "This request adds fields to the stored credential scope.")
-        scope.font = .systemFont(ofSize: 12, weight: .semibold)
-        scope.textColor = .systemOrange
-        scope.preferredMaxLayoutWidth = innerWidth
-        stack.addArrangedSubview(scope)
-      }
-
-      if credential.compatibilityReviewOffered {
-        let checkbox = NSButton(
-          checkboxWithTitle: DeliveryReviewCopy.compatibilityAcceptanceLabel(
-            for: review.plan,
-            storedLevel: credential.storedLevel
-          ),
-          target: nil,
-          action: nil
-        )
-        checkbox.font = .systemFont(ofSize: 13)
-        checkbox.state = credential.compatibilityAccepted ? .on : .off
-        checkbox.isEnabled = !credential.compatibilityAccepted
-        stack.addArrangedSubview(checkbox)
-        acceptanceButtons[credential.identity.credentialKey] = checkbox
-        policyControls.append(checkbox)
       }
 
       return Self.card(
@@ -598,7 +519,7 @@
 
       statusLabel = NSTextField(
         wrappingLabelWithString: biometricsAvailable
-          ? "Touch ID is active. The exact selection shown when it succeeds is checked before release."
+          ? "Touch ID is active. Touch the sensor to release the value, or Deny."
           : "Touch ID is unavailable, so this request cannot be authorized."
       )
       statusLabel.font = .systemFont(ofSize: 12)
@@ -655,7 +576,7 @@
       denyButton.title = "Cancel"
       statusLabel.textColor = .secondaryLabelColor
       statusLabel.stringValue =
-        "Touch ID is active. Adjust the selection if needed, then touch the sensor."
+        "Touch ID is active. Touch the sensor to authorize, or Deny."
 
       context.evaluatePolicy(
         .deviceOwnerAuthenticationWithBiometrics,
@@ -669,34 +590,6 @@
 
     @objc private func denyPressed(_ sender: Any?) {
       finishDenied(closeWindow: true)
-    }
-
-    private func selectedPolicy() -> AccessPolicyApproval? {
-      var classifications: [String: RiskLevel] = [:]
-      for (credentialKey, selector) in selectors {
-        let raw = selector.titleOfSelectedItem?.lowercased() ?? ""
-        guard let level = RiskLevel(rawValue: raw), level != .unknown else {
-          showValidationError("Choose an explicit risk level for every new credential.")
-          return nil
-        }
-        classifications[credentialKey] = level
-      }
-
-      let accepted = Set(
-        acceptanceButtons.compactMap { key, button in
-          button.state == .on ? key : nil
-        })
-      return AccessPolicyApproval(
-        classifications: classifications,
-        acceptedCompatibilityCredentialKeys: accepted
-      )
-    }
-
-    private func showValidationError(_ message: String) {
-      statusLabel.textColor = .systemRed
-      statusLabel.stringValue = message
-      statusLabel.isHidden = false
-      NSSound.beep()
     }
 
     private func authenticationFinished(success: Bool, error: (any Error)?) {
@@ -716,27 +609,15 @@
 
     private func authenticationApproved() {
       guard state == .authenticating else { return }
-      guard let selection = selectedPolicy() else {
-        finishDenied(closeWindow: true)
-        return
-      }
 
       state = .awaitingPolicy
-      for control in policyControls {
-        control.isEnabled = false
-      }
       statusLabel.textColor = .secondaryLabelColor
-      statusLabel.stringValue = "Touch ID accepted. Checking the exact selection…"
+      statusLabel.stringValue = "Touch ID accepted…"
 
       let continuation = selectionContinuation
       selectionContinuation = nil
       continuation?.resume(
-        returning: .approved(
-          AccessPolicyApproval(
-            classifications: selection.classifications,
-            acceptedCompatibilityCredentialKeys: selection.acceptedCompatibilityCredentialKeys,
-            authenticationSession: self
-          )))
+        returning: .approved(AccessPolicyApproval(authenticationSession: self)))
     }
 
     private func finishDenied(closeWindow shouldClose: Bool) {
@@ -762,8 +643,7 @@
     private static func initialAuthenticationReason(_ review: AccessPolicyReview) -> String {
       let plan = review.plan
       let policySummary =
-        "use the risk selection visible in Convenient Security; delivery "
-        + "\(plan.mechanism.rawValue); scope \(plan.descendantScope.rawValue); "
+        "delivery \(plan.mechanism.rawValue); scope \(plan.descendantScope.rawValue); "
         + "destination \(plan.destination.rawValue)"
       return BiometricConsent.prompt(
         caller: review.caller,

@@ -188,24 +188,6 @@ public struct AgentClient {
         _ = try? send(.cancelNativeStoreEdit(request))
     }
 
-    public func risk(
-        _ operation: RiskOperation,
-        reference: String,
-        level: RiskLevel? = nil
-    ) throws -> RiskInspection {
-        let request = RiskOperationRequest(
-            operation: operation,
-            reference: reference,
-            level: level
-        )
-        let response = try send(.risk(request))
-        try Self.check(response: response, requestID: request.requestID)
-        guard let inspection = response.riskInspection else {
-            throw ClientError.transportFailed
-        }
-        return inspection
-    }
-
     /// Ask csecd to run the value-free host posture audit and return the report.
     /// The privileged reads, TCC/FDA enumeration, and any parsing happen inside
     /// csecd; only the value-free `HostAuditReport` crosses back to the launcher.

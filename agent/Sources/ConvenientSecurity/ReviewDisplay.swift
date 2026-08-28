@@ -137,16 +137,6 @@ public enum ReviewDisplay {
         }
     }
 
-    public static func riskLabel(_ level: RiskLevel) -> String {
-        switch level {
-        case .unknown: return "Unclassified"
-        case .low: return "Low"
-        case .standard: return "Standard"
-        case .high: return "High"
-        case .critical: return "Critical"
-        }
-    }
-
     public static func duration(seconds total: Int) -> String {
         func unit(_ count: Int, _ singular: String) -> String {
             count == 1 ? "1 \(singular)" : "\(count) \(singular)s"

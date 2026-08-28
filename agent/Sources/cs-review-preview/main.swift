@@ -31,12 +31,6 @@ func ref(_ uri: String) -> SecretRef {
     return parsed
 }
 
-let slackIdentity = CredentialIdentity(
-    provider: "op",
-    providerAccountKey: String(repeating: "a", count: 64),
-    credentialKey: String(repeating: "b", count: 64),
-    memberReferenceKeys: [String(repeating: "c", count: 64)]
-)
 let slackReferences = [
     ref("op://Employee/Dexory Slack User Token/password"),
     ref("op://Employee/Dexory Slack User Token/web cookie"),
@@ -52,20 +46,8 @@ let nodeExecutable = PlannedExecutable(
     assurance: .unverified
 )
 
-func credential(
-    level: RiskLevel,
-    references: [SecretRef] = slackReferences,
-    scopeExpanded: Bool = false,
-    compatibilityOffered: Bool = false
-) -> PolicyReviewCredential {
-    PolicyReviewCredential(
-        identity: slackIdentity,
-        references: references,
-        storedLevel: level,
-        scopeExpanded: scopeExpanded,
-        compatibilityReviewOffered: compatibilityOffered,
-        compatibilityAccepted: false
-    )
+func credential(references: [SecretRef] = slackReferences) -> PolicyReviewCredential {
+    PolicyReviewCredential(references: references)
 }
 
 let review: AccessPolicyReview
@@ -83,7 +65,7 @@ case "basic":
             requestedTTLSeconds: 3600,
             operationContext: "yarn slack"
         ),
-        credentials: [credential(level: .standard)]
+        credentials: [credential()]
     )
 case "warning":
     review = AccessPolicyReview(
@@ -99,7 +81,7 @@ case "warning":
             requestedTTLSeconds: 300,
             operationContext: "csec get"
         ),
-        credentials: [credential(level: .standard, compatibilityOffered: true)]
+        credentials: [credential()]
     )
 case "unknown":
     review = AccessPolicyReview(
@@ -115,15 +97,11 @@ case "unknown":
             operationContext: "claude"
         ),
         credentials: [
-            credential(level: .unknown),
-            credential(
-                level: .high,
-                references: [
-                    ref("op://Infrastructure/AWS Deploy Key/access key id"),
-                    ref("op://Infrastructure/AWS Deploy Key/secret access key"),
-                ],
-                scopeExpanded: true
-            ),
+            credential(),
+            credential(references: [
+                ref("op://Infrastructure/AWS Deploy Key/access key id"),
+                ref("op://Infrastructure/AWS Deploy Key/secret access key"),
+            ]),
         ]
     )
 case "file":
@@ -140,7 +118,7 @@ case "file":
             requestedTTLSeconds: 300,
             operationContext: "csec get"
         ),
-        credentials: [credential(level: .critical, compatibilityOffered: true)]
+        credentials: [credential()]
     )
 case "mixed":
     review = AccessPolicyReview(
@@ -156,13 +134,10 @@ case "mixed":
             operationContext: "rails boot"
         ),
         credentials: [
-            credential(
-                level: .standard,
-                references: [
-                    ref("op://Employee/Dexory Slack User Token/password"),
-                    ref("csec://dexory-dev/DATABASE_URL"),
-                ]
-            )
+            credential(references: [
+                ref("op://Employee/Dexory Slack User Token/password"),
+                ref("csec://dexory-dev/DATABASE_URL"),
+            ])
         ]
     )
 default:

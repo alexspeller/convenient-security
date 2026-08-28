@@ -94,24 +94,6 @@ actor FakeKeychainBackend: KeychainBackend {
     }
 }
 
-actor FakeRiskJudgmentBackend: RiskJudgmentBackend {
-    private var items: [String: Data] = [:]
-
-    func load(service: String, account: String) async throws -> Data? {
-        items["\(service)|\(account)"]
-    }
-
-    func store(service: String, account: String, data: Data) async throws {
-        items["\(service)|\(account)"] = data
-    }
-
-    func delete(service: String, account: String) async throws {
-        items["\(service)|\(account)"] = nil
-    }
-
-    func snapshot() -> [String: Data] { items }
-}
-
 print("# SecretRef")
 
 // SecretRef: canonical URI parsing + scheme dispatch.
@@ -1010,78 +992,54 @@ if let parentStart = ProcessAncestry.startTime(of: myParent) {
     check(false, "parent start time is readable")
 }
 
-print("\n# GrantTable (policy-bound reuse and revocation)")
+print("\n# GrantTable (plan-digest-bound subtree reuse)")
 
 if let myStart = ProcessAncestry.startTime(of: me) {
     let table = GrantTable()
-    let binding = PolicyGrantBinding(
-        credentialKey: "opaque-credential",
-        riskLevel: .standard,
-        policyVersion: RiskPolicyV2.version,
-        policyDigest: "policy-a",
-        outputPolicy: .exactMatchRedactAndWarn
-    )
     await table.add(Grant(
         rootPID: me,
         rootStartTime: myStart,
         references: ["op://vault/item/password"],
         reason: "synthetic",
         expiresAt: Date().addingTimeInterval(60),
-        deliveryPlanDigest: "plan-a",
-        policyBinding: binding
+        deliveryPlanDigest: "plan-a"
     ))
     check(await table.accessibleReferences(
         for: me,
         now: Date(),
-        deliveryPlanDigest: "plan-a",
-        policyBindingsByReference: ["op://vault/item/password": binding]
+        deliveryPlanDigest: "plan-a"
     ) == ["op://vault/item/password"],
-    "a live grant is reusable only with its exact plan and policy binding")
+    "a live grant rooted at the caller is reusable for its exact plan digest")
 
-    let changedBinding = PolicyGrantBinding(
-        credentialKey: binding.credentialKey,
-        riskLevel: .high,
-        policyVersion: binding.policyVersion,
-        policyDigest: "policy-b",
-        outputPolicy: .stopAndSuppressOnMatch
-    )
     check(await table.accessibleReferences(
         for: me,
         now: Date(),
-        deliveryPlanDigest: "plan-a",
-        policyBindingsByReference: ["op://vault/item/password": changedBinding]
-    ).isEmpty, "a changed risk/policy snapshot cannot reuse an old grant")
+        deliveryPlanDigest: "plan-b"
+    ).isEmpty, "a different delivery-plan digest cannot reuse an existing grant")
 
-    check(await table.revoke(credentialKey: binding.credentialKey)
-          == ["op://vault/item/password"],
-          "targeted risk revocation returns affected in-memory cache identities")
+    // A non-descendant PID (init, pid 1) never inherits the caller's grant.
     check(await table.accessibleReferences(
-        for: me,
+        for: 1,
         now: Date(),
-        deliveryPlanDigest: "plan-a",
-        policyBindingsByReference: ["op://vault/item/password": binding]
-    ).isEmpty, "targeted risk revocation removes the live grant")
+        deliveryPlanDigest: "plan-a"
+    ).isEmpty, "a non-descendant process is not covered by the caller's grant")
 
-    let oldVersion = PolicyGrantBinding(
-        credentialKey: "old-policy-credential",
-        riskLevel: .low,
-        policyVersion: RiskPolicyV2.version - 1,
-        policyDigest: "old-policy",
-        outputPolicy: .exactMatchRedactAndWarn
-    )
+    // An expired grant is not reused even for its own plan digest.
     await table.add(Grant(
         rootPID: me,
         rootStartTime: myStart,
         references: ["csec://test/TOKEN"],
-        reason: "synthetic old policy",
-        expiresAt: Date().addingTimeInterval(60),
-        policyBinding: oldVersion
+        reason: "synthetic expired",
+        expiresAt: Date().addingTimeInterval(-1),
+        deliveryPlanDigest: "plan-expired"
     ))
-    check(await table.revalidate(policyVersion: RiskPolicyV2.version)
-          == ["csec://test/TOKEN"],
-          "a policy-version change revokes grants created by older policy code")
+    check(await table.accessibleReferences(
+        for: me,
+        now: Date(),
+        deliveryPlanDigest: "plan-expired"
+    ).isEmpty, "an expired grant is never reused")
 } else {
-    check(false, "policy-bound grant tests can read their root start time")
+    check(false, "plan-digest-bound grant tests can read their root start time")
 }
 
 print("\n# AgentSocket")
@@ -1887,22 +1845,6 @@ let unguardedEnvPlan = DeliveryPlan(
 )
 check((try? guardedEnvPlan.digest()) != (try? unguardedEnvPlan.digest()),
       "output masking versus byte-exact bypass changes the bound plan digest")
-let guardedOutputDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-output-binding",
-    storedLevel: .low,
-    evidence: [],
-    plan: guardedEnvPlan,
-    now: Date(timeIntervalSince1970: 2_000_000_000)
-))
-let unguardedOutputDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-output-binding",
-    storedLevel: .low,
-    evidence: [],
-    plan: unguardedEnvPlan,
-    now: Date(timeIntervalSince1970: 2_000_000_000)
-))
-check(guardedOutputDecision.policyDigest != unguardedOutputDecision.policyDigest,
-      "output-guard configuration changes the policy decision digest")
 
 do {
     let access = try AccessRequest(
@@ -2004,22 +1946,6 @@ do {
               "native-store plaintext uses bounded Data inside the authenticated edit protocol")
     } else {
         check(false, "native-store edit commit decodes as the correct request")
-    }
-    let risk = RiskOperationRequest(
-        operation: .classify,
-        reference: "csec://development/TOKEN",
-        level: .high,
-        requestID: UUID(uuidString: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff")!
-    )
-    let riskData = try JSONEncoder().encode(Request.risk(risk))
-    let riskDecoded = try JSONDecoder().decode(Request.self, from: riskData)
-    if case let .risk(roundTrip) = riskDecoded {
-        check(roundTrip.operation == .classify
-              && roundTrip.reference == "csec://development/TOKEN"
-              && roundTrip.level == .high,
-              "value-free risk operations round-trip with explicit level semantics")
-    } else {
-        check(false, "risk operation decodes as the correct request")
     }
 } catch {
     check(false, "native-store protocol requests round-trip (\(error))")
@@ -2141,176 +2067,207 @@ checkThrows("fd presets reject NUL-bearing file content") {
     _ = try InheritedFilePreset.googleServiceAccount.render("{\"key\":\"bad\0value\"}")
 }
 
-print("\n# RiskPolicyV2 (preview, pure decisions)")
+print("\n# ReleasePolicy (value-free release decision)")
 
-let policyNow = Date(timeIntervalSince1970: 2_000_000_000)
-let unknownDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-credential",
-    storedLevel: .unknown,
-    evidence: [],
-    plan: basePlan,
-    now: policyNow
-))
-check(unknownDecision.effectiveLevel == .high,
-      "unknown credentials are enforced at the high floor")
-check(!unknownDecision.allowed && unknownDecision.denialReason == .classificationRequired,
-      "unknown credentials fail closed pending classification")
+// TTL cap constants match the centralized policy.
+check(ReleasePolicy.defaultTTLSeconds == 12 * 60 * 60
+      && ReleasePolicy.maxTTLSeconds == 24 * 60 * 60,
+      "release policy exposes the 12h default and 24h hard cap")
 
-let lowEnvDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-low",
-    storedLevel: .low,
-    evidence: [],
-    plan: envPlan,
-    now: policyNow
-))
-check(lowEnvDecision.allowed, "low-risk policy permits labeled compatibility env delivery")
-check(lowEnvDecision.ttlCapSeconds == 12 * 3600,
-      "low-risk TTL cap comes from the centralized table")
-
-let standardWithoutAcceptance = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-standard",
-    storedLevel: .standard,
-    evidence: [],
-    plan: envPlan,
-    now: policyNow
-))
-check(!standardWithoutAcceptance.allowed
-      && standardWithoutAcceptance.denialReason == .compatibilityAcceptanceRequired,
-      "standard-risk env delivery requires a separate cached acceptance")
-
-let acceptance = DeliveryAcceptance(
-    credentialKey: "opaque-standard",
-    shape: CompatibilityDeliveryShape(plan: envPlan),
-    policyVersion: RiskPolicyV2.version,
-    acceptedAt: policyNow.addingTimeInterval(-60),
-    reviewAfter: policyNow.addingTimeInterval(3600)
+// (a) A normal protected directHeap plan is allowed, honors its requested TTL,
+// and derives the in-band redact-and-warn output policy.
+let heapPlan = DeliveryPlan.directHeap(
+    executablePath: "/usr/bin/ruby",
+    ttlSeconds: ReleasePolicy.defaultTTLSeconds,
+    operationContext: "boot application"
 )
-let standardWithAcceptance = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-standard",
-    storedLevel: .standard,
-    evidence: [],
-    plan: envPlan,
-    acceptance: acceptance,
-    now: policyNow
-))
-check(standardWithAcceptance.allowed,
-      "matching unexpired delivery acceptance permits standard compatibility env")
+let heapDecision = ReleasePolicy.evaluate(plan: heapPlan)
+check(heapDecision.allowed
+      && heapDecision.denialReason == nil
+      && heapDecision.grantedTTLSeconds == ReleasePolicy.defaultTTLSeconds
+      && heapDecision.outputPolicy == .exactMatchRedactAndWarn
+      && !heapDecision.requiresPlaintextAcknowledgement,
+      "a protected directHeap plan is allowed with its 12h TTL and redact-and-warn output")
 
-let standardPipeWithoutAcceptance = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-standard-pipe",
-    storedLevel: .standard,
-    evidence: [],
-    plan: shellPipePlan,
-    now: policyNow
-))
-check(!standardPipeWithoutAcceptance.allowed
-      && standardPipeWithoutAcceptance.denialReason == .compatibilityAcceptanceRequired,
-      "standard-risk shell-delegated pipe requires its own compatibility acceptance")
-let pipeAcceptance = DeliveryAcceptance(
-    credentialKey: "opaque-standard-pipe",
-    shape: CompatibilityDeliveryShape(plan: shellPipePlan),
-    policyVersion: RiskPolicyV2.version,
-    acceptedAt: policyNow.addingTimeInterval(-60),
-    reviewAfter: policyNow.addingTimeInterval(3600)
+// The granted TTL is clamped to the 24h hard cap regardless of the request.
+let overlongPlan = DeliveryPlan.directHeap(
+    executablePath: "/usr/bin/ruby",
+    ttlSeconds: 999_999,
+    operationContext: "boot application"
 )
-check(pipeAcceptance.permits(
-    credentialKey: "opaque-standard-pipe",
-    plan: shellPipePlan,
-    policyVersion: RiskPolicyV2.version,
-    at: policyNow
-), "pipe acceptance matches its exact delivery shape")
-check(!pipeAcceptance.permits(
-    credentialKey: "opaque-standard-pipe",
-    plan: shellRootedPlan,
-    policyVersion: RiskPolicyV2.version,
-    at: policyNow
-) && !pipeAcceptance.permits(
-    credentialKey: "opaque-standard-pipe",
-    plan: persistentGetPlan,
-    policyVersion: RiskPolicyV2.version,
-    at: policyNow
-), "pipe acceptance cannot approve terminal or persistent-file delivery")
-let standardPipeWithAcceptance = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-standard-pipe",
-    storedLevel: .standard,
-    evidence: [],
-    plan: shellPipePlan,
-    acceptance: pipeAcceptance,
-    now: policyNow
-))
-check(standardPipeWithAcceptance.allowed,
-      "reviewed standard-risk shell-delegated pipe is allowed")
+let overlongDecision = ReleasePolicy.evaluate(plan: overlongPlan)
+check(overlongDecision.allowed
+      && overlongDecision.grantedTTLSeconds == ReleasePolicy.maxTTLSeconds,
+      "an overlong requested TTL is capped at the 24h backstop")
 
-let highPipeAcceptance = DeliveryAcceptance(
-    credentialKey: "opaque-high-pipe",
-    shape: CompatibilityDeliveryShape(plan: shellPipePlan),
-    policyVersion: RiskPolicyV2.version,
-    acceptedAt: policyNow,
-    reviewAfter: policyNow.addingTimeInterval(15 * 60)
+// (b) A non-positive requested TTL is refused as an invalid TTL.
+let zeroTTLPlan = DeliveryPlan.directHeap(
+    executablePath: "/usr/bin/ruby",
+    ttlSeconds: 0,
+    operationContext: "boot application"
 )
-let highPipeDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-high-pipe",
-    storedLevel: .high,
-    evidence: [],
-    plan: shellPipePlan,
-    acceptance: highPipeAcceptance,
-    now: policyNow
-))
-check(highPipeDecision.allowed
-      && highPipeDecision.requiresFreshBiometric
-      && highPipeDecision.grantedTTLSeconds == 15 * 60,
-      "explicit high-risk pipe approval uses fresh authentication and the short TTL cap")
+let zeroTTLDecision = ReleasePolicy.evaluate(plan: zeroTTLPlan)
+check(!zeroTTLDecision.allowed
+      && zeroTTLDecision.denialReason == .invalidTTL
+      && zeroTTLDecision.grantedTTLSeconds == 0,
+      "a non-positive requested TTL is refused as an invalid TTL")
 
-let criticalFileAcceptance = DeliveryAcceptance(
-    credentialKey: "opaque-critical-file",
-    shape: CompatibilityDeliveryShape(plan: persistentGetPlan),
-    policyVersion: RiskPolicyV2.version,
-    acceptedAt: policyNow,
-    reviewAfter: policyNow.addingTimeInterval(5 * 60)
-)
-let criticalFileDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-critical-file",
-    storedLevel: .critical,
-    evidence: [],
-    plan: persistentGetPlan,
-    acceptance: criticalFileAcceptance,
-    now: policyNow
-))
-check(criticalFileDecision.allowed
-      && criticalFileDecision.requiresFreshBiometric
-      && criticalFileDecision.grantedTTLSeconds == 5 * 60,
-      "explicit critical persistent-file approval uses fresh authentication and the very short cap")
-check(standardPipeWithoutAcceptance.policyDigest == standardPipeWithAcceptance.policyDigest,
-      "transient compatibility approval is represented by the exact live grant, not a broader policy digest")
+// Shared csec-get shapes for the plaintext-acknowledgement gate. Only the
+// mechanism/recipient/interactive/ack fields drive the decision.
+func getPlan(
+    mechanism: DeliveryMechanism,
+    destination: DestinationClass,
+    recipient: RecipientAssurance?,
+    interactive: Bool,
+    acknowledged: Bool,
+    ttlSeconds: Int = 3600
+) -> DeliveryPlan {
+    DeliveryPlan(
+        mechanism: mechanism,
+        executable: PlannedExecutable(
+            canonicalPath: "/Applications/ConvenientSecurity.app/Contents/MacOS/csec",
+            assurance: .verifiedProduct
+        ),
+        root: .caller,
+        descendantScope: .subtree,
+        destination: destination,
+        recipientAssurance: recipient,
+        requestedTTLSeconds: ttlSeconds,
+        operationContext: "interactive get",
+        interactive: interactive,
+        plaintextExposureAcknowledged: acknowledged
+    )
+}
 
-let reviewIdentity = CredentialIdentity(
-    provider: "op",
-    providerAccountKey: String(repeating: "a", count: 64),
-    credentialKey: String(repeating: "b", count: 64),
-    memberReferenceKeys: [String(repeating: "c", count: 64)]
+// (c) rawStandardOutput to an interactive terminal always needs an
+// acknowledgement (terminal scrollback), regardless of interactivity.
+let terminalNoAck = getPlan(
+    mechanism: .rawStandardOutput, destination: .humanOutput,
+    recipient: .interactiveTerminal, interactive: true, acknowledged: false
 )
+let terminalNoAckDecision = ReleasePolicy.evaluate(plan: terminalNoAck)
+check(!terminalNoAckDecision.allowed
+      && terminalNoAckDecision.denialReason == .plaintextExposureNotAcknowledged
+      && terminalNoAckDecision.requiresPlaintextAcknowledgement,
+      "raw terminal output without an acknowledgement is refused")
+let terminalWithAck = getPlan(
+    mechanism: .rawStandardOutput, destination: .humanOutput,
+    recipient: .interactiveTerminal, interactive: true, acknowledged: true
+)
+let terminalWithAckDecision = ReleasePolicy.evaluate(plan: terminalWithAck)
+check(terminalWithAckDecision.allowed
+      && terminalWithAckDecision.denialReason == nil
+      && terminalWithAckDecision.requiresPlaintextAcknowledgement
+      && terminalWithAckDecision.outputPolicy == .exactMatchRedactAndWarn,
+      "raw terminal output with the acknowledgement is allowed")
+
+// (d) rawStandardOutput to an unverified pipe reader: an interactive human
+// piping to a command needs no acknowledgement; a non-interactive capture does.
+let interactivePipe = getPlan(
+    mechanism: .rawStandardOutput, destination: .shellDelegatedPipe,
+    recipient: .unverifiedPipeReader, interactive: true, acknowledged: false
+)
+let interactivePipeDecision = ReleasePolicy.evaluate(plan: interactivePipe)
+check(interactivePipeDecision.allowed
+      && interactivePipeDecision.denialReason == nil
+      && !interactivePipeDecision.requiresPlaintextAcknowledgement,
+      "an interactive human piping raw output needs no acknowledgement")
+let capturedPipe = getPlan(
+    mechanism: .rawStandardOutput, destination: .shellDelegatedPipe,
+    recipient: .unverifiedPipeReader, interactive: false, acknowledged: false
+)
+let capturedPipeDecision = ReleasePolicy.evaluate(plan: capturedPipe)
+check(!capturedPipeDecision.allowed
+      && capturedPipeDecision.denialReason == .plaintextExposureNotAcknowledged
+      && capturedPipeDecision.requiresPlaintextAcknowledgement,
+      "a non-interactive pipe capture without an acknowledgement is refused")
+
+// (e) A named plaintext file always requires an acknowledgement, even when a
+// human is interactively present.
+let fileNoAck = getPlan(
+    mechanism: .namedPlaintextFile, destination: .persistentPlaintextFile,
+    recipient: .ordinaryPersistentFile, interactive: true, acknowledged: false
+)
+let fileNoAckDecision = ReleasePolicy.evaluate(plan: fileNoAck)
+check(!fileNoAckDecision.allowed
+      && fileNoAckDecision.denialReason == .plaintextExposureNotAcknowledged
+      && fileNoAckDecision.requiresPlaintextAcknowledgement,
+      "a persistent plaintext file without an acknowledgement is refused")
+let fileWithAck = getPlan(
+    mechanism: .namedPlaintextFile, destination: .persistentPlaintextFile,
+    recipient: .ordinaryPersistentFile, interactive: true, acknowledged: true
+)
+let fileWithAckDecision = ReleasePolicy.evaluate(plan: fileWithAck)
+check(fileWithAckDecision.allowed && fileWithAckDecision.denialReason == nil,
+      "a persistent plaintext file with the acknowledgement is allowed")
+
+// (f) The credential-protocol mechanism is an intentional credential channel.
+let credentialPlan = DeliveryPlan(
+    mechanism: .credentialProtocol,
+    executable: PlannedExecutable(canonicalPath: "/usr/bin/git", assurance: .independentlyProtected),
+    root: .caller,
+    descendantScope: .exactProcess,
+    destination: .credentialConsumer,
+    requestedTTLSeconds: 3600,
+    operationContext: "git credential helper"
+)
+let credentialDecision = ReleasePolicy.evaluate(plan: credentialPlan)
+check(credentialDecision.allowed
+      && credentialDecision.outputPolicy == .intentionalCredentialChannel
+      && !credentialDecision.requiresPlaintextAcknowledgement,
+      "a credential-protocol delivery uses the intentional credential channel output policy")
+
+// plaintextAcknowledgementRequired truth table: only the two raw csec-get
+// exposure shapes above require an override; every protected mechanism does not.
+check(ReleasePolicy.plaintextAcknowledgementRequired(fileNoAck)
+      && ReleasePolicy.plaintextAcknowledgementRequired(getPlan(
+          mechanism: .namedPlaintextFile, destination: .persistentPlaintextFile,
+          recipient: .ordinaryPersistentFile, interactive: false, acknowledged: false)),
+      "a named plaintext file always requires an acknowledgement, interactive or not")
+check(ReleasePolicy.plaintextAcknowledgementRequired(terminalNoAck)
+      && ReleasePolicy.plaintextAcknowledgementRequired(getPlan(
+          mechanism: .rawStandardOutput, destination: .humanOutput,
+          recipient: .interactiveTerminal, interactive: false, acknowledged: false)),
+      "raw output to an interactive terminal always requires an acknowledgement")
+check(!ReleasePolicy.plaintextAcknowledgementRequired(interactivePipe)
+      && ReleasePolicy.plaintextAcknowledgementRequired(capturedPipe),
+      "a raw pipe requires an acknowledgement only for a non-interactive capture")
+for protectedMechanism: DeliveryMechanism in [
+    .directHeap, .capabilityGIDFile, .inheritedFileDescriptor, .credentialProtocol,
+    .sealedEnvironment, .restrictedLateEnvironment, .execHook,
+    .unrestrictedInitialEnvironment,
+] {
+    let protectedPlan = DeliveryPlan(
+        mechanism: protectedMechanism,
+        executable: PlannedExecutable(canonicalPath: "/usr/bin/ruby", assurance: .independentlyProtected),
+        root: .caller,
+        descendantScope: .subtree,
+        destination: .localDevelopment,
+        requestedTTLSeconds: 3600,
+        operationContext: "protected mechanism"
+    )
+    check(!ReleasePolicy.plaintextAcknowledgementRequired(protectedPlan),
+          "protected mechanism \(protectedMechanism.rawValue) never requires an acknowledgement")
+}
+
+// The value-free review copy derives the destination-appropriate warning and
+// recipient description purely from the plan; it carries no value or path.
 let fileReview = AccessPolicyReview(
     caller: CallerInfo(pid: 4242, startTime: 999_999, description: "fish [user_writable]"),
     reason: "review persistent delivery",
     plan: persistentGetPlan,
     credentials: [PolicyReviewCredential(
-        identity: reviewIdentity,
-        references: [try! SecretRef("op://Synthetic/Item/token")],
-        storedLevel: .critical,
-        scopeExpanded: false,
-        compatibilityReviewOffered: true,
-        compatibilityAccepted: false
+        references: [try! SecretRef("op://Synthetic/Item/token")]
     )]
 )
 let fileWarning = DeliveryReviewCopy.warning(for: fileReview) ?? ""
 check(fileWarning.contains("Plaintext will persist in an ordinary file")
       && fileWarning.contains("processes running as you")
       && fileWarning.contains("copying, backups")
-      && fileWarning.contains("csec exec-file")
-      && fileWarning.contains("CRITICAL-RISK")
+      && fileWarning.contains("csec exec, exec-file, or a credential helper")
       && !fileWarning.contains("secret-output.txt")
       && !fileWarning.contains("synthetic-secret-value"),
-      "persistent-file review gives the complete value-free strongest warning")
+      "persistent-file review gives the complete value-free warning steering toward injection")
 let pipeReview = AccessPolicyReview(
     caller: fileReview.caller,
     reason: "review delegated pipe",
@@ -2386,174 +2343,7 @@ check(ReviewDisplay.duration(seconds: 45) == "45 seconds"
       && ReviewDisplay.duration(seconds: 90) == "1 minute 30 seconds",
       "requested durations render in plain units")
 
-let aiSubtreePlan = DeliveryPlan(
-    mechanism: .directHeap,
-    executable: baseExecutable,
-    root: .caller,
-    descendantScope: .subtree,
-    destination: .aiTool,
-    requestedTTLSeconds: 300,
-    operationContext: "AI-assisted development"
-)
-let aiSubtreeDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-standard",
-    storedLevel: .standard,
-    evidence: [],
-    plan: aiSubtreePlan,
-    now: policyNow
-))
-check(!aiSubtreeDecision.allowed
-      && aiSubtreeDecision.denialReason == .descendantScopeTooBroad,
-      "standard-risk access does not implicitly grant an AI process subtree")
-
-let criticalEvidence = RiskEvidence(
-    category: .authority,
-    floor: .critical,
-    source: .providerMetadata,
-    evidenceDigest: "opaque-evidence",
-    observedAt: policyNow
-)
-let raisedDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-low",
-    storedLevel: .low,
-    evidence: [criticalEvidence],
-    plan: basePlan,
-    now: policyNow
-))
-check(raisedDecision.effectiveLevel == .critical,
-      "provider evidence raises a cached low judgment")
-check(!raisedDecision.allowed && raisedDecision.denialReason == .consumerAssuranceInsufficient,
-      "critical policy rejects a user-writable consumer")
-
-let protectedHighPlan = DeliveryPlan(
-    mechanism: .directHeap,
-    executable: PlannedExecutable(
-        canonicalPath: "/usr/bin/security",
-        assurance: .independentlyProtected
-    ),
-    root: .caller,
-    descendantScope: .exactProcess,
-    destination: .production,
-    requestedTTLSeconds: 3600,
-    operationContext: "bounded production read"
-)
-let highDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-high",
-    storedLevel: .high,
-    evidence: [],
-    plan: protectedHighPlan,
-    now: policyNow
-))
-check(highDecision.allowed && highDecision.grantedTTLSeconds == 15 * 60,
-      "high-risk protected exact-process delivery is allowed with a 15-minute cap")
-check(highDecision.outputPolicy == .stopAndSuppressOnMatch,
-      "high-risk output matches fail closed")
-check(highDecision.policyDigest == RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-high",
-    storedLevel: .high,
-    evidence: [],
-    plan: protectedHighPlan,
-    now: policyNow
-)).policyDigest, "identical policy inputs yield a stable policy digest")
-
-let highSessionPlan = DeliveryPlan(
-    mechanism: .inheritedFileDescriptor,
-    executable: PlannedExecutable(
-        canonicalPath: "/usr/bin/security",
-        assurance: .independentlyProtected
-    ),
-    root: .registeredSession(id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
-    descendantScope: .broadSession,
-    destination: .localDevelopment,
-    requestedTTLSeconds: 300,
-    operationContext: "broad high-risk session"
-)
-let highSessionDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-high-session",
-    storedLevel: .high,
-    evidence: [],
-    plan: highSessionPlan,
-    now: policyNow
-))
-check(!highSessionDecision.allowed
-      && highSessionDecision.denialReason == .descendantScopeTooBroad,
-      "high-risk credentials retain per-command roots instead of broad sessions")
-
-print("\n# RiskJudgmentStore (opaque metadata, in-memory backend)")
-
-do {
-    let backend = FakeRiskJudgmentBackend()
-    let store = RiskJudgmentStore(backend: backend)
-    let rawAccount = "synthetic-account-name"
-    let rawGroup = "Synthetic Vault/Synthetic Item"
-    let rawMember = "op://Synthetic Vault/Synthetic Item/password"
-    let identity = try await store.credentialIdentity(
-        provider: "op",
-        providerAccount: rawAccount,
-        group: rawGroup,
-        memberReferences: [rawMember]
-    )
-    check(identity.credentialKey.count == 64 && identity.memberReferenceKeys.first?.count == 64,
-          "credential and member identities are keyed opaque hashes")
-    check(identity.credentialKey != identity.memberReferenceKeys.first,
-          "logical credential and member use domain-separated opaque IDs")
-
-    let sameIdentity = try await RiskJudgmentStore(backend: backend).credentialIdentity(
-        provider: "op",
-        providerAccount: rawAccount,
-        group: rawGroup,
-        memberReferences: [rawMember]
-    )
-    check(sameIdentity == identity, "device-key identity remains stable across store restarts")
-
-    let judgment = RiskJudgment(
-        credential: identity,
-        level: .standard,
-        evidence: [],
-        source: .explicitUser,
-        decidedAt: policyNow,
-        reviewAfter: policyNow.addingTimeInterval(3600),
-        policyVersion: RiskPolicyV2.version
-    )
-    try await store.save(judgment)
-    check(try await store.load(
-        credentialKey: identity.credentialKey,
-        policyVersion: RiskPolicyV2.version,
-        at: policyNow
-    ) == judgment, "current judgment round-trips separately from grants and values")
-
-    let storedAcceptance = DeliveryAcceptance(
-        credentialKey: identity.credentialKey,
-        shape: CompatibilityDeliveryShape(plan: envPlan),
-        policyVersion: RiskPolicyV2.version,
-        acceptedAt: policyNow,
-        reviewAfter: policyNow.addingTimeInterval(3600)
-    )
-    try await store.save(storedAcceptance)
-    check(try await store.loadAcceptance(
-        credentialKey: identity.credentialKey,
-        plan: envPlan,
-        policyVersion: RiskPolicyV2.version,
-        at: policyNow
-    ) == storedAcceptance, "weaker-delivery acceptance is stored separately from risk judgment")
-
-    let storedText = await backend.snapshot().reduce(into: "") { partial, item in
-        partial += item.key
-        partial += String(data: item.value, encoding: .utf8) ?? ""
-    }
-    check(!storedText.contains(rawAccount)
-          && !storedText.contains(rawGroup)
-          && !storedText.contains(rawMember),
-          "persisted judgment records contain no raw account, item, or reference")
-
-    check(try await store.load(
-        credentialKey: identity.credentialKey,
-        policyVersion: RiskPolicyV2.version + 1,
-        at: policyNow
-    ) == nil, "policy-version change invalidates and removes a cached judgment")
-} catch {
-    check(false, "risk judgment store checks succeed (\(error))")
-}
+print("\n# CredentialGrouping (display + grant shaping)")
 
 check(CredentialGrouping.onePasswordGroup(
     for: try! SecretRef("op://Vault Name/Item Name/section/password")
@@ -2570,27 +2360,7 @@ check(groupedReferences.count == 2
       "provider grouping combines 1Password fields and native keys by logical capability")
 check(CredentialGrouping.nativeStoreGroup(
     for: try! SecretRef("csec://production/*")
-) == "production", "native edit access and native keys share the store-level judgment")
-
-let namedFilePlan = DeliveryPlan(
-    mechanism: .namedPlaintextFile,
-    executable: baseExecutable,
-    root: .caller,
-    descendantScope: .exactProcess,
-    destination: .localDevelopment,
-    requestedTTLSeconds: 300,
-    operationContext: "external editor"
-)
-let namedFileDecision = RiskPolicyV2.evaluate(RiskPolicyInput(
-    credentialKey: "opaque-standard",
-    storedLevel: .standard,
-    evidence: [],
-    plan: namedFilePlan,
-    now: policyNow
-))
-check(!namedFileDecision.allowed
-      && namedFileDecision.denialReason == .compatibilityAcceptanceRequired,
-      "named plaintext files require separate acceptance at standard risk")
+) == "production", "native edit access and native keys share the store-level grouping")
 
 print("\n# OnePasswordProvider (op CLI plumbing, no account access)")
 
@@ -3443,10 +3213,10 @@ let policyPrompt = BiometricConsent.prompt(
     references: [promptRef],
     reason: "run migrations",
     ttl: 15 * 60,
-    policySummary: "risk high × 1; delivery direct_heap"
+    policySummary: "delivery direct_heap; root per-command; scope subtree"
 )
-check(policyPrompt.contains("policy: risk high × 1; delivery direct_heap"),
-      "the OS authentication prompt binds the selected risk and delivery policy")
+check(policyPrompt.contains("policy: delivery direct_heap; root per-command; scope subtree"),
+      "the OS authentication prompt binds the value-free delivery policy summary")
 
 let spoofedPrompt = BiometricConsent.prompt(
     caller: CallerInfo(pid: 4242, startTime: 1, description: "ruby\nverified launcher"),

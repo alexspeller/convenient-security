@@ -78,34 +78,7 @@ actor DenyPolicyReview: PolicyReviewProvider {
         count += 1
         return .denied
     }
-    func reviewRiskChange(_ review: RiskChangeReview) async -> Bool { false }
     func calls() -> Int { count }
-}
-
-actor SequencedCompatibilityPolicyReview: PolicyReviewProvider {
-    private var compatibilityApprovals: [Bool]
-    private var reviews: [AccessPolicyReview] = []
-
-    init(_ compatibilityApprovals: [Bool]) {
-        self.compatibilityApprovals = compatibilityApprovals
-    }
-
-    func reviewAccess(_ review: AccessPolicyReview) async -> AccessPolicyReviewOutcome {
-        reviews.append(review)
-        let approveCompatibility = compatibilityApprovals.isEmpty
-            ? false : compatibilityApprovals.removeFirst()
-        let classifications = Dictionary(uniqueKeysWithValues: review.credentials.compactMap {
-            $0.storedLevel == .unknown ? ($0.identity.credentialKey, RiskLevel.standard) : nil
-        })
-        return .approved(AccessPolicyApproval(
-            classifications: classifications,
-            acceptedCompatibilityCredentialKeys: approveCompatibility
-                ? Set(review.credentials.map { $0.identity.credentialKey }) : []
-        ))
-    }
-
-    func reviewRiskChange(_ review: RiskChangeReview) async -> Bool { false }
-    func snapshot() -> [AccessPolicyReview] { reviews }
 }
 
 actor SignalingDelayedPolicyReview: PolicyReviewProvider {
@@ -121,18 +94,8 @@ actor SignalingDelayedPolicyReview: PolicyReviewProvider {
             FileManager.default.createFile(atPath: marker, contents: Data())
         }
         try? await Task.sleep(nanoseconds: 300_000_000)
-        let classifications = Dictionary(uniqueKeysWithValues: review.credentials.compactMap {
-            $0.storedLevel == .unknown ? ($0.identity.credentialKey, RiskLevel.low) : nil
-        })
-        return .approved(AccessPolicyApproval(
-            classifications: classifications,
-            acceptedCompatibilityCredentialKeys: Set(
-                review.credentials.map { $0.identity.credentialKey }
-            )
-        ))
+        return .approved(AccessPolicyApproval())
     }
-
-    func reviewRiskChange(_ review: RiskChangeReview) async -> Bool { false }
 }
 
 actor AccessReviewCapture {
@@ -153,10 +116,6 @@ struct CapturingAutoApprovePolicyReview: PolicyReviewProvider {
     func reviewAccess(_ review: AccessPolicyReview) async -> AccessPolicyReviewOutcome {
         await capture.record(review)
         return await delegate.reviewAccess(review)
-    }
-
-    func reviewRiskChange(_ review: RiskChangeReview) async -> Bool {
-        await delegate.reviewRiskChange(review)
     }
 }
 
@@ -184,24 +143,14 @@ actor EmbeddedAuthenticationCounter: AccessPolicyAuthenticationSession {
 }
 
 struct EmbeddedAuthenticationPolicyReview: PolicyReviewProvider {
-    let level: RiskLevel
     let session: EmbeddedAuthenticationCounter
 
     func reviewAccess(_ review: AccessPolicyReview) async -> AccessPolicyReviewOutcome {
         // Model the production UI: its biometric succeeds and freezes the
         // visible selection before the agent receives the value-free snapshot.
         await session.recordPreauthentication()
-        let classifications = Dictionary(uniqueKeysWithValues: review.credentials.compactMap {
-            $0.storedLevel == .unknown ? ($0.identity.credentialKey, level) : nil
-        })
-        return .approved(AccessPolicyApproval(
-            classifications: classifications,
-            acceptedCompatibilityCredentialKeys: [],
-            authenticationSession: session
-        ))
+        return .approved(AccessPolicyApproval(authenticationSession: session))
     }
-
-    func reviewRiskChange(_ review: RiskChangeReview) async -> Bool { false }
 }
 
 actor RequestCapture {
@@ -267,7 +216,6 @@ let agent = Agent(
     resolver: resolver,
     grants: grants,
     consent: consent,
-    riskJudgments: RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend()),
     policyReview: CapturingAutoApprovePolicyReview(capture: accessReviewCapture),
     nativeStore: nativeProvider,
     allowUnverifiedPlansForTesting: true
@@ -306,8 +254,6 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.commitNativeStoreBlobs(request: commit, caller: caller)
     case let .cancelNativeStoreEdit(cancel):
         return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
-    case let .risk(risk):
-        return await agent.handleRiskOperation(request: risk, caller: caller)
     case let .hostAudit(request):
         return Response(requestID: request.requestID, hostAuditReport: nil)
     case let .hostAuditStart(request):
@@ -471,14 +417,12 @@ do {
           && capabilities.features.contains(.outputGuardBinding)
           && capabilities.features.contains(.activeOutputRedaction)
           && capabilities.features.contains(.nativeEncryptedStore)
-          && capabilities.features.contains(.riskPolicyV2)
-          && capabilities.features.contains(.riskManagement)
           && capabilities.features.contains(.nativeEditorPolicy)
           && capabilities.features.contains(.registeredSessionRoots)
           && capabilities.features.contains(.credentialProtocols)
           && capabilities.features.contains(.inheritedFileDescriptors)
           && capabilities.features.contains(.protectedRegularFiles),
-          "agent advertises delivery, redaction, native-store, risk-policy, and secure-file capabilities")
+          "agent advertises delivery, redaction, native-store, and secure-file capabilities")
 } catch {
     check(false, "protocol capability negotiation succeeds (\(error))")
 }
@@ -676,9 +620,9 @@ if let unboundOutputRequest = try? AccessRequest(
     check(false, "unbound-output request can be constructed for rejection testing")
 }
 
-// Unknown classification and a preclassified incompatible mechanism both stop
-// before the resolver/cache boundary, even for a syntactically valid request
-// constructed directly rather than through csec's normal command planner.
+// A denied trusted review must stop before the resolver/cache boundary and
+// without falling back to the ConsentProvider, even for a syntactically valid
+// request constructed directly rather than through csec's normal planner.
 do {
     let guardedCounter = ResolutionCounter()
     let guardedResolver = SecretResolver(cache: NullSecretCache())
@@ -686,14 +630,12 @@ do {
         values: ["op://production/admin/token": "never-resolve-this"],
         counter: guardedCounter
     ))
-    let guardedStore = RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend())
     let denyingReview = DenyPolicyReview()
     let guardedConsent = ConsentCounter()
     let guardedAgent = Agent(
         resolver: guardedResolver,
         grants: GrantTable(),
         consent: guardedConsent,
-        riskJudgments: guardedStore,
         policyReview: denyingReview,
         allowUnverifiedPlansForTesting: true
     )
@@ -709,77 +651,33 @@ do {
         descendantScope: .subtree,
         destination: .localDevelopment,
         requestedTTLSeconds: 3600,
-        operationContext: "unknown classification test"
+        operationContext: "denied review test"
     )
-    let unknownRequest = try AccessRequest(
+    let deniedRequest = try AccessRequest(
         references: ["op://production/admin/token"],
-        reason: "unknown must be reviewed",
+        reason: "a new reference must pass the trusted review",
         ttlSeconds: 3600,
         deliveryPlan: heapPlan
     )
-    let unknownResponse = await guardedAgent.handle(
-        request: unknownRequest,
+    let deniedResponse = await guardedAgent.handle(
+        request: deniedRequest,
         caller: directCaller
     )
-    let unknownResolutionCalls = await guardedCounter.calls()
-    let unknownConsentCalls = await guardedConsent.calls()
-    let unknownReviewCalls = await denyingReview.calls()
-    check(unknownResponse.failure?.code == .consentDenied
-          && unknownResolutionCalls == 0
-          && unknownConsentCalls == 0
-          && unknownReviewCalls == 1,
-          "unknown risk requires trusted review before fallback consent or provider resolution")
-
-    let highReference = try SecretRef("op://production/admin/token")
-    let descriptor = CredentialGrouping.groups(for: [highReference])[0]
-    let identity = try await guardedStore.credentialIdentity(
-        provider: descriptor.provider,
-        providerAccount: descriptor.providerAccount,
-        group: descriptor.group,
-        memberReferences: descriptor.references.map(\.uri)
-    )
-    try await guardedStore.save(RiskJudgment(
-        credential: identity,
-        level: .high,
-        evidence: [],
-        source: .explicitUser,
-        decidedAt: Date(),
-        reviewAfter: Date().addingTimeInterval(3600),
-        policyVersion: RiskPolicyV2.version
-    ))
-    let envPlan = DeliveryPlan(
-        mechanism: .unrestrictedInitialEnvironment,
-        executable: PlannedExecutable(canonicalPath: "/bin/sh", assurance: .unverified),
-        root: .caller,
-        descendantScope: .subtree,
-        destination: .localDevelopment,
-        requestedTTLSeconds: 3600,
-        operationContext: "hand-written incompatible delivery",
-        outputGuard: OutputGuardPlan(mode: .always)
-    )
-    let highRequest = try AccessRequest(
-        references: [highReference.uri],
-        reason: "must fail before resolution",
-        ttlSeconds: 3600,
-        deliveryPlan: envPlan
-    )
-    let highResponse = await guardedAgent.handle(request: highRequest, caller: directCaller)
-    let highResolutionCalls = await guardedCounter.calls()
-    let highConsentCalls = await guardedConsent.calls()
-    let highReviewCalls = await denyingReview.calls()
-    check(highResponse.failure?.code == .policyDenied
-          && highResolutionCalls == 0
-          && highConsentCalls == 0
-          && highReviewCalls == 1,
-          "a hand-written high-risk environment request is denied before review, biometric, cache, or provider")
+    let deniedResolutionCalls = await guardedCounter.calls()
+    let deniedConsentCalls = await guardedConsent.calls()
+    let deniedReviewCalls = await denyingReview.calls()
+    check(deniedResponse.failure?.code == .consentDenied
+          && deniedResolutionCalls == 0
+          && deniedConsentCalls == 0
+          && deniedReviewCalls == 1,
+          "a denied trusted review blocks fallback consent and provider resolution")
 } catch {
     check(false, "direct pre-resolution policy checks succeed (\(error))")
 }
 
 // A trusted access reviewer can preauthenticate, freeze its visible choices,
 // and keep one UI session open while the agent validates that value-free
-// snapshot. Only an allowed policy may consume the context; a rejected policy
-// must cancel it without invoking ConsentProvider or resolving a value.
+// snapshot, carrying the same biometric to the resolver's cold-cache unlock.
 do {
     let caller = CallerInfo(
         pid: getpid(),
@@ -810,9 +708,7 @@ do {
         resolver: allowedResolver,
         grants: GrantTable(),
         consent: separateConsent,
-        riskJudgments: RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend()),
         policyReview: EmbeddedAuthenticationPolicyReview(
-            level: .low,
             session: embeddedAuthentication
         ),
         allowUnverifiedPlansForTesting: true
@@ -836,46 +732,6 @@ do {
           && separateConsentCalls == 0
           && allowedResolutionCalls == 1,
           "an allowed preauthenticated review carries its policy-bound unlock to resolution")
-
-    let deniedReference = "op://embedded-review/denied/token"
-    let deniedResolution = ResolutionCounter()
-    let deniedResolver = SecretResolver(cache: NullSecretCache())
-    await deniedResolver.register(StaticProvider(
-        values: [deniedReference: "must-not-resolve"],
-        counter: deniedResolution
-    ))
-    let deniedAuthentication = EmbeddedAuthenticationCounter()
-    let deniedConsent = ConsentCounter()
-    let deniedAgent = Agent(
-        resolver: deniedResolver,
-        grants: GrantTable(),
-        consent: deniedConsent,
-        riskJudgments: RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend()),
-        policyReview: EmbeddedAuthenticationPolicyReview(
-            level: .high,
-            session: deniedAuthentication
-        ),
-        allowUnverifiedPlansForTesting: true
-    )
-    let deniedRequest = try AccessRequest(
-        references: [deniedReference],
-        reason: "deny before embedded authentication",
-        ttlSeconds: 3600,
-        deliveryPlan: plan
-    )
-    let deniedResponse = await deniedAgent.handle(request: deniedRequest, caller: caller)
-    let deniedPreauthenticationCalls = await deniedAuthentication.preauthentications()
-    let deniedAuthenticationCalls = await deniedAuthentication.authentications()
-    let deniedCancellationCalls = await deniedAuthentication.cancellations()
-    let deniedConsentCalls = await deniedConsent.calls()
-    let deniedResolutionCalls = await deniedResolution.calls()
-    check(deniedResponse.failure?.code == .policyDenied
-          && deniedPreauthenticationCalls == 1
-          && deniedAuthenticationCalls == 0
-          && deniedCancellationCalls == 1
-          && deniedConsentCalls == 0
-          && deniedResolutionCalls == 0,
-          "a rejected preauthenticated selection invalidates its session before resolution")
 } catch {
     check(false, "embedded policy authentication checks succeed (\(error))")
 }
@@ -1029,40 +885,6 @@ do {
     check(false, "consent-delta access failed: \(error)")
 }
 
-// A risk change must take effect against a grant that is already live. The
-// second request uses the identical reference and delivery plan; it may not
-// reuse the earlier low-risk grant after the logical credential is raised.
-do {
-    let reference = "op://grant-policy/credential/token"
-    let initial = try client.access(
-        references: [reference],
-        reason: "create a low-risk live grant",
-        ttlSeconds: 3600
-    )
-    check(initial[reference] == Data("grant-policy-synthetic-token".utf8),
-          "a low-risk reference receives an initial live grant")
-
-    _ = try client.risk(.raise, reference: reference, level: .high)
-    let resolutionsBeforeRetry = await resolutionCounter.calls()
-    let consentBeforeRetry = await consent.calls()
-    do {
-        _ = try client.access(
-            references: [reference],
-            reason: "stale grant must not bypass raised risk",
-            ttlSeconds: 3600
-        )
-        check(false, "a stale low-risk grant cannot survive a risk raise")
-    } catch AgentClient.ClientError.protocolFailure(.policyDenied, _) {
-        let resolutionsAfterRetry = await resolutionCounter.calls()
-        let consentAfterRetry = await consent.calls()
-        check(resolutionsAfterRetry == resolutionsBeforeRetry
-              && consentAfterRetry == consentBeforeRetry,
-              "a raised risk level invalidates a live grant before biometric or resolution")
-    }
-} catch {
-    check(false, "live-grant risk-raise checks succeed (\(error))")
-}
-
 // Native provider management stays on the same mutually authenticated socket,
 // but uses a separate exact-caller edit session rather than a secret grant.
 do {
@@ -1076,76 +898,6 @@ do {
     } catch AgentClient.ClientError.protocolFailure(.invalidRequest, _) {
         check(await consent.calls() == consentBeforeUnboundEditor,
               "external editor mode is bound to its executable before policy or biometric")
-    }
-
-    _ = try client.risk(
-        .classify,
-        reference: "csec://high_editor/*",
-        level: .high
-    )
-    let consentBeforeForbiddenEditor = await consent.calls()
-    do {
-        _ = try client.beginNativeStoreEdit(
-            store: "high_editor",
-            mode: .externalTemporaryFile,
-            externalEditorPath: "/usr/bin/false"
-        )
-        check(false, "high-risk native stores reject the named-plaintext editor")
-    } catch AgentClient.ClientError.protocolFailure(.policyDenied, _) {
-        let consentAfterForbiddenEditor = await consent.calls()
-        let forbiddenEditorKey = await nativeKeyBackend.record(for: "high_editor")
-        check(consentAfterForbiddenEditor == consentBeforeForbiddenEditor
-              && forbiddenEditorKey == nil,
-              "high-risk named-plaintext editing is denied before biometric or decryption")
-    }
-    let protectedHighEdit = try client.beginNativeStoreEdit(
-        store: "high_editor",
-        mode: .builtInMemory
-    )
-    check(await consent.latestTTL() == 15 * 60,
-          "high-risk built-in editing applies the 15-minute policy cap")
-    client.cancelNativeStoreEdit(sessionID: protectedHighEdit.sessionID)
-
-    _ = try client.risk(
-        .classify,
-        reference: "csec://standard_editor/*",
-        level: .standard
-    )
-    let standardEdit = try client.beginNativeStoreEdit(
-        store: "standard_editor",
-        mode: .externalTemporaryFile,
-        externalEditorPath: "/usr/bin/false"
-    )
-    client.cancelNativeStoreEdit(sessionID: standardEdit.sessionID)
-    let standardInspection = try client.risk(
-        .inspect,
-        reference: "csec://standard_editor/*"
-    )
-    check(standardInspection.acceptances.contains {
-        $0.mechanism == .namedPlaintextFile
-            && $0.emitterAssurance == .unverified
-            && $0.destination == .localDevelopment
-    }, "standard-risk external editing records separate named-file acceptance")
-
-    _ = try client.risk(
-        .classify,
-        reference: "csec://revoked_editor/*",
-        level: .low
-    )
-    let revokedEdit = try client.beginNativeStoreEdit(store: "revoked_editor")
-    _ = try client.risk(
-        .raise,
-        reference: "csec://revoked_editor/*",
-        level: .high
-    )
-    do {
-        _ = try client.commitNativeStoreEdit(
-            sessionID: revokedEdit.sessionID,
-            document: Data(#"{"TOKEN":"must-not-commit"}"#.utf8)
-        )
-        check(false, "a risk change revokes an open native edit session")
-    } catch AgentClient.ClientError.protocolFailure(.invalidRequest, _) {
-        check(true, "a risk change revokes an open native edit session")
     }
 
     let edit = try client.beginNativeStoreEdit(store: "development")
@@ -1915,7 +1667,7 @@ func runRepeatedInteractiveGet(
     process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
     process.arguments = [
         "-q", "/dev/null", "/bin/sh", "-c",
-        "\"$1\" get --for 60 \"$2\"; \"$1\" get --for 60 \"$2\"; :",
+        "\"$1\" get --reveal --for 60 \"$2\"; \"$1\" get --reveal --for 60 \"$2\"; :",
         "csec-get-parent-e2e", csecURL.path, reference,
     ]
     var environment = ProcessInfo.processInfo.environment
@@ -1976,9 +1728,9 @@ func runTerminalPipeAndFileGet(
     process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
     process.arguments = [
         "-q", "/dev/null", "/bin/sh", "-c",
-        "\"$1\" get --reason shape-isolation --for 60 \"$2\"; "
+        "\"$1\" get --reveal --reason shape-isolation --for 60 \"$2\"; "
             + "\"$1\" get --reason shape-isolation --for 60 \"$2\" | /bin/cat; "
-            + "\"$1\" get --reason shape-isolation --for 60 \"$2\" > \"$3\"; :",
+            + "\"$1\" get --allow-plaintext-file --reason shape-isolation --for 60 \"$2\" > \"$3\"; :",
         "csec-get-shapes-e2e", csecURL.path, reference, filePath,
     ]
     var environment = ProcessInfo.processInfo.environment
@@ -2122,8 +1874,8 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
     let reviewsBeforePipedGets = await accessReviewCapture.snapshot().count
     let consentBeforePipedGets = await consent.calls()
     let repeatedPipedGets = runShellGetCommand(
-        "\"$1\" get --for 60 \"$2\" | /bin/cat; "
-            + "\"$1\" get --for 60 \"$2\" | /bin/cat; :",
+        "\"$1\" get --reveal --for 60 \"$2\" | /bin/cat; "
+            + "\"$1\" get --reveal --for 60 \"$2\" | /bin/cat; :",
         arguments: [csecURL.path, pipeReference]
     )
     let consentAfterPipedGets = await consent.calls()
@@ -2145,7 +1897,7 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
 
     let consentBeforeOtherShell = await consent.calls()
     let otherShellGet = runShellGetCommand(
-        "\"$1\" get --for 60 \"$2\" | /bin/cat",
+        "\"$1\" get --reveal --for 60 \"$2\" | /bin/cat",
         arguments: [csecURL.path, pipeReference]
     )
     let consentAfterOtherShell = await consent.calls()
@@ -2157,13 +1909,13 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
     let substitutionReference = "op://get-substitution/credential/token"
     let substitutionValue = "command-substitution-synthetic-token"
     let commandSubstitution = runShellGetCommand(
-        "value=$(\"$1\" get --for 60 \"$2\") || exit $?; /usr/bin/printf '%s\\n' \"$value\"",
+        "value=$(\"$1\" get --reveal --for 60 \"$2\") || exit $?; /usr/bin/printf '%s\\n' \"$value\"",
         arguments: [csecURL.path, substitutionReference]
     )
     check(commandSubstitution.status == 0
           && commandSubstitution.out == "\(substitutionValue)\n"
-          && commandSubstitution.err.contains("unverified reader"),
-          "command substitution succeeds through reviewed shell-delegated pipe delivery")
+          && !commandSubstitution.err.contains(substitutionValue),
+          "command substitution succeeds through revealed shell-delegated pipe delivery")
 
     let shapeReference = "op://get-shapes/credential/token"
     let shapeValue = "delivery-shape-synthetic-token"
@@ -2198,220 +1950,6 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
           && !persistentWarning.contains(shapeValue),
           "terminal, pipe, and persistent-file shapes require separate review without filename or value metadata")
 
-    // A standard-risk compatibility choice is durable only for its exact
-    // delivery shape. Exercise the real shell redirection boundary: the shell
-    // may create/truncate an empty file, but csec resolves and writes no value
-    // until the dedicated compatibility checkbox and authentication succeed.
-    let standardReference = "op://standard-get/credential/token"
-    let standardValue = "standard-compatibility-synthetic-token"
-    let standardResolution = ResolutionCounter()
-    let standardResolver = SecretResolver(cache: NullSecretCache())
-    await standardResolver.register(StaticProvider(
-        values: [standardReference: standardValue],
-        counter: standardResolution
-    ))
-    let standardStore = RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend())
-    let standardDescriptor = CredentialGrouping.groups(
-        for: [try! SecretRef(standardReference)]
-    )[0]
-    let standardIdentity = try! await standardStore.credentialIdentity(
-        provider: standardDescriptor.provider,
-        providerAccount: standardDescriptor.providerAccount,
-        group: standardDescriptor.group,
-        memberReferences: standardDescriptor.references.map(\.uri)
-    )
-    try! await standardStore.save(RiskJudgment(
-        credential: standardIdentity,
-        level: .standard,
-        evidence: [],
-        source: .explicitUser,
-        decidedAt: Date(),
-        reviewAfter: Date().addingTimeInterval(3600),
-        policyVersion: RiskPolicyV2.version
-    ))
-    let standardReview = SequencedCompatibilityPolicyReview([false, true, false, true])
-    let standardConsent = ConsentCounter()
-    let standardAgent = Agent(
-        resolver: standardResolver,
-        grants: GrantTable(),
-        consent: standardConsent,
-        riskJudgments: standardStore,
-        policyReview: standardReview,
-        allowUnverifiedPlansForTesting: true
-    )
-    let standardSocket = NSTemporaryDirectory() + "cs-standard-get-\(getpid()).sock"
-    check(startAccessOnlyServer(path: standardSocket, agent: standardAgent),
-          "standard compatibility test agent is listening")
-    let firstDeniedFile = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        .appendingPathComponent("csec-denied-file-\(UUID().uuidString)")
-    let secondDeniedFile = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        .appendingPathComponent("csec-shape-denied-file-\(UUID().uuidString)")
-    let approvedFile = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        .appendingPathComponent("csec-approved-file-\(UUID().uuidString)")
-    defer {
-        for url in [firstDeniedFile, secondDeniedFile, approvedFile] {
-            try? FileManager.default.removeItem(at: url)
-        }
-    }
-    let deniedFileGet = runShellGetCommand(
-        "\"$1\" get --reason standard-file --for 3600 \"$2\" > \"$3\"",
-        arguments: [csecURL.path, standardReference, firstDeniedFile.path],
-        agentSocket: standardSocket
-    )
-    let deniedFileData = (try? Data(contentsOf: firstDeniedFile)) ?? Data()
-    let deniedFileResolutions = await standardResolution.calls()
-    let deniedFileConsents = await standardConsent.calls()
-    check(deniedFileGet.status == 1
-          && deniedFileData.isEmpty
-          && deniedFileResolutions == 0
-          && deniedFileConsents == 0
-          && !deniedFileGet.err.contains(standardValue),
-          "regular-file compatibility denial occurs before resolution and leaves no plaintext")
-
-    let approvedStandardPipe = runShellGetCommand(
-        "\"$1\" get --reason standard-pipe --for 3600 \"$2\" | /bin/cat",
-        arguments: [csecURL.path, standardReference],
-        agentSocket: standardSocket
-    )
-    check(approvedStandardPipe.status == 0
-          && approvedStandardPipe.out == "\(standardValue)\n",
-          "explicit standard-risk pipe compatibility approval succeeds")
-
-    let fileAfterPipeApproval = runShellGetCommand(
-        "\"$1\" get --reason standard-file --for 3600 \"$2\" > \"$3\"",
-        arguments: [csecURL.path, standardReference, secondDeniedFile.path],
-        agentSocket: standardSocket
-    )
-    let fileAfterPipeData = (try? Data(contentsOf: secondDeniedFile)) ?? Data()
-    let resolutionsAfterPipeThenFile = await standardResolution.calls()
-    check(fileAfterPipeApproval.status == 1
-          && fileAfterPipeData.isEmpty
-          && resolutionsAfterPipeThenFile == 1,
-          "pipe acceptance cannot implicitly approve persistent-file delivery")
-
-    let approvedFileGet = runShellGetCommand(
-        "\"$1\" get --reason standard-file --for 3600 \"$2\" > \"$3\"",
-        arguments: [csecURL.path, standardReference, approvedFile.path],
-        agentSocket: standardSocket
-    )
-    let approvedFileValue = (try? String(contentsOf: approvedFile, encoding: .utf8)) ?? ""
-    let standardReviews = await standardReview.snapshot()
-    let fileReviewMetadataIsValueFree = standardReviews.filter {
-        $0.plan.destination == .persistentPlaintextFile
-    }.allSatisfy {
-        !$0.plan.operationContext.contains(firstDeniedFile.lastPathComponent)
-            && !$0.plan.operationContext.contains(secondDeniedFile.lastPathComponent)
-            && !$0.plan.operationContext.contains(approvedFile.lastPathComponent)
-            && !$0.plan.operationContext.contains(standardValue)
-    }
-    let standardAcceptances = try! await standardStore.loadAcceptances(
-        credentialKey: standardIdentity.credentialKey,
-        policyVersion: RiskPolicyV2.version
-    )
-    let finalStandardResolutions = await standardResolution.calls()
-    let finalStandardConsents = await standardConsent.calls()
-    check(approvedFileGet.status == 0
-          && approvedFileValue == "\(standardValue)\n"
-          && finalStandardResolutions == 2
-          && finalStandardConsents == 2
-          && standardAcceptances.count == 2
-          && Set(standardAcceptances.map(\.shape.destination))
-            == [.shellDelegatedPipe, .persistentPlaintextFile]
-          && fileReviewMetadataIsValueFree
-          && !approvedFileGet.err.contains(approvedFile.lastPathComponent)
-          && !approvedFileGet.err.contains(standardValue),
-          "regular-file redirection succeeds only after exact, value-free compatibility approval")
-
-    // High/critical weak delivery is reviewable, but its acceptance is never
-    // persisted beyond the exact risk-capped live-shell grant.
-    let highReference = "op://risk-get-high/credential/token"
-    let criticalReference = "op://risk-get-critical/credential/token"
-    let highValue = "high-pipe-synthetic-token"
-    let criticalValue = "critical-file-synthetic-token"
-    let riskResolution = ResolutionCounter()
-    let riskResolver = SecretResolver(cache: NullSecretCache())
-    await riskResolver.register(StaticProvider(values: [
-        highReference: highValue,
-        criticalReference: criticalValue,
-    ], counter: riskResolution))
-    let compatibilityRiskStore = RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend())
-    var riskIdentities: [String: CredentialIdentity] = [:]
-    for (reference, level) in [(highReference, RiskLevel.high), (criticalReference, .critical)] {
-        let descriptor = CredentialGrouping.groups(for: [try! SecretRef(reference)])[0]
-        let identity = try! await compatibilityRiskStore.credentialIdentity(
-            provider: descriptor.provider,
-            providerAccount: descriptor.providerAccount,
-            group: descriptor.group,
-            memberReferences: descriptor.references.map(\.uri)
-        )
-        riskIdentities[reference] = identity
-        try! await compatibilityRiskStore.save(RiskJudgment(
-            credential: identity,
-            level: level,
-            evidence: [],
-            source: .explicitUser,
-            decidedAt: Date(),
-            reviewAfter: Date().addingTimeInterval(3600),
-            policyVersion: RiskPolicyV2.version
-        ))
-    }
-    let riskReviewCapture = AccessReviewCapture()
-    let riskConsent = ConsentCounter()
-    let compatibilityRiskAgent = Agent(
-        resolver: riskResolver,
-        grants: GrantTable(),
-        consent: riskConsent,
-        riskJudgments: compatibilityRiskStore,
-        policyReview: CapturingAutoApprovePolicyReview(capture: riskReviewCapture),
-        allowUnverifiedPlansForTesting: true
-    )
-    let riskSocket = NSTemporaryDirectory() + "cs-risk-get-\(getpid()).sock"
-    check(startAccessOnlyServer(path: riskSocket, agent: compatibilityRiskAgent),
-          "high/critical compatibility test agent is listening")
-    let highPipedGets = runShellGetCommand(
-        "\"$1\" get --reason high-pipe --for 3600 \"$2\" | /bin/cat; "
-            + "\"$1\" get --reason high-pipe --for 3600 \"$2\" | /bin/cat; :",
-        arguments: [csecURL.path, highReference],
-        agentSocket: riskSocket
-    )
-    let highConsentTTL = await riskConsent.latestTTL()
-    let criticalFile = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        .appendingPathComponent("csec-critical-file-\(UUID().uuidString)")
-    defer { try? FileManager.default.removeItem(at: criticalFile) }
-    let criticalFileGet = runShellGetCommand(
-        "\"$1\" get --reason critical-file --for 3600 \"$2\" > \"$3\"",
-        arguments: [csecURL.path, criticalReference, criticalFile.path],
-        agentSocket: riskSocket
-    )
-    let criticalConsentTTL = await riskConsent.latestTTL()
-    let criticalFileValue = (try? String(contentsOf: criticalFile, encoding: .utf8)) ?? ""
-    let highAcceptances = try! await compatibilityRiskStore.loadAcceptances(
-        credentialKey: riskIdentities[highReference]!.credentialKey,
-        policyVersion: RiskPolicyV2.version
-    )
-    let criticalAcceptances = try! await compatibilityRiskStore.loadAcceptances(
-        credentialKey: riskIdentities[criticalReference]!.credentialKey,
-        policyVersion: RiskPolicyV2.version
-    )
-    let riskReviews = await riskReviewCapture.snapshot()
-    let highWarning = riskReviews.first { $0.reason == "high-pipe" }
-        .flatMap { DeliveryReviewCopy.warning(for: $0) } ?? ""
-    let criticalWarning = riskReviews.first { $0.reason == "critical-file" }
-        .flatMap { DeliveryReviewCopy.warning(for: $0) } ?? ""
-    let finalRiskConsents = await riskConsent.calls()
-    check(highPipedGets.status == 0
-          && highPipedGets.out.components(separatedBy: highValue).count - 1 == 2
-          && highConsentTTL == 15 * 60
-          && criticalFileGet.status == 0
-          && criticalFileValue == "\(criticalValue)\n"
-          && criticalConsentTTL == 5 * 60
-          && finalRiskConsents == 2
-          && highAcceptances.isEmpty
-          && criticalAcceptances.isEmpty
-          && highWarning.contains("HIGH-RISK")
-          && criticalWarning.contains("CRITICAL-RISK"),
-          "high and critical compatibility delivery requires fresh, short-lived approval and persists no acceptance")
-
     // Force the exact direct parent to change after review begins. The agent
     // revalidates before resolution and csec independently rechecks before
     // stdout, so neither an exec replacement nor reparenting releases bytes.
@@ -2433,7 +1971,6 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
         resolver: mutationResolver,
         grants: GrantTable(),
         consent: ConsentCounter(),
-        riskJudgments: RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend()),
         policyReview: SignalingDelayedPolicyReview(
             markerPaths: [replacementMarker, exitMarker]
         ),
@@ -2443,13 +1980,13 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
     check(startAccessOnlyServer(path: mutationSocket, agent: mutationAgent),
           "parent-mutation test agent is listening")
     let replacedParentGet = runShellGetCommand(
-        "\"$1\" get --reason parent-replaced --for 60 \"$2\" & "
+        "\"$1\" get --reveal --reason parent-replaced --for 60 \"$2\" & "
             + "while [ ! -e \"$3\" ]; do /bin/sleep 0.01; done; exec /bin/sleep 1",
         arguments: [csecURL.path, mutationReference, replacementMarker],
         agentSocket: mutationSocket
     )
     let exitedParentGet = runShellGetCommand(
-        "\"$1\" get --reason parent-exited --for 60 \"$2\" & "
+        "\"$1\" get --reveal --reason parent-exited --for 60 \"$2\" & "
             + "while [ ! -e \"$3\" ]; do /bin/sleep 0.01; done; exit 0",
         arguments: [csecURL.path, mutationReference, exitMarker],
         agentSocket: mutationSocket
@@ -2538,57 +2075,6 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
     } catch {
         check(false, "setup CLI import checks succeed (\(error))")
     }
-
-    let policyReference = "op://policy-tests/credential/token"
-    let resolutionsBeforeRiskCLI = await resolutionCounter.calls()
-    let initialRisk = runCsec(["risk", "inspect", policyReference], extraEnv: [:])
-    let authenticationBeforeRiskCLI = await consent.authentications()
-    let classifiedLow = runCsec(
-        ["risk", "classify", "low", policyReference],
-        extraEnv: [:]
-    )
-    let authenticationAfterLow = await consent.authentications()
-    let raisedHigh = runCsec(
-        ["risk", "raise", "high", policyReference],
-        extraEnv: [:]
-    )
-    let authenticationAfterRaise = await consent.authentications()
-    let rejectedLowerRaise = runCsec(
-        ["risk", "raise", "low", policyReference],
-        extraEnv: [:]
-    )
-    let classifiedBackToLow = runCsec(
-        ["risk", "classify", "low", policyReference],
-        extraEnv: [:]
-    )
-    let authenticationAfterDowngrade = await consent.authentications()
-    let forgottenRisk = runCsec(["risk", "forget", policyReference], extraEnv: [:])
-    let authenticationAfterForget = await consent.authentications()
-    let resolutionsAfterRiskCLI = await resolutionCounter.calls()
-    check(initialRisk.status == 0
-          && initialRisk.out.contains("classification: unknown")
-          && initialRisk.out.contains("effective-risk: high"),
-          "risk inspect reports fail-safe unknown without resolving a value")
-    check(classifiedLow.status == 0
-          && classifiedLow.out.contains("classification: low")
-          && authenticationAfterLow == authenticationBeforeRiskCLI + 1,
-          "classifying below the unknown high floor requires authentication")
-    check(raisedHigh.status == 0
-          && raisedHigh.out.contains("classification: high")
-          && authenticationAfterRaise == authenticationAfterLow,
-          "risk raise increases enforcement without an unnecessary biometric")
-    check(rejectedLowerRaise.status == 1
-          && rejectedLowerRaise.err.contains("policy_denied"),
-          "risk raise cannot be used to lower a classification")
-    check(classifiedBackToLow.status == 0
-          && authenticationAfterDowngrade == authenticationAfterRaise + 1,
-          "an explicit high-to-low reclassification requires authentication")
-    check(forgottenRisk.status == 0
-          && forgottenRisk.out.contains("classification: unknown")
-          && authenticationAfterForget == authenticationAfterDowngrade + 1,
-          "risk forget resets to fail-safe unknown behind authentication")
-    check(resolutionsAfterRiskCLI == resolutionsBeforeRiskCLI,
-          "risk management reads and writes no provider value")
 
     do {
         let fixtureDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -2884,31 +2370,6 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
     )) ?? []
     check(sessionsAfterRegularFile.isEmpty,
           "the root helper removes the protected session after the complete launch tree exits")
-
-    do {
-        _ = try client.risk(
-            .classify,
-            reference: "op://fd-high/pgpass/content",
-            level: .high
-        )
-        let consentBeforeHighFD = await consent.calls()
-        let highSessionFD = runCsec(
-            [
-                "session", "--", csecURL.path,
-                "exec-fd", "--redact-output=never",
-                "--preset", "pgpass=op://fd-high/pgpass/content",
-                "--", "/bin/cat", "/dev/fd/64",
-            ],
-            extraEnv: [:]
-        )
-        let consentAfterHighFD = await consent.calls()
-        check(highSessionFD.status == 0
-              && highSessionFD.out == "high-fd-synthetic-secret"
-              && consentAfterHighFD == consentBeforeHighFD + 1,
-              "high-risk delivery inside a session falls back to an exact per-command root")
-    } catch {
-        check(false, "high-risk session fallback can be prepared (\(error))")
-    }
 
     let redactedFD = runCsec(
         [

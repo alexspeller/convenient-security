@@ -120,18 +120,12 @@ func startAgentServer() async {
   }
   let grants = GrantTable()
   let consent: ConsentProvider = BiometricConsent()
-  let riskBackend: RiskJudgmentBackend =
-    cacheEnabled
-    ? SecurityRiskJudgmentBackend()
-    : InMemoryRiskJudgmentBackend()
-  let riskJudgments = RiskJudgmentStore(backend: riskBackend)
   let policyReview: PolicyReviewProvider = TrustedPolicyReview()
   #if DEBUG
     let agent = Agent(
       resolver: resolver,
       grants: grants,
       consent: consent,
-      riskJudgments: riskJudgments,
       policyReview: policyReview,
       nativeStore: nativeStore,
       allowUnverifiedPlansForTesting: true
@@ -142,7 +136,6 @@ func startAgentServer() async {
       resolver: resolver,
       grants: grants,
       consent: consent,
-      riskJudgments: riskJudgments,
       policyReview: policyReview,
       nativeStore: nativeStore
     )
@@ -177,8 +170,6 @@ func startAgentServer() async {
       return await agent.commitNativeStoreBlobs(request: commit, caller: caller)
     case .cancelNativeStoreEdit(let cancel):
       return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
-    case .risk(let risk):
-      return await agent.handleRiskOperation(request: risk, caller: caller)
     case .approveProtectedLaunch(let approval):
       guard approval.validate(caller: caller) else {
         return .failed(

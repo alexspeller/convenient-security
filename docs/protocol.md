@@ -68,8 +68,6 @@ The response advertises supported versions and features:
       "output_guard_binding",
       "active_output_redaction",
       "native_encrypted_store",
-      "risk_policy_v2",
-      "risk_management",
       "native_editor_policy",
       "registered_session_roots",
       "credential_protocols",
@@ -169,15 +167,15 @@ Before resolution, the agent verifies:
   writable-path assurance csecd independently recomputes;
 - for `credential_protocol`, that the plan's consumer executable is the
   helper's current direct parent's canonical executable path; and
-- the current logical-credential risk judgment, delivery acceptance, mechanism,
-  consumer assurance, destination, descendant scope, and policy-capped TTL; and
-- that any existing grant has the same delivery-plan and policy-decision digests
-  plus a live kernel-verified ancestry relationship.
+- the plan's mechanism, recipient, descendant scope, and the bounded TTL
+  (`--for`, default 12h, capped at 24h); and
+- that any existing grant has the same delivery-plan digest plus a live
+  kernel-verified ancestry relationship.
 
 The grant records the request ID, plan digest, peer PID version/CDHash, and
-planned executable, together with the opaque credential key, effective risk,
-policy version/digest, and output policy. A risk change revokes matching grants;
-reuse also recomputes the policy binding, so stale authorization fails closed.
+planned executable. Grants expire by TTL and drop when their root exits; reuse is
+purely delivery-plan-digest plus subtree ancestry, so there is no risk-shaped
+binding to go stale.
 Every `csec get` stdout shape keeps signed `csec` as the emitter, binds its
 verified direct parent as `requestingExecutable`, and uses that parent's exact
 PID/start-time as a subtree grant root. The daemon repeats the live
@@ -202,14 +200,13 @@ redirection, `fstat` identifies only that stdout is a regular file. The shell
 may already have created or truncated it, but csec sends no pathname and no
 plaintext is resolved or written unless review and authentication succeed.
 
-Compatibility acceptance is bound to mechanism, destination, descendant scope,
-emitter assurance, requester assurance, and recipient assurance. A terminal
-acceptance therefore cannot approve a pipe or file, and a pipe acceptance cannot
-approve a file. Standard acceptance may be retained for 30 days. High and
-critical acceptance is not persisted: fresh Touch ID creates only the exact
-risk-capped live-shell grant (15 minutes or 5 minutes respectively). Policy
-version 2 invalidates version-1 decisions and acceptances instead of assigning
-them these broader semantics.
+There is no compatibility-acceptance ledger. Each raw-output shape carries a
+digest-bound `interactive` flag and — only when the user passed the shape-matched
+override (`--reveal` for an observing sink, `--allow-plaintext-file` for a file) —
+a `plaintextExposureAcknowledged` flag; csecd re-derives whether the
+acknowledgment is required and refuses a shape that needs one but lacks it. The
+terminal, pipe, and file shapes have distinct plan digests, so one never
+authorizes another.
 
 Success echoes the request nonce:
 
@@ -262,10 +259,9 @@ access performs a fresh ancestry walk from the authenticated caller to the
 recorded PID/start-time pair. A malformed, stale, forged, copied-across-tree, or
 cross-audit-session ID is rejected as `invalid_request`, with no fallback.
 
-Risk policy may reject broad scope before resolution. In that case only, the
-product launcher may issue a new access request and plan using its ordinary
-caller root. This preserves per-command treatment for high-impact credentials;
-the broad and narrow plans have different digests and cannot share a grant.
+A registered `broad_session` plan and an ordinary caller-root plan have different
+digests and cannot share a grant, so registering a session never silently widens
+an existing per-command grant.
 
 ## Secure no-root delivery plans
 
@@ -344,37 +340,6 @@ code with generic text except the bounded expired-rendezvous distinction.
 Relative paths are fixed by product construction and independently reject
 absolute paths, traversal, prefix collisions, duplicates, environment
 collisions, and loader/product controls.
-
-## Value-free risk management
-
-Only a verified product launcher may inspect or mutate risk metadata. The
-caller supplies one reference so `csecd` can derive its logical group; the agent
-does not resolve the provider value. For example:
-
-```json
-{
-  "version": 2,
-  "type": "risk",
-  "requestID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-  "operation": "classify",
-  "reference": "op://Vault/Item/field",
-  "level": "standard"
-}
-```
-
-Operations are `inspect`, `classify`, `raise`, and `forget`. `inspect` and
-`forget` omit `level`; `classify` and `raise` require one of `low`, `standard`,
-`high`, or `critical`. `raise` cannot lower the current effective level.
-Mutations pass through an agent-owned value-free review. A classification that
-lowers the effective floor, and every `forget`, additionally requires Touch ID.
-
-The response contains `riskInspection`: provider kind, stored and effective
-levels, decision/review timestamps, policy version, known member count, whether
-the supplied reference is in the recorded scope, and any mechanism/assurance
-acceptances with their review deadlines. It contains neither secret values,
-opaque credential identifiers, nor other raw member references. A successful
-change revokes matching live grants, resolver entries known in memory, and open
-native-store edit sessions before returning the updated inspection.
 
 ## Active-output redaction sessions
 

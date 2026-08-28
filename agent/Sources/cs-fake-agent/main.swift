@@ -33,7 +33,6 @@ let agent = Agent(
     resolver: resolver,
     grants: grants,
     consent: AutoApproveConsent(),
-    riskJudgments: RiskJudgmentStore(backend: InMemoryRiskJudgmentBackend()),
     policyReview: AutoApprovePolicyReview(),
     allowLegacyAccessForTesting: true,
     allowUnverifiedPlansForTesting: true
@@ -63,8 +62,6 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.commitNativeStoreBlobs(request: commit, caller: caller)
     case let .cancelNativeStoreEdit(cancel):
         return await agent.cancelNativeStoreEdit(request: cancel, caller: caller)
-    case let .risk(risk):
-        return await agent.handleRiskOperation(request: risk, caller: caller)
     case let .approveProtectedLaunch(approval):
         return .failed(
             .deliveryNotSupported,

@@ -43,10 +43,6 @@ import Darwin
 //       editor is the default; --editor opts into a named plaintext file for
 //       compatibility with the command in $EDITOR.
 //
-//   csec risk inspect|forget <reference>
-//   csec risk classify|raise <level> <reference>
-//       Inspect or change value-free risk metadata without resolving a value.
-
 //   csec setup [--apply] [options]
 //       Dry-run-first onboarding for coding-agent hooks, value-free local source
 //       discovery, selected native-store import, and a bounded audit prompt.
@@ -54,7 +50,7 @@ import Darwin
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage:
-      csec get <reference> [--reason <text>] [--for <seconds>]
+      csec get <reference> [--reason <text>] [--for <seconds>] [--reveal | --allow-plaintext-file]
       csec exec [--reason <text>] [--for <seconds>] [--set NAME=<reference>]…
                 [--redact-output=always|tty|never]
                 [--redact-output-label=reference|opaque] [--redact-short-values]
@@ -92,10 +88,6 @@ func usage() -> Never {
       csec protect [--store <store>] [--keep-plaintext] [--dry-run] <path>…
       csec protect --env [--store <store> | --dest <csec://STORE|op://VAULT[/ITEM]>]
                    [--dry-run] <file>
-      csec risk inspect <reference>
-      csec risk classify low|standard|high|critical <reference>
-      csec risk raise low|standard|high|critical <reference>
-      csec risk forget <reference>
       csec setup [--apply] [--agent claude|codex]… [--skip-agents]
                  [--project <directory>] [--replace-csec-hook]
                  [--store <store>
@@ -106,13 +98,16 @@ func usage() -> Never {
       csec root-status
 
     get        Fetch a secret from csecd and write it to the selected stdout shape:
-                 csec get REF                    interactive terminal output
-                 csec get REF | command          shell-delegated pipeline
-                 value=$(csec get REF)           shell-delegated command substitution
-                 csec get REF > file             ordinary persistent plaintext file
-               The verified direct-parent shell owns the PID/start-time-bound subtree
-               grant; signed csec is the emitter. A generic Unix pipe does not reveal
-               its sibling reader, so the review labels that recipient unverified.
+                 csec get REF | command          pipe to a command — allowed
+                 value=$(csec get REF)           command substitution — allowed
+                 csec get REF                    terminal — refused; --reveal to echo
+                 csec get REF > file             file — refused; --allow-plaintext-file
+               A raw value is refused when it would land in terminal scrollback, on
+               disk, or in a non-interactive (agent/script) capture, since a coding
+               agent or logger could retain it; the matching flag overrides under
+               Touch ID. Prefer csec exec/exec-file/creds, which hand the value to a
+               tool without returning it here. The verified direct-parent shell owns
+               the PID/start-time-bound subtree grant; signed csec is the emitter.
                File redirection persists plaintext and may expose it to same-user
                processes, copies, backups, and later access. Each delivery shape is
                approved separately. Prefer csec exec for environment injection,
@@ -164,9 +159,6 @@ func usage() -> Never {
                is read from stdin (one trailing newline stripped), so
                `printf %s VALUE | csec edit csec://store/KEY` works. A missing
                csec:// key is created; the value never appears in argv or output.
-    risk       Inspect or change a logical credential's value-free risk policy.
-               classify may set any level; raise cannot lower one; forget resets
-               it to fail-safe unknown. Downgrades and forget require Touch ID.
     setup      Detect supported coding agents and local secret sources without
                displaying values. The default is a dry run. --apply safely merges
                fail-closed hooks and may import only explicitly selected plaintext
@@ -221,8 +213,6 @@ case "edit":
     runEdit(Array(arguments.dropFirst()))
 case "protect":
     runProtect(Array(arguments.dropFirst()))
-case "risk":
-    runRisk(Array(arguments.dropFirst()))
 case "setup":
     runSetup(Array(arguments.dropFirst()))
 case "audit":
@@ -382,75 +372,6 @@ func runToolExec(_ arguments: [String]) -> Never {
 func currentExecutablePath() -> String {
     (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
         .standardizedFileURL.resolvingSymlinksInPath().path
-}
-
-// MARK: - value-free risk management
-
-func runRisk(_ arguments: [String]) -> Never {
-    guard let operationText = arguments.first,
-          let operation = RiskOperation(rawValue: operationText) else { usage() }
-
-    let referenceText: String
-    let level: RiskLevel?
-    switch operation {
-    case .inspect, .forget:
-        guard arguments.count == 2 else { usage() }
-        referenceText = arguments[1]
-        level = nil
-    case .classify, .raise:
-        guard arguments.count == 3,
-              let parsed = RiskLevel(rawValue: arguments[1]),
-              parsed != .unknown else { usage() }
-        level = parsed
-        referenceText = arguments[2]
-    }
-    guard let reference = try? SecretRef(referenceText) else {
-        FileHandle.standardError.write(Data("csec risk: invalid secret reference\n".utf8))
-        exit(2)
-    }
-
-    do {
-        let inspection = try makeAgentClient().risk(
-            operation,
-            reference: reference.uri,
-            level: level
-        )
-        let formatter = ISO8601DateFormatter()
-        print("reference: \(reference.safeInlineURI)")
-        print("provider: \(inspection.provider)")
-        print("classification: \(inspection.level.rawValue)")
-        print("effective-risk: \(inspection.effectiveLevel.rawValue)")
-        print("policy-version: \(inspection.policyVersion)")
-        print("known-members: \(inspection.knownMemberCount)")
-        print("reference-in-known-scope: \(inspection.referenceInKnownScope ? "yes" : "no")")
-        if let decidedAt = inspection.decidedAt {
-            print("decided-at: \(formatter.string(from: decidedAt))")
-        }
-        if let reviewAfter = inspection.reviewAfter {
-            print("review-after: \(formatter.string(from: reviewAfter))")
-        }
-        if inspection.acceptances.isEmpty {
-            print("compatibility-acceptances: none")
-        } else {
-            for acceptance in inspection.acceptances {
-                print(
-                    "compatibility-acceptance: \(acceptance.mechanism.rawValue) "
-                        + "\(acceptance.destination.rawValue) "
-                        + "scope=\(acceptance.descendantScope.rawValue) "
-                        + "emitter=\(acceptance.emitterAssurance.rawValue) "
-                        + "requester=\(acceptance.requesterAssurance?.rawValue ?? "none") "
-                        + "recipient=\(acceptance.recipientAssurance?.rawValue ?? "planned_consumer") until "
-                        + formatter.string(from: acceptance.reviewAfter)
-                )
-            }
-        }
-        exit(0)
-    } catch {
-        FileHandle.standardError.write(Data(
-            "csec risk: \(error.localizedDescription)\n".utf8
-        ))
-        exit(1)
-    }
 }
 
 // MARK: - native encrypted store editor
@@ -615,6 +536,8 @@ func runGet(_ arguments: [String]) -> Never {
     var references: [String] = []
     var reason = "csec get"
     var ttlSeconds = 3600
+    var reveal = false
+    var allowPlaintextFile = false
     var index = 0
     while index < arguments.count {
         switch arguments[index] {
@@ -626,6 +549,10 @@ func runGet(_ arguments: [String]) -> Never {
             index += 1
             guard index < arguments.count, let seconds = Int(arguments[index]) else { usage() }
             ttlSeconds = seconds
+        case "--reveal":
+            reveal = true
+        case "--allow-plaintext-file":
+            allowPlaintextFile = true
         default:
             references.append(arguments[index])
         }
@@ -656,33 +583,74 @@ func runGet(_ arguments: [String]) -> Never {
             startTime: parentStartTime,
             executablePath: parentExecutable.canonicalPath
         )
+        // A human is interactively present if any std descriptor is a tty. This
+        // distinguishes a person piping `csec get x | cmd` (allowed) from an
+        // agent/script capturing the output (refused, steered to injection).
+        let interactive = isatty(STDIN_FILENO) == 1
+            || isatty(STDOUT_FILENO) == 1
+            || isatty(STDERR_FILENO) == 1
         let mechanism: DeliveryMechanism
         let destination: DestinationClass
         let recipient: RecipientAssurance
+        // Whether the user supplied the override flag this stdout shape requires.
+        // One flag never unlocks the other; csecd independently re-derives whether
+        // an acknowledgment is required, so the launcher check is a fast, specific
+        // first line, not the security boundary.
+        let ackGiven: Bool
         if isatty(STDOUT_FILENO) == 1 {
+            // Echoing to the terminal lands in scrollback.
             mechanism = .rawStandardOutput
             destination = .humanOutput
             recipient = .interactiveTerminal
-        } else if cs_fd_is_pipe_or_socket(STDOUT_FILENO) == 1 {
-            mechanism = .rawStandardOutput
-            destination = .shellDelegatedPipe
-            recipient = .unverifiedPipeReader
-            FileHandle.standardError.write(Data(
-                "csec get: stdout is a shell-delegated pipe with an unverified reader; review required\n".utf8
-            ))
+            ackGiven = reveal
         } else if cs_fd_is_regular_file(STDOUT_FILENO) == 1 {
+            // Durable plaintext on disk.
             mechanism = .namedPlaintextFile
             destination = .persistentPlaintextFile
             recipient = .ordinaryPersistentFile
-            FileHandle.standardError.write(Data(
-                "csec get: stdout is an ordinary persistent plaintext file; review required; prefer csec exec-file\n".utf8
-            ))
+            ackGiven = allowPlaintextFile
         } else {
-            FileHandle.standardError.write(Data(
-                "csec get: unsupported stdout destination\n".utf8
-            ))
+            // A pipe/socket or any other non-tty, non-file sink: bytes go to a
+            // reader csec cannot authenticate. Interactive → allowed; a
+            // non-interactive capture is refused with --reveal as the override.
+            mechanism = .rawStandardOutput
+            destination = .shellDelegatedPipe
+            recipient = .unverifiedPipeReader
+            ackGiven = reveal
+        }
+        let ackRequired: Bool
+        switch (mechanism, recipient) {
+        case (.namedPlaintextFile, _),
+             (.rawStandardOutput, .interactiveTerminal):
+            ackRequired = true
+        case (.rawStandardOutput, .unverifiedPipeReader):
+            ackRequired = !interactive
+        default:
+            ackRequired = false
+        }
+        if ackRequired && !ackGiven {
+            let hint: String
+            if recipient == .ordinaryPersistentFile {
+                hint = "csec get: refusing to write a secret to a persistent plaintext file — it "
+                    + "would remain on disk, readable by other processes running as you and possibly "
+                    + "synced or backed up. Prefer `csec exec-file`, or pass --allow-plaintext-file to "
+                    + "write it anyway."
+            } else if recipient == .interactiveTerminal {
+                hint = "csec get: refusing to print a secret to the terminal — it would remain in "
+                    + "scrollback and could be captured by a coding-agent session, logger, or screen "
+                    + "capture. Pipe it into the consuming command, or pass --reveal to echo it "
+                    + "deliberately."
+            } else {
+                hint = "csec get: no interactive terminal is attached — a coding agent, script, or "
+                    + "logger appears to be capturing this output and would receive the value. Prefer "
+                    + "`csec exec`, `csec exec-file`, or a credential helper, which hand the value to "
+                    + "the consuming tool without returning it here. Pass --reveal to output the raw "
+                    + "value anyway."
+            }
+            FileHandle.standardError.write(Data((hint + "\n").utf8))
             exit(2)
         }
+        let plaintextExposureAcknowledged = ackRequired && ackGiven
         let plan = DeliveryPlan(
             mechanism: mechanism,
             executable: PlannedExecutable(
@@ -698,7 +666,9 @@ func runGet(_ arguments: [String]) -> Never {
             destination: destination,
             recipientAssurance: recipient,
             requestedTTLSeconds: ttlSeconds,
-            operationContext: reason
+            operationContext: reason,
+            interactive: interactive,
+            plaintextExposureAcknowledged: plaintextExposureAcknowledged
         )
         if isatty(STDERR_FILENO) == 1 {
             FileHandle.standardError.write(Data(
