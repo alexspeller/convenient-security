@@ -11,7 +11,11 @@ bash -n \
   "$repo_root/packaging/bin/build-and-install.sh" \
   "$repo_root/packaging/bin/build-agent.sh" \
   "$repo_root/packaging/bin/build-pkg.sh" \
+  "$repo_root/packaging/bin/build-sudo-pam.sh" \
+  "$repo_root/packaging/bin/build-sudo-review.sh" \
   "$repo_root/packaging/bin/build-spike.sh" \
+  "$repo_root/packaging/bin/install-sudo-pam.sh" \
+  "$repo_root/packaging/bin/install-sudo-review.sh" \
   "$repo_root/packaging/bin/notarize.sh" \
   "$repo_root/packaging/bin/provision.sh" \
   "$repo_root/packaging/pkg-scripts/postinstall" \
@@ -229,6 +233,11 @@ CSEC_SOCKET="/tmp/csec-release-must-ignore.sock" \
 OP_CLI_PATH="/bin/false" \
 CSEC_ROOT_SOCKET="/tmp/csec-root-release-must-ignore.sock" \
   "$repo_root/agent/.build/release/cs-selftest"
+
+# Build the opt-in sudo PAM integration and exercise its value-free preview,
+# redactor, wire-format, helper-signing, and malformed-input checks.
+"$repo_root/packaging/bin/build-sudo-pam.sh"
+"$repo_root/packaging/bin/build-sudo-review.sh"
 
 # The shipping access-review window must use Apple's context-bound embedded UI;
 # merely importing LocalAuthentication would regress to a second system alert.

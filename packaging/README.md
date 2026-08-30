@@ -158,6 +158,37 @@ authenticated read/update. Its separately signed helper deliberately has no
 restricted entitlement and must be unable to query the item. Use `RUN_SPIKE=0`
 to build + sign without the interactive Touch ID run.
 
+## Opt-in contextual sudo approval
+
+The sudo integration is deliberately separate from package installation. It
+shows a csec review window for the submitted invocation, gates approval with
+Touch ID, and leaves Apple's normal Touch ID/password path immediately behind
+the csec PAM factor. A redaction, transport, helper, or UI failure therefore
+falls through instead of locking the user out. Raw arguments are never logged
+or sent to the review helper; the PAM module sends only the frozen, filtered
+display over a private pipe.
+
+Build and run the non-privileged verification first:
+
+```sh
+packaging/bin/build-sudo-pam.sh
+packaging/bin/build-sudo-review.sh
+```
+
+Activation is an attended, two-step opt-in. Each installer offers `keep` or
+`restore`, and automatically restores on timeout, EOF, or a handled signal:
+
+```sh
+sudo packaging/bin/install-sudo-pam.sh
+sudo packaging/bin/install-sudo-review.sh
+```
+
+The first step adds the `sufficient` csec module immediately before stock
+`pam_tid` in `/etc/pam.d/sudo_local`; the second installs the hardened review
+helper and activates the custom window. Both scripts validate root ownership,
+directory modes, code signatures, architectures, backups, and the fallback
+ordering before changing the active path.
+
 The provisioning and notarization wrappers launch `op` with an allowlisted
 environment. Provisioning passes the App Store Connect private key to Fastlane
 as `/dev/fd/3`; its environment contains only the non-secret key/issuer IDs and

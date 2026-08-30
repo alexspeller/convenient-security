@@ -93,6 +93,12 @@ let package = Package(
         // synthetic value-free reviews and writes a PNG for design iteration.
         // Auto-approves nothing and resolves nothing; not a production surface.
         .executableTarget(name: "cs-review-preview", dependencies: ["ConvenientSecurity"]),
+        // Root PAM integration. It receives an already-redacted command over a
+        // private stdin pipe and owns the embedded Touch ID review UI.
+        .executableTarget(
+            name: "csec-sudo-review",
+            dependencies: ["ConvenientSecurity", "CSecuritySupport"]
+        ),
         // Synthetic regression fixture: rewrites its original argv area the way
         // modern Ruby process-title support does, with no real environment.
         .executableTarget(name: "cs-process-title-fixture"),
