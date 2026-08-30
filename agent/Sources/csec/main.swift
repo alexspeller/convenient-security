@@ -94,6 +94,7 @@ func usage() -> Never {
                   --import DEST=env:NAME|DEST=dotenv:PATH:NAME]…
                  [--replace-secret] [--no-audit-prompt]
       csec audit [--report-only] [--json] [--attest] [--scan-filesystem]
+      csec remote status | enable <phone-pairing-code> | disable
       csec install | uninstall | status
       csec root-status
 
@@ -175,6 +176,12 @@ func usage() -> Never {
                just prints the report, --attest prints only the pasteable
                attestation, --json emits the machine-readable report, and
                --scan-filesystem adds the bounded SUID/world-writable sweep.
+    remote     Explicitly opt one iPhone into mirrored approvals. `enable` pins
+               the phone's public pairing code under local Touch ID, then prints
+               the Mac public pairing code to import in the phone app. Once both
+               sides are paired, the local and phone prompts race; the first
+               authenticated decision wins. `disable` removes the pin under
+               local Touch ID. Pairing codes contain no credential values.
     install    Register csecd as a login-item LaunchAgent so it runs in the background.
     uninstall  Unregister the csecd LaunchAgent.
     status     Show whether the csecd LaunchAgent is registered/enabled.
@@ -217,6 +224,8 @@ case "setup":
     runSetup(Array(arguments.dropFirst()))
 case "audit":
     runAudit(Array(arguments.dropFirst()))
+case "remote":
+    runRemote(Array(arguments.dropFirst()))
 case "install":
     runInstall()
 case "uninstall":
@@ -1145,6 +1154,51 @@ func runRootStatus() -> Never {
             "csec root-status: authenticated root helper unavailable\n".utf8
         ))
         exit(1)
+    }
+}
+
+func runRemote(_ arguments: [String]) -> Never {
+    guard let action = arguments.first else { usage() }
+    let client = makeAgentClient()
+    do {
+        switch action {
+        case "status":
+            guard arguments.count == 1 else { usage() }
+            printRemoteApprovalStatus(try client.remoteApprovalStatus())
+        case "enable":
+            guard arguments.count == 2 else { usage() }
+            let result = try client.enableRemoteApproval(
+                phonePairingCode: arguments[1]
+            )
+            printRemoteApprovalStatus(result.status)
+            print("Import this public Mac pairing code in Convenient Security on the iPhone:")
+            print(result.macPairingCode)
+            print("Remote approval starts immediately after the phone accepts that code.")
+        case "disable":
+            guard arguments.count == 1 else { usage() }
+            printRemoteApprovalStatus(try client.disableRemoteApproval())
+        default:
+            usage()
+        }
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data(
+            "csec remote: remote approval could not be configured (\(error.localizedDescription))\n".utf8
+        ))
+        exit(1)
+    }
+}
+
+private func printRemoteApprovalStatus(_ status: RemoteApprovalConfigurationStatus) {
+    switch status.state {
+    case .disabled:
+        print("csec: iPhone remote approval is off")
+    case .unavailable:
+        print("csec: iPhone remote approval configuration is unavailable; disable and enroll again")
+    case .enabled:
+        let phone = status.phoneName ?? "paired iPhone"
+        let fingerprint = status.phoneKeyFingerprint ?? "unknown"
+        print("csec: iPhone remote approval is on for \(phone) (key \(fingerprint))")
     }
 }
 

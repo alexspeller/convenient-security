@@ -19,6 +19,7 @@ public enum WireCapability: String, Codable, Sendable, CaseIterable {
     case credentialProtocols = "credential_protocols"
     case inheritedFileDescriptors = "inherited_file_descriptors"
     case protectedRegularFiles = "protected_regular_files"
+    case remoteApprovals = "remote_approvals"
 }
 
 public struct ProtocolCapabilities: Codable, Sendable, Equatable {
@@ -281,6 +282,52 @@ public struct CommitNativeStoreBlobsRequest: Codable, Sendable {
     }
 }
 
+public enum RemoteApprovalConfigurationAction: String, Codable, Sendable {
+    case status
+    case enable
+    case disable
+}
+
+/// Local, authenticated launcher request for the explicit remote-approval
+/// opt-in. Pairing codes contain public device identity and P-256 keys only.
+public struct RemoteApprovalConfigurationRequest: Codable, Sendable {
+    public let requestID: String
+    public let action: RemoteApprovalConfigurationAction
+    public let phonePairingCode: String?
+
+    public init(
+        action: RemoteApprovalConfigurationAction,
+        phonePairingCode: String? = nil,
+        requestID: UUID = UUID()
+    ) {
+        self.requestID = requestID.uuidString.lowercased()
+        self.action = action
+        self.phonePairingCode = phonePairingCode
+    }
+}
+
+public enum RemoteApprovalConfigurationState: String, Codable, Sendable {
+    case disabled
+    case enabled
+    case unavailable
+}
+
+public struct RemoteApprovalConfigurationStatus: Codable, Equatable, Sendable {
+    public let state: RemoteApprovalConfigurationState
+    public let phoneName: String?
+    public let phoneKeyFingerprint: String?
+
+    public init(
+        state: RemoteApprovalConfigurationState,
+        phoneName: String? = nil,
+        phoneKeyFingerprint: String? = nil
+    ) {
+        self.state = state
+        self.phoneName = phoneName
+        self.phoneKeyFingerprint = phoneKeyFingerprint
+    }
+}
+
 /// Requests retain the v1 flat discriminator so an upgraded agent can return a
 /// typed migration error instead of misinterpreting an old access as secure.
 public enum Request: Sendable {
@@ -301,6 +348,7 @@ public enum Request: Sendable {
     case hostAuditPoll(HostAuditPollRequest)
     case hostRemediate(HostRemediationRequest)
     case hostRecordTriage(HostTriageRequest)
+    case configureRemoteApproval(RemoteApprovalConfigurationRequest)
 }
 
 extension Request: Codable {
@@ -312,6 +360,7 @@ extension Request: Codable {
         case protectedLaunchApproval
         case scanFilesystem, selectedKeys, jobID
         case exemptions, todos, cleared
+        case action, phonePairingCode
     }
 
     public init(from decoder: Decoder) throws {
@@ -443,6 +492,28 @@ extension Request: Codable {
                 cleared: try container.decodeIfPresent([String].self, forKey: .cleared) ?? [],
                 requestUUID: try Self.decodeUUID(container, forKey: .requestID)
             ))
+        case "configure_remote_approval":
+            let action = try container.decode(
+                RemoteApprovalConfigurationAction.self,
+                forKey: .action
+            )
+            let phonePairingCode = try container.decodeIfPresent(
+                String.self,
+                forKey: .phonePairingCode
+            )
+            guard phonePairingCode?.utf8.count ?? 0 <= 16 * 1_024,
+                  (action == .enable) == (phonePairingCode != nil) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .phonePairingCode,
+                    in: container,
+                    debugDescription: "invalid remote approval configuration"
+                )
+            }
+            self = .configureRemoteApproval(RemoteApprovalConfigurationRequest(
+                action: action,
+                phonePairingCode: phonePairingCode,
+                requestID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: container, debugDescription: "unknown request type"
@@ -550,6 +621,15 @@ extension Request: Codable {
             try container.encode(request.exemptions, forKey: .exemptions)
             try container.encode(request.todos, forKey: .todos)
             try container.encode(request.cleared, forKey: .cleared)
+        case let .configureRemoteApproval(request):
+            try container.encode("configure_remote_approval", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.action, forKey: .action)
+            try container.encodeIfPresent(
+                request.phonePairingCode,
+                forKey: .phonePairingCode
+            )
         }
     }
 
@@ -594,6 +674,8 @@ public struct Response: Codable, Sendable {
     public let hostAuditReport: HostAuditReport?
     public let hostAuditProgress: HostAuditProgressSnapshot?
     public let hostRemediation: HostRemediationSummary?
+    public let remoteApprovalStatus: RemoteApprovalConfigurationStatus?
+    public let remoteApprovalMacPairingCode: String?
     public let failure: ProtocolFailure?
     public let error: String?
 
@@ -618,6 +700,8 @@ public struct Response: Codable, Sendable {
         hostAuditReport: HostAuditReport? = nil,
         hostAuditProgress: HostAuditProgressSnapshot? = nil,
         hostRemediation: HostRemediationSummary? = nil,
+        remoteApprovalStatus: RemoteApprovalConfigurationStatus? = nil,
+        remoteApprovalMacPairingCode: String? = nil,
         failure: ProtocolFailure? = nil,
         error: String? = nil
     ) {
@@ -641,6 +725,8 @@ public struct Response: Codable, Sendable {
         self.hostAuditReport = hostAuditReport
         self.hostAuditProgress = hostAuditProgress
         self.hostRemediation = hostRemediation
+        self.remoteApprovalStatus = remoteApprovalStatus
+        self.remoteApprovalMacPairingCode = remoteApprovalMacPairingCode
         self.failure = failure
         self.error = error
     }

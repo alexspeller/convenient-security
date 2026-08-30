@@ -127,6 +127,18 @@ carries the same bounded, value-free delivery details as defense in depth, and
 all dynamic text is bounded with control, newline, and bidirectional-formatting
 characters neutralized.
 
+An explicitly paired iPhone may mirror this review for requests composed only
+of `op://` references. csecd freezes the phone display model before starting
+either path, signs its canonical request with a device-bound Secure Enclave key,
+and races the ordinary local review against a 90-second CloudKit-private-database
+exchange. The phone verifies its pinned Mac key before showing an action and its
+Face-ID-gated Secure Enclave key signs the exact decision, request ID, request
+digest, phone ID, and timestamp. csecd accepts only the pinned phone, matching
+unexpired transaction, and a single use. CloudKit is an untrusted value-free
+mailbox, never an authorization source. Missing enrollment or relay failure
+leaves the local flow unchanged; host remediation and `csec://` stay local-only.
+See [`docs/remote-approval.md`](docs/remote-approval.md).
+
 Editing a native file is a separate exact-launcher operation that asks for fresh
 Touch ID and shows that every key in the named store will be exposed to the
 editor; it does not create a reusable secret grant. The shipping daemon has no
@@ -547,9 +559,28 @@ An `X`/`F`-unavailable check reports `unknown`, never a pass.
 ## Resolution and cache
 
 `SecretResolver` dispatches each reference independently by scheme. The shipping
-daemon registers `op://` when the verified official 1Password CLI is installed
-and registers `csec://` when its provisioned Keychain group is usable. A single
-request, language-client call, or `csec exec` launch can contain both schemes.
+daemon always registers `op://`, so a missing CLI fails closed instead of letting
+a reference pass through as ordinary process data, and registers `csec://` when
+its provisioned Keychain group is usable. A single request, language-client call,
+or `csec exec` launch can contain both schemes.
+
+The 1Password provider starts independently after the daemon begins serving. It
+dynamically locates and signature-checks the official CLI, immediately runs a
+metadata-only `op whoami --format=json`, discards that command's output, and
+repeats the probe every eight minutes while access remains available. This stays
+inside 1Password desktop integration's ten-minute inactivity window without
+prefetching any secret. All CLI commands are serialized, concurrent reconnects
+share one attempt, and every spawn rechecks the CLI's code identity. A failed
+background probe retries after 5, 15, then at most 30 minutes; an actual secret
+request does not wait for that backoff and reconnects immediately. Installing a
+trusted CLI after launch is noticed on a later probe without restarting csecd.
+Authentication probes have a 60-second deadline and reads a 120-second deadline,
+including forced termination of an unresponsive CLI. Logs expose only fixed
+connection states.
+
+This is best-effort continuity, not a bypass of 1Password policy: locking the
+1Password app revokes CLI authorization, and desktop integration still applies
+its maximum session lifetime. Either event can require fresh local approval.
 
 For 1Password, resolution checks the warm in-process cache, then—only when a
 just-approved biometric context is present—the data-protection keychain, then

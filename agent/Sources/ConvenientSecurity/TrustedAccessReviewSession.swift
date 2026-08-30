@@ -6,8 +6,8 @@
 
   /// One trusted window owns policy selection and the LAContext-backed Touch ID
   /// view. Authentication starts as soon as the visible window is rendered. On
-  /// success the exact visible selections are frozen and returned to Agent,
-  /// which must still accept them before this session releases its LAContext.
+  /// success the exact visible review is returned to Agent, which must still
+  /// accept it before this session releases its LAContext.
   @MainActor
   final class TrustedAccessReviewSession: NSObject, NSWindowDelegate,
     AccessPolicyAuthenticationSession
@@ -45,7 +45,16 @@
 
     static func present(_ review: AccessPolicyReview) async -> AccessPolicyReviewOutcome {
       let session = TrustedAccessReviewSession(review: review)
-      return await session.collectPolicySelection()
+      return await withTaskCancellationHandler {
+        await session.collectPolicySelection()
+      } onCancel: {
+        // A verified phone decision can win while the local Touch ID sheet is
+        // active. Invalidate its LAContext and close the panel promptly so the
+        // losing path cannot later produce a second decision.
+        Task { @MainActor in
+          await session.cancel()
+        }
+      }
     }
 
     func completeAfterPolicyApproval(policySummary: String) async -> ConsentOutcome {

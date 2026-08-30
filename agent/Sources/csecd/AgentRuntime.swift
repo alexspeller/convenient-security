@@ -1,4 +1,6 @@
 import ConvenientSecurity
+import CSECRemoteApprovalCloudKit
+import CloudKit
 import Foundation
 import OnePasswordAdapter
 import Security
@@ -107,20 +109,50 @@ func startAgentServer() async {
   #endif
 
   let resolver = SecretResolver(cache: cache)
-  #if DEBUG
-    let registerOnePassword = providerPath != nil
-  #else
-    let registerOnePassword = providerTrusted
-  #endif
-  if registerOnePassword, let providerPath {
-    await resolver.register(OnePasswordProvider(cliPath: providerPath))
-  }
+  let onePasswordProvider = OnePasswordProvider(statusObserver: { status in
+    let message: String?
+    switch status {
+    case .notStarted:
+      message = nil
+    case .cliUnavailable:
+      message = "csecd: 1Password CLI unavailable; waiting for a trusted installation.\n"
+    case .connecting:
+      message = "csecd: requesting 1Password desktop access.\n"
+    case .connected:
+      message = "csecd: 1Password desktop access ready; keeping it active.\n"
+    case .disconnected:
+      message = "csecd: 1Password desktop access unavailable; retrying in the background.\n"
+    }
+    if let message {
+      FileHandle.standardError.write(Data(message.utf8))
+    }
+  })
+  // Always claim op:// so a missing CLI fails closed instead of allowing a raw
+  // reference through as ordinary process data. The provider locates and
+  // re-validates the official CLI on every command, which also notices a trusted
+  // installation added after csecd launched.
+  await resolver.register(onePasswordProvider)
   if let nativeStore {
     await resolver.register(nativeStore)
   }
   let grants = GrantTable()
   let consent: ConsentProvider = BiometricConsent()
-  let policyReview: PolicyReviewProvider = TrustedPolicyReview()
+  let remoteRelay = CloudKitRemoteApprovalRelay()
+  let remoteApproval = RemoteApprovalManager(
+    store: SecurityRemoteApprovalConfigurationStore(),
+    relay: remoteRelay,
+    consent: consent,
+    cloudKitContainerIdentifier: CloudKitRemoteApprovalRelay.defaultContainerIdentifier,
+    relayIsAvailable: {
+      guard let status = try? await remoteRelay.accountStatus() else { return false }
+      return status == .available
+    }
+  )
+  await remoteApproval.prepare()
+  let policyReview: PolicyReviewProvider = MirroredPolicyReview(
+    local: TrustedPolicyReview(),
+    remote: remoteApproval
+  )
   #if DEBUG
     let agent = Agent(
       resolver: resolver,
@@ -154,6 +186,70 @@ func startAgentServer() async {
       return await agent.schemes()
     case .capabilities:
       return await agent.capabilities()
+    case .configureRemoteApproval(let request):
+      switch request.action {
+      case .status:
+        return Response(
+          requestID: request.requestID,
+          remoteApprovalStatus: wireRemoteApprovalStatus(await remoteApproval.status())
+        )
+      case .enable:
+        guard let phonePairingCode = request.phonePairingCode else {
+          return .failed(
+            .invalidRequest,
+            message: "a phone pairing code is required",
+            requestID: request.requestID
+          )
+        }
+        do {
+          let macPairingCode = try await remoteApproval.enable(
+            phonePairingCode: phonePairingCode
+          )
+          return Response(
+            requestID: request.requestID,
+            remoteApprovalStatus: wireRemoteApprovalStatus(await remoteApproval.status()),
+            remoteApprovalMacPairingCode: macPairingCode
+          )
+        } catch RemoteApprovalManagerError.denied {
+          return .failed(
+            .consentDenied,
+            message: "remote approval enrollment denied",
+            requestID: request.requestID
+          )
+        } catch RemoteApprovalManagerError.relayUnavailable {
+          return .failed(
+            .providerUnavailable,
+            message: "the private iCloud approval relay is unavailable",
+            requestID: request.requestID
+          )
+        } catch {
+          return .failed(
+            .invalidRequest,
+            message: "remote approval enrollment could not be completed",
+            requestID: request.requestID
+          )
+        }
+      case .disable:
+        do {
+          try await remoteApproval.disable()
+          return Response(
+            requestID: request.requestID,
+            remoteApprovalStatus: wireRemoteApprovalStatus(await remoteApproval.status())
+          )
+        } catch RemoteApprovalManagerError.denied {
+          return .failed(
+            .consentDenied,
+            message: "remote approval removal denied",
+            requestID: request.requestID
+          )
+        } catch {
+          return .failed(
+            .internalError,
+            message: "remote approval removal could not be completed",
+            requestID: request.requestID
+          )
+        }
+      }
     case .beginSession(let begin):
       return await agent.beginSession(request: begin, caller: caller)
     case .beginOutputRedaction(let begin):
@@ -255,7 +351,7 @@ func startAgentServer() async {
   FileHandle.standardError.write(Data("csecd: listening on \(socketPath)\n".utf8))
   FileHandle.standardError.write(
     Data(
-      "csecd: new references require Touch ID.\n".utf8
+      "csecd: new references require biometric approval.\n".utf8
     ))
   if cacheEnabled {
     FileHandle.standardError.write(
@@ -295,6 +391,30 @@ func startAgentServer() async {
     }
   }
 
+  // Serving local requests does not wait for 1Password. In parallel, make the
+  // first metadata-only connection attempt immediately, then stay inside the
+  // desktop integration's idle window for as long as 1Password permits.
+  Task(priority: .utility) {
+    await onePasswordProvider.maintainConnection()
+  }
+
   // Periodic value-free re-audit + regression notifications (Decision 6).
   PeriodicHostAudit.start()
+}
+
+private func wireRemoteApprovalStatus(
+  _ status: RemoteApprovalManagerStatus
+) -> RemoteApprovalConfigurationStatus {
+  switch status {
+  case .disabled:
+    return RemoteApprovalConfigurationStatus(state: .disabled)
+  case let .enabled(phoneName, fingerprint):
+    return RemoteApprovalConfigurationStatus(
+      state: .enabled,
+      phoneName: phoneName,
+      phoneKeyFingerprint: fingerprint
+    )
+  case .unavailable:
+    return RemoteApprovalConfigurationStatus(state: .unavailable)
+  }
 }

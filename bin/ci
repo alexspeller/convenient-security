@@ -97,8 +97,53 @@ fi
 plutil -lint \
   "$repo_root/packaging/agent/Info.plist" \
   "$repo_root/packaging/agent/csecd.entitlements" \
+  "$repo_root/packaging/agent/csecd.remote-approval.development.entitlements" \
+  "$repo_root/packaging/agent/csecd.remote-approval.entitlements" \
   "$repo_root/packaging/agent/LaunchAgents/com.alexspeller.convenient-security.plist" \
+  "$repo_root/ios/ConvenientSecurityApproval/Info.plist" \
+  "$repo_root/ios/ConvenientSecurityApproval/ConvenientSecurityApproval.entitlements" \
+  "$repo_root/ios/ConvenientSecurityApproval/ConvenientSecurityApproval.production.entitlements" \
   "$repo_root/packaging/root/LaunchDaemons/com.alexspeller.convenient-security.rootd.plist"
+iphone_development_environment="$(
+  /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.icloud-container-environment' \
+    "$repo_root/ios/ConvenientSecurityApproval/ConvenientSecurityApproval.entitlements"
+)"
+iphone_production_environment="$(
+  /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.icloud-container-environment' \
+    "$repo_root/ios/ConvenientSecurityApproval/ConvenientSecurityApproval.production.entitlements"
+)"
+mac_development_environment="$(
+  /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.icloud-container-environment' \
+    "$repo_root/packaging/agent/csecd.remote-approval.development.entitlements"
+)"
+mac_production_environment="$(
+  /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.icloud-container-environment' \
+    "$repo_root/packaging/agent/csecd.remote-approval.entitlements"
+)"
+if [ "$iphone_development_environment" != "Development" ] \
+    || [ "$mac_development_environment" != "Development" ] \
+    || [ "$iphone_production_environment" != "Production" ] \
+    || [ "$mac_production_environment" != "Production" ]; then
+  echo "Mac and iPhone CloudKit entitlements must stay aligned by build environment" >&2
+  exit 1
+fi
+ruby -ryaml -e '
+  project = YAML.safe_load(File.read(ARGV.fetch(0)))
+  configs = project.dig("targets", "ConvenientSecurityApproval", "settings", "configs")
+  expected = {
+    "Debug" => "ConvenientSecurityApproval/ConvenientSecurityApproval.entitlements",
+    "Release" => "ConvenientSecurityApproval/ConvenientSecurityApproval.production.entitlements",
+  }
+  actual = configs&.transform_values { |settings| settings["CODE_SIGN_ENTITLEMENTS"] }
+  abort "iOS build configurations must select matching CloudKit entitlements" unless actual == expected
+' "$repo_root/ios/project.yml"
+# The release gate still needs a generated Xcode project and physical device,
+# but CI rejects syntax drift in the checked-in iOS source shell immediately.
+swiftc -frontend -parse \
+  "$repo_root/ios/ConvenientSecurityApproval/ConvenientSecurityApprovalApp.swift" \
+  "$repo_root/ios/ConvenientSecurityApproval/PhoneIdentityStore.swift" \
+  "$repo_root/ios/ConvenientSecurityApproval/ApprovalViewModel.swift" \
+  "$repo_root/ios/ConvenientSecurityApproval/ContentView.swift"
 ruby -c "$repo_root/packaging/fastlane/Fastfile"
 swiftc "$repo_root/packaging/spike/main.swift" \
   -o "$swift_scratch/keychain-spike-compile-check"
@@ -192,7 +237,10 @@ if ! otool -L "$shipping_agent" | rg -q 'LocalAuthenticationEmbeddedUI'; then
   echo "release csecd does not link the embedded LocalAuthentication UI" >&2
   exit 1
 fi
-if ! nm -u "$shipping_agent" | rg -q '_OBJC_CLASS_\$_LAAuthenticationView'; then
+shipping_undefined_symbols="$(nm -u "$shipping_agent")"
+# Do not use `nm | rg -q` here: with pipefail, rg closes the large nm stream
+# after its match and nm's resulting SIGPIPE turns a successful check into 141.
+if [[ "$shipping_undefined_symbols" != *"_OBJC_CLASS_\$_LAAuthenticationView"* ]]; then
   echo "release csecd does not reference LAAuthenticationView" >&2
   exit 1
 fi

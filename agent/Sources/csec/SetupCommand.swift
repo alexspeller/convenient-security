@@ -1,5 +1,10 @@
 import Foundation
+@preconcurrency import AppKit
 import ConvenientSecurity
+
+#if canImport(Darwin)
+import Darwin
+#endif
 
 private struct SetupImportRequest {
     let destinationKey: String
@@ -137,6 +142,8 @@ func runSetup(_ arguments: [String]) -> Never {
         sipStatus: sipStatus
     )
 
+    requestFullDiskAccess()
+
     if let auditPrompt {
         print("\n# Bounded coding-agent security audit prompt\n")
         FileHandle.standardOutput.write(Data(auditPrompt.utf8))
@@ -265,6 +272,31 @@ func runSetup(_ arguments: [String]) -> Never {
     print("\n---")
     performHostAudit(scanFilesystem: false, reportOnly: true, json: false, quietWhenUnavailable: true)
     exit(0)
+}
+
+private func requestFullDiskAccess() {
+    print("\n## Full Disk Access")
+    print("- required by the resident csecd agent to audit macOS privacy grants")
+    print(
+        "- add or enable /Applications/ConvenientSecurity.app in "
+            + "System Settings → Privacy & Security → Full Disk Access"
+    )
+
+    let interactive = isatty(STDIN_FILENO) == 1
+        || isatty(STDOUT_FILENO) == 1
+        || isatty(STDERR_FILENO) == 1
+    guard interactive else {
+        print("- System Settings was not opened because setup is not attached to a terminal")
+        return
+    }
+
+    guard let settingsURL = URL(
+        string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+    ), NSWorkspace.shared.open(settingsURL) else {
+        print("- could not open System Settings; open the Full Disk Access pane manually")
+        return
+    }
+    print("- opened the Full Disk Access pane")
 }
 
 private func parseSetupOptions(_ arguments: [String]) throws -> SetupCommandOptions {

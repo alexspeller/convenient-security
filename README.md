@@ -66,6 +66,15 @@ rest and in use — as small as macOS allows.
 - **Two backends, one interface.** References resolve from the official 1Password
   CLI (`op://…`) or from device-bound, AES-256-GCM encrypted files (`csec://…`).
   You can mix both in a single launch.
+- **1Password is ready before you need it.** When the trusted `op` CLI is
+  installed, the resident agent requests desktop-app access on launch and keeps
+  that access active with metadata-only checks. It never prefetches a secret;
+  app lock and 1Password's maximum session lifetime still require fresh approval.
+- **Opt-in iPhone approval.** A paired iPhone can mirror and Face-ID-approve the
+  exact same short-lived, value-free 1Password prompt while the local Touch ID
+  window remains available; the first signed decision wins. The source path is
+  implemented, with its CloudKit provisioning and physical-device release gate
+  tracked in [`docs/remote-approval.md`](docs/remote-approval.md).
 - **Encrypted at rest, gated by code identity.** The optional cache and the
   native store keys live in a Secure-Enclave-backed Keychain group that only the
   signed agent can open — the same code-identity model 1Password itself relies on.

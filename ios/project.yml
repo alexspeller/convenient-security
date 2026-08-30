@@ -1,0 +1,42 @@
+name: ConvenientSecurityApproval
+options:
+  bundleIdPrefix: com.alexspeller
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+packages:
+  convenient-security:
+    path: ../agent
+targets:
+  ConvenientSecurityApproval:
+    type: application
+    platform: iOS
+    sources:
+      - path: ConvenientSecurityApproval
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.alexspeller.convenient-security.approval
+        DEVELOPMENT_TEAM: 8RS6GD89Y7
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: 5.9
+        TARGETED_DEVICE_FAMILY: "1"
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: ConvenientSecurityApproval/ConvenientSecurityApproval.entitlements
+        Release:
+          CODE_SIGN_ENTITLEMENTS: ConvenientSecurityApproval/ConvenientSecurityApproval.production.entitlements
+    dependencies:
+      - package: convenient-security
+        product: CSECRemoteApproval
+      - package: convenient-security
+        product: CSECRemoteApprovalCloudKit
+    info:
+      path: ConvenientSecurityApproval/Info.plist
+      properties:
+        CFBundleDisplayName: Convenient Security
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: 1
+        UILaunchScreen: {}
+        NSFaceIDUsageDescription: Confirm approvals mirrored from your paired Mac.
+        UIBackgroundModes:
+          - remote-notification

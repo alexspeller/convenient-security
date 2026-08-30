@@ -238,6 +238,11 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.schemes()
     case .capabilities:
         return await agent.capabilities()
+    case let .configureRemoteApproval(request):
+        return Response(
+            requestID: request.requestID,
+            remoteApprovalStatus: RemoteApprovalConfigurationStatus(state: .disabled)
+        )
     case let .beginSession(begin):
         return await agent.beginSession(request: begin, caller: caller)
     case let .beginOutputRedaction(begin):

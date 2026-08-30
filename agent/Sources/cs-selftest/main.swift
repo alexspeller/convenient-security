@@ -94,6 +94,128 @@ actor FakeKeychainBackend: KeychainBackend {
     }
 }
 
+actor FakeOnePasswordCommandRunner {
+    struct Invocation: Sendable, Equatable {
+        let path: String
+        let arguments: [String]
+        let timeout: TimeInterval
+    }
+
+    private var recordedInvocations: [Invocation] = []
+    private var readStatus: Int32 = 0
+    private var readError = Data()
+    private var shouldBlockNextInvocation = false
+    private var blocked = false
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var releaseRequested = false
+
+    func blockNextInvocation() {
+        shouldBlockNextInvocation = true
+    }
+
+    func waitUntilBlocked() async -> Bool {
+        for _ in 0..<100 {
+            if blocked { return true }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        return blocked
+    }
+
+    func releaseBlockedInvocation() {
+        if let continuation = releaseContinuation {
+            continuation.resume()
+            releaseContinuation = nil
+        } else {
+            releaseRequested = true
+        }
+    }
+
+    func setReadResult(status: Int32, stderr: Data = Data()) {
+        readStatus = status
+        readError = stderr
+    }
+
+    func invocations() -> [Invocation] {
+        recordedInvocations
+    }
+
+    func run(
+        path: String,
+        arguments: [String],
+        timeout: TimeInterval
+    ) async throws -> OnePasswordCLI.Result {
+        recordedInvocations.append(
+            Invocation(path: path, arguments: arguments, timeout: timeout)
+        )
+
+        if shouldBlockNextInvocation {
+            shouldBlockNextInvocation = false
+            blocked = true
+            await withCheckedContinuation { continuation in
+                if releaseRequested {
+                    releaseRequested = false
+                    continuation.resume()
+                } else {
+                    releaseContinuation = continuation
+                }
+            }
+            blocked = false
+        }
+
+        if arguments.first == "whoami" {
+            return OnePasswordCLI.Result(
+                status: 0,
+                stdout: Data("{}".utf8),
+                stderr: Data()
+            )
+        }
+        if arguments.first == "read" {
+            return OnePasswordCLI.Result(
+                status: readStatus,
+                stdout: readStatus == 0 ? Data("synthetic-provider-value".utf8) : Data(),
+                stderr: readError
+            )
+        }
+        return OnePasswordCLI.Result(status: 64, stdout: Data(), stderr: Data())
+    }
+}
+
+actor FakeOnePasswordSleeper {
+    private var recordedIntervals: [TimeInterval] = []
+
+    func sleep(_ seconds: TimeInterval) async throws {
+        recordedIntervals.append(seconds)
+        if recordedIntervals.count >= 2 {
+            throw CancellationError()
+        }
+    }
+
+    func intervals() -> [TimeInterval] {
+        recordedIntervals
+    }
+}
+
+final class LockedOnePasswordCLIPath: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+
+    init(_ value: String?) {
+        self.value = value
+    }
+
+    func get() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func set(_ value: String?) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+}
+
 print("# SecretRef")
 
 // SecretRef: canonical URI parsing + scheme dispatch.
@@ -2368,6 +2490,169 @@ check(OnePasswordCLI.sanitizedEnvironment()["GITHUB_TOKEN"] == nil
       && OnePasswordCLI.sanitizedEnvironment()["DATABASE_URL"] == nil,
       "provider child receives a minimal allowlisted environment")
 
+#if DEBUG
+do {
+    let previousOverride = getenv("OP_CLI_PATH").map { String(cString: $0) }
+    defer {
+        if let previousOverride {
+            _ = setenv("OP_CLI_PATH", previousOverride, 1)
+        } else {
+            unsetenv("OP_CLI_PATH")
+        }
+    }
+    _ = setenv("OP_CLI_PATH", "/bin/sleep", 1)
+    let startedAt = Date()
+    do {
+        _ = try await OnePasswordCLI.run("/bin/sleep", ["30"], timeout: 0.05)
+        check(false, "a CLI subprocess exceeding its deadline should throw")
+    } catch OnePasswordCLIError.timedOut {
+        check(Date().timeIntervalSince(startedAt) < 3,
+              "a CLI subprocess exceeding its deadline is terminated promptly")
+    } catch {
+        check(false, "a CLI subprocess deadline reports the timeout error (\(error))")
+    }
+}
+#endif
+
+let providerConfiguration = OnePasswordConnectionConfiguration(
+    heartbeatInterval: 8,
+    connectionFreshness: 10,
+    initialRetryDelay: 5,
+    maximumRetryDelay: 30,
+    authenticationTimeout: 7,
+    resolutionTimeout: 11
+)
+let fakeOnePasswordRunner = FakeOnePasswordCommandRunner()
+let proactiveProvider = OnePasswordProvider(
+    cliPath: "/synthetic/op",
+    configuration: providerConfiguration,
+    runCommand: { path, arguments, timeout in
+        try await fakeOnePasswordRunner.run(
+            path: path,
+            arguments: arguments,
+            timeout: timeout
+        )
+    }
+)
+
+await fakeOnePasswordRunner.blockNextInvocation()
+let firstAuthentication = Task { try await proactiveProvider.authenticate() }
+let firstProbeBlocked = await fakeOnePasswordRunner.waitUntilBlocked()
+check(firstProbeBlocked, "proactive authentication starts a metadata-only CLI probe")
+let concurrentAuthentication = Task { try await proactiveProvider.authenticate() }
+try? await Task.sleep(nanoseconds: 10_000_000)
+await fakeOnePasswordRunner.releaseBlockedInvocation()
+do {
+    try await firstAuthentication.value
+    try await concurrentAuthentication.value
+    let invocations = await fakeOnePasswordRunner.invocations()
+    check(invocations == [
+        .init(
+            path: "/synthetic/op",
+            arguments: ["whoami", "--format=json"],
+            timeout: 7
+        )
+    ], "concurrent authentication shares one bounded whoami probe")
+    check(await proactiveProvider.isAvailable(),
+          "a successful metadata probe marks 1Password immediately available")
+
+    try await proactiveProvider.authenticate()
+    check(await fakeOnePasswordRunner.invocations().count == 1,
+          "fresh authentication is idempotent and does not spawn another CLI")
+
+    let resolved = try await proactiveProvider.resolve(
+        try SecretRef("op://synthetic/item/field"),
+        unlock: nil
+    )
+    check(resolved.value == Data("synthetic-provider-value".utf8),
+          "an authenticated provider resolves through the existing op read path")
+    check(await fakeOnePasswordRunner.invocations().last?.timeout == 11,
+          "secret resolution has its own bounded CLI deadline")
+} catch {
+    check(false, "synthetic proactive provider flow succeeds (\(error))")
+}
+
+await fakeOnePasswordRunner.setReadResult(
+    status: 1,
+    stderr: Data("authorization unavailable".utf8)
+)
+do {
+    _ = try await proactiveProvider.resolve(
+        try SecretRef("op://synthetic/item/other-field"),
+        unlock: nil
+    )
+    check(false, "a failed real read should throw")
+} catch {
+    check(await proactiveProvider.connectionStatus() == .disconnected,
+          "a failed real read invalidates optimistic connection state")
+}
+await fakeOnePasswordRunner.setReadResult(status: 0)
+do {
+    _ = try await proactiveProvider.resolve(
+        try SecretRef("op://synthetic/item/other-field"),
+        unlock: nil
+    )
+    let suffix = Array((await fakeOnePasswordRunner.invocations()).suffix(2))
+    check(suffix.map(\.arguments) == [
+        ["whoami", "--format=json"],
+        ["read", "--no-newline", "op://synthetic/item/other-field"],
+    ], "the next real request reconnects immediately after a failed read")
+} catch {
+    check(false, "a real request reconnects after provider failure (\(error))")
+}
+
+let dynamicCLIPath = LockedOnePasswordCLIPath(nil)
+let hotInstallRunner = FakeOnePasswordCommandRunner()
+let hotInstallProvider = OnePasswordProvider(
+    locateCLI: { dynamicCLIPath.get() },
+    runCommand: { path, arguments, timeout in
+        try await hotInstallRunner.run(path: path, arguments: arguments, timeout: timeout)
+    }
+)
+do {
+    try await hotInstallProvider.authenticate()
+    check(false, "authentication without a CLI should throw")
+} catch {
+    check(await hotInstallProvider.connectionStatus() == .cliUnavailable,
+          "a missing CLI has a distinct value-free connection state")
+}
+dynamicCLIPath.set("/synthetic/newly-installed-op")
+do {
+    try await hotInstallProvider.authenticate()
+    let hotInstallStatus = await hotInstallProvider.connectionStatus()
+    let hotInstallInvocationCount = await hotInstallRunner.invocations().count
+    check(hotInstallStatus == .connected && hotInstallInvocationCount == 1,
+          "the same provider notices a CLI installed after daemon launch")
+} catch {
+    check(false, "a newly installed CLI can connect without restarting csecd (\(error))")
+}
+
+let heartbeatRunner = FakeOnePasswordCommandRunner()
+let heartbeatSleeper = FakeOnePasswordSleeper()
+let heartbeatProvider = OnePasswordProvider(
+    cliPath: "/synthetic/op",
+    configuration: OnePasswordConnectionConfiguration(
+        heartbeatInterval: 8,
+        connectionFreshness: 10,
+        initialRetryDelay: 5,
+        maximumRetryDelay: 30,
+        authenticationTimeout: 7,
+        resolutionTimeout: 11
+    ),
+    runCommand: { path, arguments, timeout in
+        try await heartbeatRunner.run(path: path, arguments: arguments, timeout: timeout)
+    },
+    sleep: { seconds in try await heartbeatSleeper.sleep(seconds) }
+)
+await heartbeatProvider.maintainConnection()
+let heartbeatInvocations = await heartbeatRunner.invocations()
+check(heartbeatInvocations.count == 2
+      && heartbeatInvocations.allSatisfy {
+          $0.arguments == ["whoami", "--format=json"] && $0.timeout == 7
+      }, "connection maintenance probes immediately and again after the heartbeat")
+check(await heartbeatSleeper.intervals() == [8, 8],
+      "successful maintenance uses the configured sub-expiry heartbeat")
+
 if let opPath = OnePasswordCLI.locate() {
     check(FileManager.default.isExecutableFile(atPath: opPath), "op CLI located at \(opPath)")
     if let result = try? await OnePasswordCLI.run(opPath, ["--version"]) {
@@ -3327,6 +3612,7 @@ envFileDocumentTests()
 envSelectModelTests()
 secretDestinationSpecTests()
 onePasswordItemWriteTests()
+await remoteApprovalTests()
 
 if failures == 0 {
     print("\nAll checks passed.")

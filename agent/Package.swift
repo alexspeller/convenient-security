@@ -3,9 +3,15 @@ import PackageDescription
 
 let package = Package(
     name: "convenient-security",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v13), .iOS(.v16)],
     products: [
         .library(name: "ConvenientSecurity", targets: ["ConvenientSecurity"]),
+        // Shared, value-free wire model used by the Mac agent and companion app.
+        .library(name: "CSECRemoteApproval", targets: ["CSECRemoteApproval"]),
+        .library(
+            name: "CSECRemoteApprovalCloudKit",
+            targets: ["CSECRemoteApprovalCloudKit"]
+        ),
         .executable(name: "csecd", targets: ["csecd"]),
         .executable(name: "csec", targets: ["csec"]),
         .executable(name: "csec-rootd", targets: ["csec-rootd"]),
@@ -27,15 +33,32 @@ let package = Package(
             name: "CSECRootServer",
             dependencies: ["CSecuritySupport", "CSECRootProtocol"]
         ),
+        // Cross-platform signed remote-approval envelopes. This target contains
+        // no provider, secret value, AppKit/UIKit, Keychain, or CloudKit code.
+        .target(name: "CSECRemoteApproval"),
+        // Private-database transport. Signatures in CSECRemoteApproval remain
+        // authoritative; CloudKit is an untrusted, value-free mailbox.
+        .target(
+            name: "CSECRemoteApprovalCloudKit",
+            dependencies: ["CSECRemoteApproval"]
+        ),
         // Security core plus the native encrypted-file provider.
         .target(
             name: "ConvenientSecurity",
-            dependencies: ["CSecuritySupport", "CSECRootProtocol"]
+            dependencies: [
+                "CSecuritySupport", "CSECRootProtocol", "CSECRemoteApproval",
+            ]
         ),
         // All 1Password-specific code lives behind the provider seam.
         .target(name: "OnePasswordAdapter", dependencies: ["ConvenientSecurity"]),
         // The resident agent.
-        .executableTarget(name: "csecd", dependencies: ["ConvenientSecurity", "OnePasswordAdapter"]),
+        .executableTarget(
+            name: "csecd",
+            dependencies: [
+                "ConvenientSecurity", "OnePasswordAdapter",
+                "CSECRemoteApprovalCloudKit",
+            ]
+        ),
         // The signed launcher / CLI.
         // OnePasswordAdapter powers CLI-direct 1Password writes
         // (protect --env, edit op://…); reads stay in csecd.
@@ -52,7 +75,7 @@ let package = Package(
             name: "cs-selftest",
             dependencies: [
                 "ConvenientSecurity", "OnePasswordAdapter", "CSecuritySupport",
-                "CSECRootServer",
+                "CSECRootServer", "CSECRemoteApproval",
             ]
         ),
         // End-to-end check: agent + client over a real socket, no entitlements.

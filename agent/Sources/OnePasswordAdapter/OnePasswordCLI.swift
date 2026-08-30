@@ -1,10 +1,13 @@
 import Foundation
 import Security
 import ConvenientSecurity
+import Darwin
 
 /// Locates and runs the 1Password CLI (`op`). Encapsulates all subprocess
 /// handling so `OnePasswordProvider` stays declarative.
 public enum OnePasswordCLI {
+    public static let defaultTimeout: TimeInterval = 120
+
     /// Absolute path to `op`, using common installation locations. Debug builds
     /// accept `OP_CLI_PATH` for isolated tests; a shipping signed agent must not
     /// select security-critical provider code from attacker-controlled process
@@ -119,6 +122,12 @@ public enum OnePasswordCLI {
         public let status: Int32
         public let stdout: Data
         public let stderr: Data
+
+        public init(status: Int32, stdout: Data, stderr: Data) {
+            self.status = status
+            self.stdout = stdout
+            self.stderr = stderr
+        }
     }
 
     /// Do not copy csecd's ambient environment into `op`: even a short-lived
@@ -145,13 +154,16 @@ public enum OnePasswordCLI {
     /// values) — argv is visible to every process on the machine, a pipe is
     /// not.
     public static func run(
-        _ path: String, _ arguments: [String], stdin input: Data? = nil
+        _ path: String,
+        _ arguments: [String],
+        stdin input: Data? = nil,
+        timeout: TimeInterval = defaultTimeout
     ) async throws -> Result {
         try verifyTrusted(path)
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 continuation.resume(with: Swift.Result {
-                    try execute(path, arguments, stdin: input)
+                    try execute(path, arguments, stdin: input, timeout: timeout)
                 })
             }
         }
@@ -161,10 +173,13 @@ public enum OnePasswordCLI {
     /// `csec protect --env` writing to 1Password). Same trust re-check and
     /// sanitized environment; blocks the calling thread until `op` exits.
     public static func runSync(
-        _ path: String, _ arguments: [String], stdin input: Data? = nil
+        _ path: String,
+        _ arguments: [String],
+        stdin input: Data? = nil,
+        timeout: TimeInterval = defaultTimeout
     ) throws -> Result {
         try verifyTrusted(path)
-        return try execute(path, arguments, stdin: input)
+        return try execute(path, arguments, stdin: input, timeout: timeout)
     }
 
     private static func verifyTrusted(_ path: String) throws {
@@ -179,8 +194,14 @@ public enum OnePasswordCLI {
     }
 
     private static func execute(
-        _ path: String, _ arguments: [String], stdin input: Data?
+        _ path: String,
+        _ arguments: [String],
+        stdin input: Data?,
+        timeout: TimeInterval
     ) throws -> Result {
+        guard timeout > 0, timeout.isFinite else {
+            throw OnePasswordCLIError.invalidTimeout
+        }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
@@ -199,7 +220,23 @@ public enum OnePasswordCLI {
             inPipe = nil
         }
 
+        let terminated = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in terminated.signal() }
+
         try process.run()
+
+        let output = CapturedProcessOutput()
+        let readers = DispatchGroup()
+        readers.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            output.setStdout(outPipe.fileHandleForReading.readDataToEndOfFile())
+            readers.leave()
+        }
+        readers.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            output.setStderr(errPipe.fileHandleForReading.readDataToEndOfFile())
+            readers.leave()
+        }
 
         if let input, let inPipe {
             // Feed stdin from another queue while this one drains the outputs,
@@ -214,20 +251,74 @@ public enum OnePasswordCLI {
             }
         }
 
-        // op's output (a secret value, or a short error) is small, so
-        // draining stdout then stderr to EOF cannot fill the pipe buffers.
-        let out = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let err = errPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
+        let timeoutMilliseconds = min(
+            timeout * 1_000,
+            Double(Int.max)
+        )
+        let deadline = DispatchTime.now()
+            + .milliseconds(Int(timeoutMilliseconds.rounded(.up)))
+        if terminated.wait(timeout: deadline) == .timedOut {
+            if process.isRunning {
+                process.terminate()
+            }
+            if terminated.wait(timeout: .now() + .seconds(2)) == .timedOut {
+                if process.isRunning {
+                    _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                }
+                terminated.wait()
+            }
+            readers.wait()
+            throw OnePasswordCLIError.timedOut
+        }
 
-        return Result(status: process.terminationStatus, stdout: out, stderr: err)
+        readers.wait()
+        let captured = output.snapshot()
+
+        return Result(
+            status: process.terminationStatus,
+            stdout: captured.stdout,
+            stderr: captured.stderr
+        )
+    }
+}
+
+private final class CapturedProcessOutput: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stdout = Data()
+    private var stderr = Data()
+
+    func setStdout(_ data: Data) {
+        lock.lock()
+        stdout = data
+        lock.unlock()
+    }
+
+    func setStderr(_ data: Data) {
+        lock.lock()
+        stderr = data
+        lock.unlock()
+    }
+
+    func snapshot() -> (stdout: Data, stderr: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (stdout, stderr)
     }
 }
 
 public enum OnePasswordCLIError: Error, LocalizedError {
     case untrustedExecutable
+    case invalidTimeout
+    case timedOut
 
     public var errorDescription: String? {
-        "the configured 1Password CLI does not satisfy the official signing requirement"
+        switch self {
+        case .untrustedExecutable:
+            return "the configured 1Password CLI does not satisfy the official signing requirement"
+        case .invalidTimeout:
+            return "the configured 1Password CLI timeout is invalid"
+        case .timedOut:
+            return "the 1Password CLI did not respond before the operation deadline"
+        }
     }
 }

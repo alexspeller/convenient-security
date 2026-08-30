@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build, assemble, and sign the resident agent as a Developer-ID-signed, hardened,
-# provisioned .app bundle:
+# Build, assemble, and sign the resident agent as a hardened, provisioned .app
+# bundle. Releases use Developer ID; CloudKit device testing uses Apple
+# Development so the Mac can join the Development database:
 #
 #   ConvenientSecurity.app/
 #     Contents/Info.plist                        (CFBundleExecutable = csecd)
@@ -21,8 +22,8 @@ set -euo pipefail
 # this .app, so `csec install` registers the LaunchAgent via SMAppService.
 #
 # Requires (same values as build-spike.sh):
-#   SIGN_IDENTITY  e.g. "Developer ID Application: Stateful Ltd (8RS6GD89Y7)"
-#   PROFILE_PATH   path to the Developer ID .provisionprofile / .mobileprovision
+#   SIGN_IDENTITY  Developer ID for release, Apple Development for device testing
+#   PROFILE_PATH   matching .provisionprofile / .mobileprovision
 #
 # Usage:
 #   SIGN_IDENTITY="Developer ID Application: Stateful Ltd (8RS6GD89Y7)" \
@@ -34,8 +35,27 @@ root="$(cd "$here/.." && pwd)"                            # repo root
 app="$here/build/ConvenientSecurity.app"
 label="com.alexspeller.convenient-security"
 root_helper="$here/build/csec-rootd"
+agent_entitlements="$here/agent/csecd.entitlements"
 
-: "${SIGN_IDENTITY:?set SIGN_IDENTITY to your Developer ID Application identity}"
+# CloudKit is an explicit release gate because enabling iCloud invalidates the
+# current Developer ID profile. The ordinary build stays usable until the App
+# ID/container association and refreshed profile have been completed.
+if [ "${CSEC_REMOTE_APPROVAL:-0}" = "1" ]; then
+  case "${CSEC_REMOTE_APPROVAL_ENV:-production}" in
+    development)
+      agent_entitlements="$here/agent/csecd.remote-approval.development.entitlements"
+      ;;
+    production)
+      agent_entitlements="$here/agent/csecd.remote-approval.entitlements"
+      ;;
+    *)
+      echo "CSEC_REMOTE_APPROVAL_ENV must be development or production" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+: "${SIGN_IDENTITY:?set SIGN_IDENTITY to a matching Apple code-signing identity}"
 : "${PROFILE_PATH:?set PROFILE_PATH to the fetched .provisionprofile/.mobileprovision}"
 
 echo "--- building release binaries (csec, csecd, csec-rootd) ---"
@@ -70,7 +90,7 @@ codesign --force --options runtime --timestamp \
 
 echo "--- then the bundle: signs csecd (main executable) WITH the keychain entitlements ---"
 codesign --force --options runtime --timestamp \
-  --entitlements "$here/agent/csecd.entitlements" \
+  --entitlements "$agent_entitlements" \
   --sign "$SIGN_IDENTITY" \
   "$app"
 

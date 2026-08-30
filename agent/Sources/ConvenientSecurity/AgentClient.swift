@@ -105,6 +105,47 @@ public struct AgentClient {
         return capabilities
     }
 
+    public func remoteApprovalStatus() throws -> RemoteApprovalConfigurationStatus {
+        try configureRemoteApproval(action: .status).status
+    }
+
+    public func enableRemoteApproval(
+        phonePairingCode: String
+    ) throws -> (status: RemoteApprovalConfigurationStatus, macPairingCode: String) {
+        let result = try configureRemoteApproval(
+            action: .enable,
+            phonePairingCode: phonePairingCode
+        )
+        guard let code = result.macPairingCode,
+              code.hasPrefix("csec-mac-v1:") else {
+            throw ClientError.transportFailed
+        }
+        return (result.status, code)
+    }
+
+    public func disableRemoteApproval() throws -> RemoteApprovalConfigurationStatus {
+        try configureRemoteApproval(action: .disable).status
+    }
+
+    private func configureRemoteApproval(
+        action: RemoteApprovalConfigurationAction,
+        phonePairingCode: String? = nil
+    ) throws -> (
+        status: RemoteApprovalConfigurationStatus,
+        macPairingCode: String?
+    ) {
+        let request = RemoteApprovalConfigurationRequest(
+            action: action,
+            phonePairingCode: phonePairingCode
+        )
+        let response = try send(.configureRemoteApproval(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let status = response.remoteApprovalStatus else {
+            throw ClientError.transportFailed
+        }
+        return (status, response.remoteApprovalMacPairingCode)
+    }
+
     /// Register this launcher's current process incarnation as an explicit
     /// session root. The returned UUID is safe to inherit but is never treated
     /// as authority without a matching daemon record and kernel ancestry.
