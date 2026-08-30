@@ -3327,6 +3327,7 @@ envFileDocumentTests()
 envSelectModelTests()
 secretDestinationSpecTests()
 onePasswordItemWriteTests()
+await cacheInvalidationTests()
 
 if failures == 0 {
     print("\nAll checks passed.")

@@ -253,6 +253,20 @@ public struct AgentClient {
         try Self.check(response: response, requestID: request.requestID)
     }
 
+    /// Tell csecd to drop any cached resolution for `references`, so the next
+    /// resolve re-reads the freshly-rotated value instead of a stale cache hit.
+    /// Cache eviction only: it carries no secret material, discloses no value,
+    /// and raises no Touch ID. Best-effort by design — the value is already
+    /// durably written, so callers must not fail their primary operation if this
+    /// throws (e.g. against an older daemon that lacks the verb, or no running
+    /// agent at all); at worst a running agent serves the previous value until
+    /// its cache entry expires.
+    public func invalidateCachedReferences(_ references: [String]) throws {
+        let request = InvalidateCachedReferencesRequest(references: references)
+        let response = try send(.invalidateCachedReferences(request))
+        try Self.check(response: response, requestID: request.requestID)
+    }
+
     /// Ask csecd to review/resolve a protected-file launch and send the rendered
     /// bytes directly to csec-rootd. A successful response contains only a
     /// boolean; file plaintext is never decoded by this client process.

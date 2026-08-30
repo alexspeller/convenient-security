@@ -281,6 +281,28 @@ public struct CommitNativeStoreBlobsRequest: Codable, Sendable {
     }
 }
 
+/// Drop csecd's cached resolution(s) for the given references so the next
+/// resolve re-reads the freshly-rotated value from its provider instead of a
+/// stale cache hit. Cache eviction only — it carries no secret material,
+/// discloses no value, and needs no Touch ID. Sent by the launcher after
+/// `csec edit` rotates a value or `csec protect --env` overwrites an existing
+/// reference: a 1Password rotation is performed entirely outside csecd (through
+/// the `op` CLI), so the daemon would otherwise keep serving the pre-rotation
+/// value for up to the provider's cache lifetime (24h for op://).
+public struct InvalidateCachedReferencesRequest: Codable, Sendable {
+    public let requestID: String
+    public let references: [String]
+
+    /// A generous ceiling: one edit invalidates a single reference and a whole
+    /// env import only a handful, so a larger list is a malformed request.
+    public static let maximumReferences = 4096
+
+    public init(references: [String], requestID: UUID = UUID()) {
+        self.requestID = requestID.uuidString.lowercased()
+        self.references = references
+    }
+}
+
 /// Requests retain the v1 flat discriminator so an upgraded agent can return a
 /// typed migration error instead of misinterpreting an old access as secure.
 public enum Request: Sendable {
@@ -301,6 +323,7 @@ public enum Request: Sendable {
     case hostAuditPoll(HostAuditPollRequest)
     case hostRemediate(HostRemediationRequest)
     case hostRecordTriage(HostTriageRequest)
+    case invalidateCachedReferences(InvalidateCachedReferencesRequest)
 }
 
 extension Request: Codable {
@@ -443,6 +466,19 @@ extension Request: Codable {
                 cleared: try container.decodeIfPresent([String].self, forKey: .cleared) ?? [],
                 requestUUID: try Self.decodeUUID(container, forKey: .requestID)
             ))
+        case "invalidate_cached_references":
+            let references = try container.decode([String].self, forKey: .references)
+            guard references.count <= InvalidateCachedReferencesRequest.maximumReferences else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .references,
+                    in: container,
+                    debugDescription: "too many references to invalidate"
+                )
+            }
+            self = .invalidateCachedReferences(InvalidateCachedReferencesRequest(
+                references: references,
+                requestID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: container, debugDescription: "unknown request type"
@@ -550,6 +586,11 @@ extension Request: Codable {
             try container.encode(request.exemptions, forKey: .exemptions)
             try container.encode(request.todos, forKey: .todos)
             try container.encode(request.cleared, forKey: .cleared)
+        case let .invalidateCachedReferences(request):
+            try container.encode("invalidate_cached_references", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.references, forKey: .references)
         }
     }
 

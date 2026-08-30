@@ -48,6 +48,55 @@ struct StaticProvider: SecretProvider {
     func isAvailable() async -> Bool { true }
 }
 
+/// A `.cacheable` provider for the post-rotation freshness e2e: its value is
+/// fixed to the rotated ("AFTER") value, so a resolve after cache invalidation
+/// must return it.
+struct RotatingProvider: SecretProvider {
+    let reference: String
+    let value: String
+    var schemes: Set<String> { ["op"] }
+    func resolve(_ ref: SecretRef, unlock: CacheUnlock?) async throws -> ResolvedSecret {
+        guard ref.uri == reference else { throw ProviderError.referenceNotFound(ref.uri) }
+        return ResolvedSecret(value: Data(value.utf8), cacheHint: .cacheable(maxAge: 24 * 3600))
+    }
+    func authenticate() async throws {}
+    func isAvailable() async -> Bool { true }
+}
+
+/// In-memory keychain backend so the e2e can drive a real `KeychainSecretCache`
+/// (warm + cold tiers) without touching the data-protection keychain, and can
+/// assert whether an entry survives an invalidation.
+actor InMemoryKeychain: KeychainBackend {
+    private var items: [String: Data] = [:]
+    func store(account: String, data: Data) async throws { items[account] = data }
+    func load(account: String, unlock: CacheUnlock?) async throws -> Data? { items[account] }
+    func delete(account: String) async { items[account] = nil }
+    func has(_ account: String) -> Bool { items[account] != nil }
+}
+
+/// A minimal server exposing only `.access` and `.invalidateCachedReferences`,
+/// used to drive the cache-invalidation verb over a real socket.
+func startInvalidatingServer(path: String, agent: Agent) -> Bool {
+    let server = SocketServer(path: path, clientTrustPolicy: .allowUnverifiedForTesting) {
+        request, caller in
+        switch request {
+        case let .access(access):
+            return await agent.handle(request: access, caller: caller)
+        case let .invalidateCachedReferences(request):
+            return await agent.invalidateCachedReferences(request: request, caller: caller)
+        default:
+            return .failed(.invalidRequest, message: "synthetic invalidation server")
+        }
+    }
+    Thread.detachNewThread { try? server.run() }
+    var attempts = 0
+    while !FileManager.default.fileExists(atPath: path) && attempts < 100 {
+        usleep(20_000)
+        attempts += 1
+    }
+    return FileManager.default.fileExists(atPath: path)
+}
+
 actor ConsentCounter: ConsentProvider {
     private(set) var count = 0
     private(set) var authenticationCount = 0
@@ -276,6 +325,8 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
             message: "the e2e harness does not persist host triage",
             requestID: request.requestID
         )
+    case let .invalidateCachedReferences(request):
+        return await agent.invalidateCachedReferences(request: request, caller: caller)
     case let .approveProtectedLaunch(approval):
         guard approval.validate(caller: caller) else {
             return .failed(
@@ -2728,6 +2779,42 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
           "csec exec leaves a non-secret URL untouched (got status \(untouched.status), out \"\(untouched.out)\", err \"\(untouched.err)\")")
 } else {
     check(false, "built csec binary is present at \(csecURL.path)")
+}
+
+// Cache invalidation over the socket: a rotation performed outside csecd (an
+// `op` edit) leaves csecd's cached resolution stale; the launcher's invalidate
+// verb must evict it so the next resolve returns the rotated value.
+do {
+    let cacheBackend = InMemoryKeychain()
+    let cache = KeychainSecretCache(backend: cacheBackend)
+    let rotResolver = SecretResolver(cache: cache)
+    let uri = "op://rotate/item/field"
+    await rotResolver.register(RotatingProvider(reference: uri, value: "AFTER"))
+    // Seed the cache with the pre-rotation value, as an earlier resolve would.
+    try await cache.put(uri, value: Data("BEFORE".utf8), maxAge: 24 * 3600)
+    check(await cacheBackend.has(uri), "precondition: the stale value is cached")
+
+    let rotAgent = Agent(
+        resolver: rotResolver,
+        grants: GrantTable(),
+        consent: ConsentCounter(),
+        policyReview: CapturingAutoApprovePolicyReview(capture: AccessReviewCapture()),
+        allowUnverifiedPlansForTesting: true
+    )
+    let rotSocket = NSTemporaryDirectory() + "cs-e2e-invalidate-\(getpid()).sock"
+    check(startInvalidatingServer(path: rotSocket, agent: rotAgent),
+          "cache-invalidation server is listening")
+    let rotClient = AgentClient(path: rotSocket, serverTrustPolicy: .allowUnverifiedForTesting)
+
+    try rotClient.invalidateCachedReferences([uri])
+    check(!(await cacheBackend.has(uri)),
+          "invalidate over the socket evicts the cached entry")
+    let fresh = try await rotResolver.resolve(try SecretRef(uri), unlock: CacheUnlock(LAContext()))
+    check(fresh == Data("AFTER".utf8),
+          "after socket invalidation the resolver serves the rotated value")
+    unlink(rotSocket)
+} catch {
+    check(false, "socket cache invalidation threw: \(error)")
 }
 
 unlink(socketPath)

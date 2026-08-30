@@ -1006,6 +1006,29 @@ public actor Agent {
         return Response(requestID: request.requestID)
     }
 
+    /// Drop any cached resolution for `request.references` so the next resolve
+    /// re-reads the rotated value from its provider rather than serving a stale
+    /// cache hit. Verified-launcher gated like the other mutating verbs; since
+    /// eviction discloses no value it raises no Touch ID. Called by the launcher
+    /// after `csec edit` / `csec protect --env` durably writes a new value —
+    /// notably for op://, whose rotation happens outside csecd entirely. Returns
+    /// a plain success; invalidating an uncached reference is a harmless no-op.
+    public func invalidateCachedReferences(
+        request: InvalidateCachedReferencesRequest,
+        caller: CallerInfo
+    ) async -> Response {
+        guard UUID(uuidString: request.requestID) != nil,
+              isVerifiedLauncher(caller) else {
+            return .failed(
+                .invalidRequest,
+                message: "cache invalidation requires the verified csec launcher",
+                requestID: request.requestID
+            )
+        }
+        await resolver.invalidate(references: request.references)
+        return Response(requestID: request.requestID)
+    }
+
     /// Register the authenticated launcher's current process incarnation. A
     /// descendant can later name the opaque ID, but access succeeds only when
     /// a fresh kernel ancestry walk reaches this exact PID/start-time pair.

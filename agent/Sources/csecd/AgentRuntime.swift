@@ -249,6 +249,8 @@ func startAgentServer() async {
       return await agent.runHostRemediation(request: request, caller: caller)
     case .hostRecordTriage(let request):
       return await agent.recordHostTriage(request: request, caller: caller)
+    case .invalidateCachedReferences(let request):
+      return await agent.invalidateCachedReferences(request: request, caller: caller)
     }
   }
 
