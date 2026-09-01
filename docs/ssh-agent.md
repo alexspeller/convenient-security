@@ -98,11 +98,18 @@ Catalog management stays on csec's authenticated JSON control socket rather
 than the SSH wire protocol:
 
 ```sh
-csec ssh status
+csec status
 csec ssh list
 csec ssh register --label work 'op://Private/SSH key/private key'
 csec ssh remove 'SHA256:...'
 ```
+
+`csec status` reports the installed app, LaunchAgent, authenticated control
+channel, providers, SSH socket/key count, shell selection, remote approval, and
+root helper together. `csec doctor` repairs a missing or stopped
+per-user agent and verifies those live endpoints; `csec doctor --check` is
+read-only. The old `csec ssh status` spelling remains only as a compatibility
+alias to the complete report.
 
 `remove` deletes only the public catalog registration and its live grants. It
 does not delete the referenced value from its backend. `ssh-add` add/remove,

@@ -76,6 +76,7 @@ let package = Package(
             dependencies: [
                 "ConvenientSecurity", "OnePasswordAdapter", "CSecuritySupport",
                 "CSECRootServer", "CSECRemoteApproval",
+                "CSECRemoteApprovalCloudKit",
             ]
         ),
         // End-to-end check: agent + client over a real socket, no entitlements.

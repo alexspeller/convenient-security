@@ -103,12 +103,16 @@ For a complete build and local installation, use the single-command wrapper:
 packaging/bin/build-and-install.sh
 ```
 
-It reuses `packaging/build/convenient-security.mobileprovision` when present,
-fetches it through `provision.sh` when absent, then builds and signs every
+It first authorizes the 1Password CLI through the desktop app, so a locked or
+disconnected session fails before the expensive release build. It then reuses
+`packaging/build/convenient-security.mobileprovision` when present, fetches it
+through `provision.sh` when absent, and builds and signs every
 binary, notarizes the app, builds and notarizes the full package, installs it
 with Apple's `installer`, registers or restarts the per-user LaunchAgent, and
-verifies that the installed payloads match the build and that the root helper
-is reachable. Use `--refresh-profile` to force a profile refresh and `--dry-run`
+verifies that the installed payloads match the build. It then runs `csec doctor`,
+which authenticates the live control channel and root helper and requires the
+protected SSH socket before installation can succeed. Use `--refresh-profile`
+to force a profile refresh and `--dry-run`
 to print the complete plan without changing anything. Run the wrapper as the
 login user: only the package installation is elevated; running the LaunchAgent
 registration under `sudo` would register it for the wrong user.
@@ -226,8 +230,8 @@ LaunchAgent plist:
 #   (if it says "awaiting your approval", approve ConvenientSecurity in
 #    System Settings › General › Login Items)
 
-/Applications/ConvenientSecurity.app/Contents/MacOS/csec status     # check
-/Applications/ConvenientSecurity.app/Contents/MacOS/csec root-status # root helper protocol check
+/Applications/ConvenientSecurity.app/Contents/MacOS/csec status       # complete read-only status
+/Applications/ConvenientSecurity.app/Contents/MacOS/csec doctor       # repair and verify services/sockets
 /Applications/ConvenientSecurity.app/Contents/MacOS/csec uninstall  # unregister
 ```
 
@@ -238,6 +242,12 @@ Copying only the `.app` deliberately leaves `root-status` unavailable and
 cannot enable `exec-file`.
 Until the signed/root matrix passes, exercise `exec-file` with synthetic data
 only.
+
+`csec doctor` is deliberately narrower than reinstalling the package: it can
+register or restart the per-user agent and verify all live endpoints, but it
+does not rewrite shell profiles, touch secret stores, or silently replace a
+missing root-owned app/helper. `csec doctor --check` performs the same diagnosis
+without changing service state.
 
 Once the agent is running, create a native encrypted store with:
 
@@ -330,10 +340,10 @@ the bundle context.
 | Symptom | Cause / fix |
 |---------|-------------|
 | `csecd` dies instantly at launch, no output, `launchctl` shows exit `-9` | AMFI SIGKILL: an entitled binary that isn't the bundle's main executable, or a missing/invalid profile, or the missing **G2 intermediate**. Ensure `CFBundleExecutable = csecd` and the profile authorizes the access group (`security cms -D -i …/embedded.provisionprofile`). |
-| `csec status` says *not installed* / `.notFound` | Normal **before the first** `csec install`. Otherwise: `csec` isn't being run from inside the installed `.app`. |
+| `csec status` reports the LaunchAgent but the agent is unavailable | A registered job may be stopped or crash-looping; run `csec doctor`. Installation succeeds only after doctor authenticates the live control, SSH, and root-helper endpoints. |
 | `csec root-status` says the helper is unavailable | The `.app` was copied without installing the `.pkg`, the system job failed, or the live server does not satisfy the exact root-helper identity. Check `launchctl print system/com.alexspeller.convenient-security.rootd`, the root-owned helper/plist paths, and the Installer log; do not bypass the identity check. |
 | `csec edit` says the native store is unavailable | The daemon could not use its provisioned Keychain group. Check the embedded profile, signed entitlements, startup log, and the native-store `build-spike` gate. An unsigned SwiftPM daemon intentionally has no native provider. |
-| Agent runs but `op` fetches fail | Install the official signed CLI at `/opt/homebrew/bin/op`, `/usr/local/bin/op`, or `/usr/bin/op`; arbitrary provider paths are intentionally rejected in release builds. |
+| Agent runs but `op` fetches fail | Install the official signed CLI at `/opt/homebrew/bin/op`, `/usr/local/bin/op`, or `/usr/bin/op`; unlock 1Password, enable **Developer > Integrate with 1Password CLI**, and run `op signin`; arbitrary provider paths are intentionally rejected in release builds. |
 | `codesign` shows `0 valid identities` for a cert that's installed | Missing **G2 intermediate CA** — see prerequisites. |
 | Notarization rejected | Check for `get-task-allow` / missing hardened runtime / missing timestamp — the scripts set `--options runtime --timestamp`; don't strip them. |
 | Inspect the running agent | `launchctl print gui/$(id -u)/com.alexspeller.convenient-security`; tail `…/convenient-security-<uid>/csecd.log`. |

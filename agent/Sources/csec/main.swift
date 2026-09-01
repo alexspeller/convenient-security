@@ -97,10 +97,12 @@ func usage() -> Never {
                  [--replace-secret] [--no-audit-prompt]
       csec audit [--report-only] [--json] [--attest] [--scan-filesystem]
       csec remote status | enable <phone-pairing-code> | disable
-      csec ssh socket | env | status | list
+      csec ssh socket | env | list
       csec ssh register [--label <label>] <reference|sidecar.csec>
       csec ssh remove <SHA256:fingerprint>
-      csec install | uninstall | status
+      csec install | uninstall
+      csec status
+      csec doctor [--check]
       csec root-status
 
     get        Fetch a secret from csecd and write it to the selected stdout shape:
@@ -200,7 +202,10 @@ func usage() -> Never {
                host-key + remote-user + process-subtree grants.
     install    Register csecd as a login-item LaunchAgent so it runs in the background.
     uninstall  Unregister the csecd LaunchAgent.
-    status     Show whether the csecd LaunchAgent is registered/enabled.
+    status     Show app, LaunchAgent, authenticated agent/provider, SSH, shell,
+               remote-approval, and root-helper status together.
+    doctor     Diagnose and repair the installed app's per-user agent, stale
+               sockets, and service health. --check performs no repairs.
     root-status  Verify that the authenticated regular-file root helper is reachable.
 
     """.utf8))
@@ -250,6 +255,8 @@ case "uninstall":
     runUninstall()
 case "status":
     runStatus()
+case "doctor":
+    runDoctor(Array(arguments.dropFirst()))
 case "root-status":
     guard arguments.count == 1 else { usage() }
     runRootStatus()
@@ -1150,11 +1157,6 @@ func runUninstall() -> Never {
         FileHandle.standardError.write(Data("csec uninstall: \(error)\n".utf8))
         exit(1)
     }
-}
-
-func runStatus() -> Never {
-    print("csec: LaunchAgent \(LaunchAgentService.status().description)")
-    exit(0)
 }
 
 func runRootStatus() -> Never {

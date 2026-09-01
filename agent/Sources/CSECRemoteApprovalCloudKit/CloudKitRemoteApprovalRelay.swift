@@ -22,6 +22,28 @@ public actor CloudKitRemoteApprovalRelay: RemoteApprovalRelay {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
+    /// `CKContainer(identifier:)` terminates the process when the signed binary
+    /// does not carry the named iCloud-container entitlement. Callers must gate
+    /// construction from their verified signing information; an unavailable
+    /// optional transport must never crash the resident credential agent.
+    public static func isEntitled(
+        containerIdentifiers: [String],
+        containerIdentifier: String = defaultContainerIdentifier
+    ) -> Bool {
+        containerIdentifiers.contains(containerIdentifier)
+    }
+
+    public static func makeIfEntitled(
+        containerIdentifiers: [String],
+        containerIdentifier: String = defaultContainerIdentifier
+    ) -> CloudKitRemoteApprovalRelay? {
+        guard isEntitled(
+            containerIdentifiers: containerIdentifiers,
+            containerIdentifier: containerIdentifier
+        ) else { return nil }
+        return CloudKitRemoteApprovalRelay(containerIdentifier: containerIdentifier)
+    }
+
     public init(
         containerIdentifier: String = CloudKitRemoteApprovalRelay.defaultContainerIdentifier
     ) {

@@ -17,7 +17,6 @@ installed_app="/Applications/ConvenientSecurity.app"
 installed_csec="$installed_app/Contents/MacOS/csec"
 installed_bridge="/Library/Application Support/ConvenientSecurity/bin/csec"
 root_label="com.alexspeller.convenient-security.rootd"
-agent_label="com.alexspeller.convenient-security"
 installed_root_helper="/Library/PrivilegedHelperTools/$root_label"
 
 dry_run=0
@@ -28,13 +27,14 @@ usage() {
 usage: packaging/bin/build-and-install.sh [--refresh-profile] [--dry-run]
 
 Build and install the complete signed Convenient Security stack in one command:
-  1. fetch a provisioning profile when missing (or when explicitly refreshed)
-  2. build and sign the app, CLI, resident agent, and root helper
-  3. notarize and staple the app
-  4. build, sign, notarize, and staple the full installer package
-  5. install the package with sudo
-  6. register or restart the per-user LaunchAgent without sudo
-  7. verify installed payload bytes, registration, and root-helper reachability
+  1. authorize 1Password CLI before starting the expensive build
+  2. fetch a provisioning profile when missing (or when explicitly refreshed)
+  3. build and sign the app, CLI, resident agent, and root helper
+  4. notarize and staple the app
+  5. build, sign, notarize, and staple the full installer package
+  6. install the package with sudo
+  7. register or restart the per-user LaunchAgent without sudo
+  8. run csec doctor and require authenticated control, SSH, and root health
 
 Options:
   --refresh-profile  Fetch a fresh Developer ID profile before building.
@@ -133,6 +133,11 @@ for required_script in \
   [ -x "$required_script" ] || die "required script is not executable: $required_script"
 done
 
+# Authenticate before a release build can spend minutes compiling and signing.
+# `op signin` is idempotent, reads no item fields, and keeps its authorization in
+# the 1Password desktop integration rather than printing a session token.
+run "$here/bin/notarize.sh" --check-auth
+
 if [ "$refresh_profile" -eq 1 ]; then
   run "$here/bin/provision.sh"
   PROFILE_PATH="$default_profile"
@@ -168,11 +173,8 @@ if [ "$dry_run" -eq 1 ]; then
   print_command /usr/bin/cmp -s "$app/Contents/MacOS/csecd" "$installed_app/Contents/MacOS/csecd"
   print_command /usr/bin/cmp -s "$app/Contents/MacOS/csec" "$installed_bridge"
   print_command /usr/bin/cmp -s "$root_helper" "$installed_root_helper"
+  print_command "$installed_csec" doctor
   print_command "$installed_csec" status
-  echo "+ $installed_csec install  # only when the LaunchAgent is not registered"
-  echo "+ /bin/launchctl kickstart -k gui/$(id -u)/$agent_label  # when enabled"
-  print_command "$installed_csec" status
-  print_command "$installed_csec" root-status
   echo "Dry run complete; no build, signing, network, installation, or service changes were made."
   exit 0
 fi
@@ -182,44 +184,12 @@ verify_same_file "$app/Contents/MacOS/csecd" "$installed_app/Contents/MacOS/csec
 verify_same_file "$app/Contents/MacOS/csec" "$installed_bridge"
 verify_same_file "$root_helper" "$installed_root_helper"
 
-# SMAppService.register() reports an error for an already-registered service.
-# Preserve its approval state on upgrades, registering only when necessary, and
-# restart an enabled job so it immediately executes the newly installed bytes.
-agent_status="$("$installed_csec" status)"
-printf '%s\n' "$agent_status"
-case "$agent_status" in
-  *"enabled — starts at login"*)
-    ;;
-  *"registered, awaiting your approval"*)
-    ;;
-  *)
-    run "$installed_csec" install
-    ;;
-esac
-
-agent_status="$("$installed_csec" status)"
-printf '%s\n' "$agent_status"
-if [[ "$agent_status" == *"enabled — starts at login"* ]]; then
-  run /bin/launchctl kickstart -k "gui/$(id -u)/$agent_label"
-  /bin/launchctl print "gui/$(id -u)/$agent_label" >/dev/null
-elif [[ "$agent_status" == *"registered, awaiting your approval"* ]]; then
-  echo "Convenient Security is installed but needs approval in System Settings > General > Login Items."
-else
-  die "LaunchAgent did not reach a registered state"
-fi
-
-root_ready=0
-root_status=""
-attempts=0
-while [ "$attempts" -lt 10 ]; do
-  attempts=$((attempts + 1))
-  if root_status="$("$installed_csec" root-status 2>&1)"; then
-    printf '%s\n' "$root_status"
-    root_ready=1
-    break
-  fi
-  /bin/sleep 0.25
-done
-[ "$root_ready" -eq 1 ] || die "${root_status:-authenticated root helper did not become reachable}"
+# Registration alone is not installation success: launchd can retain a submitted
+# job that exits immediately, while stale socket pathnames make the filesystem
+# look superficially installed. Doctor registers/restarts as needed and succeeds
+# only after authenticating the agent and root-helper protocols and observing the
+# protected SSH socket.
+run "$installed_csec" doctor
+run "$installed_csec" status
 
 echo "Build and installation complete: $installed_app"

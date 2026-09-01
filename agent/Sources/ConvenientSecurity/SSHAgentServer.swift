@@ -9,7 +9,15 @@ public enum SSHAgentSocket {
     public static let maximumFrameBytes = 256 * 1_024
 
     public static func defaultPath() -> String {
-        (AgentSocket.directory() as NSString).appendingPathComponent("ssh-agent.sock")
+        #if DEBUG
+        // Isolated integration tests need a socket that cannot collide with a
+        // developer's installed agent. Release builds compile out this lookup.
+        if let override = ProcessInfo.processInfo.environment["CSEC_SSH_SOCKET"],
+           !override.isEmpty {
+            return override
+        }
+        #endif
+        return (AgentSocket.directory() as NSString).appendingPathComponent("ssh-agent.sock")
     }
 }
 

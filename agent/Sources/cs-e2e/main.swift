@@ -183,9 +183,11 @@ actor RequestCapture {
 }
 
 let socketPath = NSTemporaryDirectory() + "cs-e2e-\(getpid()).sock"
+let sshSocketPath = NSTemporaryDirectory() + "cs-e2e-ssh-\(getpid()).sock"
 let rootFixtureDirectory = NSTemporaryDirectory() + "cs-root-e2e-\(getpid())"
 let rootSocketPath = rootFixtureDirectory + "/rootd.sock"
 setenv("CSEC_ROOT_SOCKET", rootSocketPath, 1)
+setenv("CSEC_SSH_SOCKET", sshSocketPath, 1)
 
 let resolver = SecretResolver(cache: NullSecretCache())
 let resolutionCounter = ResolutionCounter()
@@ -362,14 +364,22 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
     }
 }
 Thread.detachNewThread { try? server.run() }
+let sshServer = SSHAgentServer(
+    path: sshSocketPath,
+    trustPolicy: .allowUnverifiedForTesting,
+    provider: sshSigningService
+)
+Thread.detachNewThread { try? sshServer.run() }
 
-// Wait (up to ~2s) for the socket to appear.
+// Wait (up to ~2s) for both protocol sockets to appear.
 var waited = 0
-while !FileManager.default.fileExists(atPath: socketPath) && waited < 100 {
+while (!FileManager.default.fileExists(atPath: socketPath)
+       || !FileManager.default.fileExists(atPath: sshSocketPath)) && waited < 100 {
     usleep(20_000)
     waited += 1
 }
 check(FileManager.default.fileExists(atPath: socketPath), "agent socket is listening")
+check(FileManager.default.fileExists(atPath: sshSocketPath), "SSH agent socket is listening")
 
 func startAccessOnlyServer(path: String, agent: Agent) -> Bool {
     let server = SocketServer(path: path, clientTrustPolicy: .allowUnverifiedForTesting) {
@@ -1039,6 +1049,34 @@ while !FileManager.default.fileExists(atPath: rootSocketPath) && rootWaited < 10
     rootWaited += 1
 }
 check(FileManager.default.fileExists(atPath: rootSocketPath), "synthetic root-helper socket is listening")
+
+let completeStatus = runCsec(
+    ["status"], extraEnv: ["SSH_AUTH_SOCK": sshSocketPath]
+)
+check(completeStatus.status == 0
+      && completeStatus.out.contains("Agent control channel: reachable and authenticated")
+      && completeStatus.out.contains("Providers: csec, op")
+      && completeStatus.out.contains("SSH agent: ready")
+      && completeStatus.out.contains("Protected SSH keys: 0")
+      && completeStatus.out.contains("Root helper: reachable and authenticated"),
+      "csec status consolidates authenticated agent, provider, SSH, and root health")
+
+let doctorCheck = runCsec(
+    ["doctor", "--check"], extraEnv: ["SSH_AUTH_SOCK": sshSocketPath]
+)
+check(doctorCheck.status == 0
+      && doctorCheck.out.contains("csec doctor: checking the complete installation")
+      && doctorCheck.out.contains("SSH agent: ready"),
+      "csec doctor --check performs a healthy read-only diagnosis")
+
+let legacySSHStatus = runCsec(
+    ["ssh", "status"], extraEnv: ["SSH_AUTH_SOCK": sshSocketPath]
+)
+check(legacySSHStatus.status == 0
+      && legacySSHStatus.err.contains("status is consolidated under `csec status`")
+      && legacySSHStatus.out.contains("Convenient Security status"),
+      "csec ssh status redirects users to the complete status report")
+
 let fakeGHURL = URL(fileURLWithPath: rootFixtureDirectory).appendingPathComponent("gh")
 try? FileManager.default.removeItem(at: fakeGHURL)
 do {
@@ -2896,6 +2934,7 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
 }
 
 unlink(socketPath)
+unlink(sshSocketPath)
 if fakeRoot.isRunning {
     fakeRoot.terminate()
     fakeRoot.waitUntilExit()

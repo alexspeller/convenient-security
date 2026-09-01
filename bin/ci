@@ -25,12 +25,13 @@ bash -n \
 install_plan="$("$repo_root/packaging/bin/build-and-install.sh" --dry-run --refresh-profile)"
 for expected_step in \
   "packaging/bin/provision.sh" \
+  "packaging/bin/notarize.sh --check-auth" \
   "packaging/bin/build-agent.sh" \
   "packaging/bin/notarize.sh" \
   "packaging/bin/build-pkg.sh" \
   "/usr/bin/sudo /usr/sbin/installer" \
-  "/Applications/ConvenientSecurity.app/Contents/MacOS/csec install" \
-  "/Applications/ConvenientSecurity.app/Contents/MacOS/csec root-status"; do
+  "/Applications/ConvenientSecurity.app/Contents/MacOS/csec doctor" \
+  "/Applications/ConvenientSecurity.app/Contents/MacOS/csec status"; do
   if [[ "$install_plan" != *"$expected_step"* ]]; then
     echo "build-and-install dry run omitted: $expected_step" >&2
     exit 1
@@ -38,6 +39,15 @@ for expected_step in \
 done
 if [[ "$install_plan" == *"sudo /Applications/ConvenientSecurity.app/Contents/MacOS/csec install"* ]]; then
   echo "build-and-install must not register the per-user agent with sudo" >&2
+  exit 1
+fi
+
+# The ordinary signed app intentionally has no CloudKit entitlement. Constructing
+# CKContainer in that build is a process-terminating programmer error on macOS,
+# not a throwable availability failure, so startup must use the entitlement gate.
+if ! rg -F -q 'CloudKitRemoteApprovalRelay.makeIfEntitled(' \
+  "$repo_root/agent/Sources/csecd/AgentRuntime.swift"; then
+  echo "csecd must gate optional CloudKit relay construction from signed entitlements" >&2
   exit 1
 fi
 postinstall_requirement_checks="$(

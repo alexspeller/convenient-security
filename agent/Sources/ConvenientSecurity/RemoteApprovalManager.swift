@@ -229,6 +229,7 @@ public actor RemoteApprovalManager: RemoteAccessPolicyReviewProvider {
     private let relay: any RemoteApprovalRelay
     private let consent: any ConsentProvider
     private let cloudKitContainerIdentifier: String
+    private let relayIsConfigured: Bool
     private let relayIsAvailable: @Sendable () async -> Bool
 
     private var configuration: StoredRemoteApprovalConfiguration?
@@ -240,16 +241,24 @@ public actor RemoteApprovalManager: RemoteAccessPolicyReviewProvider {
         relay: any RemoteApprovalRelay,
         consent: any ConsentProvider,
         cloudKitContainerIdentifier: String,
+        relayIsConfigured: Bool = true,
         relayIsAvailable: @escaping @Sendable () async -> Bool = { true }
     ) {
         self.store = store
         self.relay = relay
         self.consent = consent
         self.cloudKitContainerIdentifier = cloudKitContainerIdentifier
+        self.relayIsConfigured = relayIsConfigured
         self.relayIsAvailable = relayIsAvailable
     }
 
     public func prepare() async {
+        guard relayIsConfigured else {
+            configuration = nil
+            requester = nil
+            loadFailed = true
+            return
+        }
         do {
             guard let stored = try await store.load() else {
                 configuration = nil
@@ -283,7 +292,7 @@ public actor RemoteApprovalManager: RemoteAccessPolicyReviewProvider {
     /// public pairing code for biometric-gated import by the phone app.
     public func enable(phonePairingCode: String) async throws -> String {
         let phone = try RemoteApprovalPairingCode.decodePhone(phonePairingCode)
-        guard await relayIsAvailable() else {
+        guard relayIsConfigured, await relayIsAvailable() else {
             throw RemoteApprovalManagerError.relayUnavailable
         }
         let safeName = ReviewDisplay.sanitized(phone.phoneDeviceName)
@@ -371,6 +380,33 @@ public actor RemoteApprovalManager: RemoteAccessPolicyReviewProvider {
             relay: relay
         )
     }
+}
+
+/// Safe stand-in for a build without CloudKit entitlements. The protocol stays
+/// present so local policy review and opt-out recovery retain one code path, but
+/// every attempted transport operation is explicitly unavailable.
+public actor UnavailableRemoteApprovalRelay: RemoteApprovalRelay {
+    public init() {}
+
+    public func publishRequest(_ request: SignedRemoteApprovalRequest) async throws {
+        throw RemoteApprovalManagerError.relayUnavailable
+    }
+
+    public func response(
+        for requestID: String
+    ) async throws -> SignedRemoteApprovalResponse? {
+        throw RemoteApprovalManagerError.relayUnavailable
+    }
+
+    public func pendingRequests() async throws -> [SignedRemoteApprovalRequest] {
+        throw RemoteApprovalManagerError.relayUnavailable
+    }
+
+    public func publishResponse(_ response: SignedRemoteApprovalResponse) async throws {
+        throw RemoteApprovalManagerError.relayUnavailable
+    }
+
+    public func deleteExchange(requestID: String) async {}
 }
 
 public enum RemoteApprovalManagerError: Error, Equatable, Sendable {

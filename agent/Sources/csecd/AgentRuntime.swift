@@ -145,17 +145,30 @@ func startAgentServer() async {
   }
   let grants = GrantTable()
   let consent: ConsentProvider = BiometricConsent()
-  let remoteRelay = CloudKitRemoteApprovalRelay()
-  let remoteApproval = RemoteApprovalManager(
-    store: SecurityRemoteApprovalConfigurationStore(),
-    relay: remoteRelay,
-    consent: consent,
-    cloudKitContainerIdentifier: CloudKitRemoteApprovalRelay.defaultContainerIdentifier,
-    relayIsAvailable: {
-      guard let status = try? await remoteRelay.accountStatus() else { return false }
-      return status == .available
-    }
-  )
+  let remoteApproval: RemoteApprovalManager
+  if let remoteRelay = CloudKitRemoteApprovalRelay.makeIfEntitled(
+    containerIdentifiers: startupReport.cloudKitContainerIdentifiers
+  ) {
+    remoteApproval = RemoteApprovalManager(
+      store: SecurityRemoteApprovalConfigurationStore(),
+      relay: remoteRelay,
+      consent: consent,
+      cloudKitContainerIdentifier: CloudKitRemoteApprovalRelay.defaultContainerIdentifier,
+      relayIsAvailable: {
+        guard let status = try? await remoteRelay.accountStatus() else { return false }
+        return status == .available
+      }
+    )
+  } else {
+    remoteApproval = RemoteApprovalManager(
+      store: SecurityRemoteApprovalConfigurationStore(),
+      relay: UnavailableRemoteApprovalRelay(),
+      consent: consent,
+      cloudKitContainerIdentifier: CloudKitRemoteApprovalRelay.defaultContainerIdentifier,
+      relayIsConfigured: false,
+      relayIsAvailable: { false }
+    )
+  }
   await remoteApproval.prepare()
   let policyReview: PolicyReviewProvider = MirroredPolicyReview(
     local: TrustedPolicyReview(),

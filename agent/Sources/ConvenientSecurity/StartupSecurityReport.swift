@@ -18,6 +18,7 @@ public struct StartupSecurityReport: Sendable {
     public let dangerousEntitlements: [String]
     public let applicationIdentifierPresent: Bool
     public let keychainAccessGroupPresent: Bool
+    public let cloudKitContainerIdentifiers: [String]
     public let sipStatus: SIPStatus
 
     public var productionReady: Bool {
@@ -75,6 +76,15 @@ public struct StartupSecurityReport: Sendable {
         let applicationIdentifierPresent = entitlements["com.apple.application-identifier"] as? String
             == expectedApplicationID
         let groups = entitlements["keychain-access-groups"] as? [String] ?? []
+        let productionCloudKit = entitlements[
+            "com.apple.developer.icloud-container-identifiers"
+        ] as? [String] ?? []
+        let developmentCloudKit = entitlements[
+            "com.apple.developer.icloud-container-development-container-identifiers"
+        ] as? [String] ?? []
+        let cloudKitContainers = Array(
+            Set(productionCloudKit + developmentCloudKit)
+        ).sorted()
 
         return StartupSecurityReport(
             executablePath: executablePath,
@@ -86,8 +96,13 @@ public struct StartupSecurityReport: Sendable {
             dangerousEntitlements: dangerous,
             applicationIdentifierPresent: applicationIdentifierPresent,
             keychainAccessGroupPresent: groups.contains(expectedApplicationID),
+            cloudKitContainerIdentifiers: cloudKitContainers,
             sipStatus: querySIP()
         )
+    }
+
+    public func authorizesCloudKitContainer(_ identifier: String) -> Bool {
+        cloudKitContainerIdentifiers.contains(identifier)
     }
 
     public func logLines(
@@ -101,6 +116,7 @@ public struct StartupSecurityReport: Sendable {
             "csecd security: code=\(signatureValid && productRequirementMatches ? "verified product" : "UNVERIFIED") identifier=\(identifier ?? "none") team=\(teamIdentifier ?? "none")",
             "csecd security: hardened-runtime=\(hardenedRuntime ? "on" : "OFF") dangerous-entitlements=\(dangerousEntitlements.isEmpty ? "none" : dangerousEntitlements.joined(separator: ","))",
             "csecd security: application-identifier=\(applicationIdentifierPresent ? "ok" : "MISSING") keychain-group=\(keychainAccessGroupPresent ? "ok" : "MISSING")",
+            "csecd security: remote-approval-cloudkit=\(cloudKitContainerIdentifiers.isEmpty ? "off" : "entitled")",
             "csecd security: SIP=\(sipStatus.rawValue) socket=\(socketPath)",
             "csecd security: cache=\(cacheEnabled ? "secure-enclave-keychain" : "memory-only") consent=touch-id",
             "csecd security: 1password-provider=\(providerPath ?? "missing") provider-code=\(providerTrusted ? "verified" : "UNVERIFIED")",
@@ -134,6 +150,7 @@ public struct StartupSecurityReport: Sendable {
             dangerousEntitlements: [],
             applicationIdentifierPresent: false,
             keychainAccessGroupPresent: false,
+            cloudKitContainerIdentifiers: [],
             sipStatus: sipStatus
         )
     }

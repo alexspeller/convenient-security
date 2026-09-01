@@ -1,5 +1,6 @@
 import CryptoKit
 import CSECRemoteApproval
+import CSECRemoteApprovalCloudKit
 import ConvenientSecurity
 import Foundation
 
@@ -192,6 +193,14 @@ private func localReviewFixture(reference: String = "op://Development/Database/p
 }
 
 func remoteApprovalTests() async {
+    check(!CloudKitRemoteApprovalRelay.isEntitled(containerIdentifiers: []),
+          "a build without CloudKit entitlements does not authorize relay construction")
+    check(CloudKitRemoteApprovalRelay.isEntitled(containerIdentifiers: [
+        CloudKitRemoteApprovalRelay.defaultContainerIdentifier
+    ]), "the exact signed CloudKit container authorizes the optional relay")
+    check(CloudKitRemoteApprovalRelay.makeIfEntitled(containerIdentifiers: []) == nil,
+          "an ordinary build never calls CKContainer without its entitlement")
+
     print("\n# Remote approval (signed, expiring, transaction-bound; synthetic keys only)")
 
     let macKey = P256.Signing.PrivateKey()

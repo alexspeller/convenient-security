@@ -99,21 +99,10 @@ func runSSH(_ arguments: [String]) -> Never {
         }
     case "status":
         guard arguments.count == 1 else { usage() }
-        var info = stat()
-        let path = SSHAgentSocket.defaultPath()
-        let listening = path.withCString { lstat($0, &info) } == 0
-            && (info.st_mode & S_IFMT) == S_IFSOCK
-        do {
-            let count = try makeAgentClient().listSSHKeys().count
-            FileHandle.standardOutput.write(Data(
-                "SSH agent: \(listening ? "socket ready" : "socket unavailable") at \(path)\n"
-                    .utf8
-            ))
-            FileHandle.standardOutput.write(Data("Registered keys: \(count)\n".utf8))
-            exit(listening ? 0 : 1)
-        } catch {
-            sshFail(error.localizedDescription)
-        }
+        FileHandle.standardError.write(Data(
+            "csec ssh status: status is consolidated under `csec status`\n".utf8
+        ))
+        runStatus()
     default:
         usage()
     }

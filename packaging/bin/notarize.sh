@@ -14,6 +14,7 @@ set -euo pipefail
 #   OP_ASC_ITEM  op:// item base with fields key_id / issuer_id / key
 #
 # Usage:
+#   packaging/bin/notarize.sh --check-auth
 #   packaging/bin/notarize.sh packaging/build/ConvenientSecurity.app
 #   packaging/bin/notarize.sh packaging/build/ConvenientSecurity.pkg
 
@@ -75,10 +76,22 @@ stage_notary_key_from_command() {
 }
 
 main() {
-  local here target op_path key_id issuer_id
+  local here target auth_only op_path key_id issuer_id
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  target="${1:?usage: notarize.sh <App.app | installer.pkg>}"
-  [ -e "$target" ] || { echo "notarize: no such target: $target" >&2; exit 1; }
+  target="${1:-}"
+  auth_only=0
+  case "$target" in
+    --check-auth)
+      auth_only=1
+      ;;
+    "")
+      echo "usage: notarize.sh [--check-auth | <App.app | installer.pkg>]" >&2
+      exit 2
+      ;;
+    *)
+      [ -e "$target" ] || { echo "notarize: no such target: $target" >&2; exit 1; }
+      ;;
+  esac
   # shellcheck disable=SC1091
   [ -f "$here/.env" ] && source "$here/.env"
   : "${OP_ACCOUNT:?set OP_ACCOUNT in packaging/.env}"
@@ -101,6 +114,15 @@ main() {
       PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
       "$op_path" "$@"
   }
+
+  if ! run_op signin --account "$OP_ACCOUNT"; then
+    echo "notarize: 1Password CLI authorization failed; unlock 1Password, enable Developer > Integrate with 1Password CLI, and retry" >&2
+    exit 1
+  fi
+  if [ "$auth_only" -eq 1 ]; then
+    echo "notarize: 1Password CLI authorization ready"
+    return 0
+  fi
 
   notary_key_directory=""
   notary_key_file=""

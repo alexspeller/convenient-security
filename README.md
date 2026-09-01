@@ -379,8 +379,9 @@ always disclose what it reads.
 The GitHub mode creates only a protected `GH_CONFIG_DIR/hosts.yml`, refuses
 ambient GitHub token variables or existing config/keyring authority before
 resolution, and is restricted to a direct `gh` executable outside its
-authentication and extension-management commands. Run `csec root-status` to
-verify that the authenticated helper endpoint is reachable.
+authentication and extension-management commands. Run `csec status` for the
+complete app/agent/provider/SSH/root report, or `csec doctor` to repair and
+verify the installed services.
 
 The source and synthetic compatibility matrix are implemented. Do not use this
 path for real credentials until the signed, installed root-helper matrix in
