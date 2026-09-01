@@ -235,6 +235,10 @@ exec 9<&-
 swift build --package-path "$repo_root/agent"
 "$repo_root/agent/.build/debug/cs-selftest"
 "$repo_root/agent/.build/debug/cs-e2e"
+for host_mode in ed25519-certificate ed25519 ecdsa rsa rsa-sha1; do
+  CSEC_SSH_E2E_HOST_MODE="$host_mode" \
+    "$repo_root/agent/.build/debug/cs-ssh-e2e"
+done
 
 # Compile the shipping branches and prove environment-only test controls are
 # absent there. The release self-test does not contact a real agent or vault.

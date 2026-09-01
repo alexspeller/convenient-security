@@ -153,9 +153,13 @@ Before policy review or provider resolution, the server requires and verifies
 OpenSSH's `session-bind@openssh.com` message. It checks the server host-key
 signature over the SSH session identifier, rejects forwarding, and accepts only
 an exact SSH user-authentication signing packet whose session, key, algorithm,
-service, method, username, and host-bound key are consistent. Unknown agent
-messages and all SSH-wire catalog mutations fail closed. Agent frames are capped
-at 256 KiB, and `csecd` disables core dumps before starting either socket.
+service, method, username, and host-bound key are consistent. For an OpenSSH host
+certificate, csec validates its bounded canonical structure and CA signature,
+verifies the session with the embedded host key, and retains the exact
+certificate blob for the host-bound packet. The review fingerprint is the
+underlying host-key fingerprint, matching OpenSSH's agent behavior. Unknown
+agent messages and all SSH-wire catalog mutations fail closed. Agent frames are
+capped at 256 KiB, and `csecd` disables core dumps before starting either socket.
 
 After approval, the signing service resolves the canonical reference through
 `SecretResolver`, reparses the private key, verifies that its public blob still
@@ -171,15 +175,34 @@ The first release accepts one unencrypted private key in any of these encodings:
 - PKCS#8 RSA, EC, or Ed25519.
 
 Supported identities are Ed25519, ECDSA P-256/P-384/P-521, and RSA keys of at
-least 2048 bits. RSA signatures require RSA-SHA2-256 or RSA-SHA2-512; SHA-1
-`ssh-rsa` signatures are refused.
+least 2048 bits. Protected RSA identity signatures require RSA-SHA2-256 or
+RSA-SHA2-512; csec never produces SHA-1 `ssh-rsa` signatures. For destination
+binding only, csec can verify an `ssh-rsa` host signature when Apple SSH has
+already negotiated and accepted it. This compatibility path does not enable the
+algorithm or use it to sign with a protected key; it preserves destination
+binding for hosts that still require a legacy RSA host signature.
 
-Encrypted private-key documents, DSA, Ed448, FIDO/SK keys, certificates,
-multi-key OpenSSH files, unknown signature flags, forwarded agent use, and host
-certificates are not supported. The catalog is capped at 64 identities. These
-limits fail closed rather than silently falling back to ordinary signing.
+Encrypted private-key documents, DSA, Ed448, FIDO/SK identity keys, identity
+certificates, multi-key OpenSSH files, unknown signature flags, forwarded agent
+use, and FIDO/SK host keys are not supported. Host certificates whose embedded
+host and CA keys use the supported Ed25519, ECDSA, or RSA algorithms are
+supported. The catalog is capped at 64 identities. These limits fail closed
+rather than silently falling back to ordinary signing.
 
-The automated suite uses generated synthetic keys and a synthetic SSH-agent
-connection. A signed/notarized physical-Mac run against a real local or remote
-`sshd` remains a release gate; debug-build success is not evidence that the
-shipping code-identity and Keychain boundaries are provisioned correctly.
+The automated suite uses generated synthetic keys at two levels. The focused
+checks exercise malformed and adversarial SSH-agent frames directly. The
+`cs-ssh-e2e` check removes a generated RSA private-key file, then authenticates
+Apple’s real `/usr/bin/ssh` through the csec socket to an isolated, unprivileged
+localhost `sshd`. The gate runs with plain Ed25519, ECDSA P-256, RSA-SHA2, and a
+legacy RSA/SHA-1 host signature, plus a synthetic Ed25519 host certificate. This
+is the release gate for OpenSSH framing, plain and certificate session binding,
+RSA flags, and signature interoperability without touching a developer key or
+an external host.
+
+A signed/notarized physical-Mac run remains the release gate for the shipping
+code-identity, Touch ID, Keychain, and provider boundaries. If OpenSSH reports
+only `agent refused operation`, csecd records a value-free line in `csecd.log`
+with the request type and stable reason code. A refused session binding also
+records only fixed algorithm-family categories and boolean forwarding/binding
+state; it never echoes an untrusted wire algorithm, key bytes, signed data,
+usernames, hosts, or provider values.

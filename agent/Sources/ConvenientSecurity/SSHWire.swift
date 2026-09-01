@@ -19,6 +19,27 @@ public enum SSHProtectionError: Error, Sendable, Equatable {
 }
 
 extension SSHProtectionError: LocalizedError {
+    /// Stable, value-free reason recorded when the binary SSH-agent protocol can
+    /// return only its generic failure byte. Never include key, host, username,
+    /// reference, or request bytes in this diagnostic.
+    public var diagnosticCode: String {
+        switch self {
+        case .malformedMessage: return "malformed_message"
+        case .unsupportedKeyType: return "unsupported_key_type"
+        case .encryptedPrivateKey: return "encrypted_private_key"
+        case .invalidPrivateKey: return "invalid_private_key"
+        case .weakRSAKey: return "weak_rsa_key"
+        case .keyNotRegistered: return "key_not_registered"
+        case .destinationBindingRequired: return "destination_binding_required"
+        case .forwardedAgentNotAllowed: return "forwarded_agent_not_allowed"
+        case .destinationBindingInvalid: return "destination_binding_invalid"
+        case .signingRequestInvalid: return "signing_request_invalid"
+        case .authorizationDenied: return "authorization_denied"
+        case .catalogUnavailable: return "catalog_unavailable"
+        case .providerResolutionFailed: return "provider_resolution_failed"
+        }
+    }
+
     public var errorDescription: String? {
         switch self {
         case .malformedMessage:
@@ -77,6 +98,16 @@ struct SSHWireReader {
             | (UInt32(bytes[offset + 2]) << 8)
             | UInt32(bytes[offset + 3])
         offset += 4
+        return value
+    }
+
+    mutating func readUInt64() throws -> UInt64 {
+        guard remainingCount >= 8 else { throw SSHProtectionError.malformedMessage }
+        var value: UInt64 = 0
+        for index in 0..<8 {
+            value = (value << 8) | UInt64(bytes[offset + index])
+        }
+        offset += 8
         return value
     }
 
@@ -157,6 +188,14 @@ enum SSHCurve: String, Sendable {
     var pointBytes: Int { 1 + 2 * scalarBytes }
 }
 
+/// Signature policy is deliberately contextual. Protected identity signatures
+/// remain modern-only, while destination binding may need to verify the exact
+/// legacy host signature that OpenSSH has already negotiated and accepted.
+fileprivate enum SSHSignatureVerificationPolicy {
+    case modernOnly
+    case destinationHostCompatibility
+}
+
 enum SSHPublicKey: Sendable {
     case ed25519(Data)
     case ecdsa(SSHCurve, Data)
@@ -192,9 +231,107 @@ enum SSHPublicKey: Sendable {
         return "SHA256:\(encoded)"
     }
 
+    /// Fixed-category metadata for diagnosing a refused session binding. Never
+    /// return the untrusted wire string: it could contain terminal controls or
+    /// host-specific data supplied by a malicious peer.
+    static func diagnosticAlgorithm(in blob: Data) -> String {
+        var reader = SSHWireReader(blob)
+        guard let algorithm = try? reader.readUTF8(maximumBytes: 128) else {
+            return "malformed"
+        }
+        switch algorithm {
+        case "ssh-ed25519": return "ed25519"
+        case "ssh-ed25519-cert-v01@openssh.com": return "ed25519_certificate"
+        case "ecdsa-sha2-nistp256": return "ecdsa_p256"
+        case "ecdsa-sha2-nistp256-cert-v01@openssh.com":
+            return "ecdsa_p256_certificate"
+        case "ecdsa-sha2-nistp384": return "ecdsa_p384"
+        case "ecdsa-sha2-nistp384-cert-v01@openssh.com":
+            return "ecdsa_p384_certificate"
+        case "ecdsa-sha2-nistp521": return "ecdsa_p521"
+        case "ecdsa-sha2-nistp521-cert-v01@openssh.com":
+            return "ecdsa_p521_certificate"
+        case "ssh-rsa": return "rsa_sha1_or_key"
+        case "rsa-sha2-256": return "rsa_sha2_256"
+        case "rsa-sha2-512": return "rsa_sha2_512"
+        case "ssh-rsa-cert-v01@openssh.com": return "rsa_sha1_certificate"
+        case "rsa-sha2-256-cert-v01@openssh.com": return "rsa_sha2_256_certificate"
+        case "rsa-sha2-512-cert-v01@openssh.com": return "rsa_sha2_512_certificate"
+        case "sk-ssh-ed25519@openssh.com",
+             "sk-ssh-ed25519-cert-v01@openssh.com",
+             "sk-ecdsa-sha2-nistp256@openssh.com",
+             "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
+             "webauthn-sk-ecdsa-sha2-nistp256@openssh.com":
+            return "security_key"
+        default: return "unsupported"
+        }
+    }
+
     static func parse(_ blob: Data, requireStrongRSA: Bool = true) throws -> SSHPublicKey {
         var reader = SSHWireReader(blob)
         let algorithm = try reader.readUTF8(maximumBytes: 128)
+        let key = try parseFields(
+            algorithm: algorithm,
+            reader: &reader,
+            requireStrongRSA: requireStrongRSA
+        )
+        guard reader.isAtEnd else { throw SSHProtectionError.malformedMessage }
+        return key
+    }
+
+    /// Parse the server key used by OpenSSH's session-binding extension.
+    /// Unlike user identities, a negotiated server key may be an OpenSSH host
+    /// certificate. Validate the certificate structure and CA signature before
+    /// returning the embedded key that made the key-exchange signature.
+    static func parseHostKey(_ blob: Data) throws -> SSHPublicKey {
+        var reader = SSHWireReader(blob)
+        let presentedAlgorithm = try reader.readUTF8(maximumBytes: 128)
+        guard let algorithm = certificatePlainAlgorithm(presentedAlgorithm) else {
+            return try parse(blob)
+        }
+
+        _ = try reader.readString(maximumBytes: 16 * 1_024) // certificate nonce
+        let key = try parseFields(
+            algorithm: algorithm,
+            reader: &reader,
+            requireStrongRSA: true
+        )
+
+        _ = try reader.readUInt64() // serial
+        guard try reader.readUInt32() == 2 else { // SSH2_CERT_TYPE_HOST
+            throw SSHProtectionError.destinationBindingInvalid
+        }
+        _ = try reader.readString(maximumBytes: 16 * 1_024) // key ID
+        try validateStringList(try reader.readString(maximumBytes: 16 * 1_024))
+        _ = try reader.readUInt64() // valid after
+        _ = try reader.readUInt64() // valid before
+        try validateStringPairs(try reader.readString(maximumBytes: 16 * 1_024))
+        try validateStringPairs(try reader.readString(maximumBytes: 16 * 1_024))
+        _ = try reader.readString(maximumBytes: 16 * 1_024) // reserved
+
+        let certificationKeyBlob = try reader.readString(maximumBytes: 16 * 1_024)
+        let signedLength = reader.offset
+        let certificateSignature = try reader.readString(maximumBytes: 16 * 1_024)
+        guard reader.isAtEnd else { throw SSHProtectionError.malformedMessage }
+
+        // Certificate authorities must be plain keys; recursive certificates
+        // are not valid OpenSSH certification keys.
+        let certificationKey = try parse(certificationKeyBlob)
+        let signedCertificate = Data(blob.prefix(signedLength))
+        guard try certificationKey.verify(
+            signatureBlob: certificateSignature,
+            message: signedCertificate
+        ) else {
+            throw SSHProtectionError.destinationBindingInvalid
+        }
+        return key
+    }
+
+    private static func parseFields(
+        algorithm: String,
+        reader: inout SSHWireReader,
+        requireStrongRSA: Bool
+    ) throws -> SSHPublicKey {
         let key: SSHPublicKey
         switch algorithm {
         case "ssh-ed25519":
@@ -225,11 +362,54 @@ enum SSHPublicKey: Sendable {
         default:
             throw SSHProtectionError.unsupportedKeyType
         }
-        guard reader.isAtEnd else { throw SSHProtectionError.malformedMessage }
         return key
     }
 
-    func verify(signatureBlob: Data, message: Data) throws -> Bool {
+    private static func certificatePlainAlgorithm(_ algorithm: String) -> String? {
+        switch algorithm {
+        case "ssh-ed25519-cert-v01@openssh.com":
+            return "ssh-ed25519"
+        case "ecdsa-sha2-nistp256-cert-v01@openssh.com":
+            return SSHCurve.nistp256.algorithm
+        case "ecdsa-sha2-nistp384-cert-v01@openssh.com":
+            return SSHCurve.nistp384.algorithm
+        case "ecdsa-sha2-nistp521-cert-v01@openssh.com":
+            return SSHCurve.nistp521.algorithm
+        case "ssh-rsa-cert-v01@openssh.com",
+             "rsa-sha2-256-cert-v01@openssh.com",
+             "rsa-sha2-512-cert-v01@openssh.com":
+            return "ssh-rsa"
+        default:
+            return nil
+        }
+    }
+
+    private static func validateStringList(_ encoded: Data) throws {
+        var reader = SSHWireReader(encoded)
+        var entries = 0
+        while !reader.isAtEnd {
+            _ = try reader.readString(maximumBytes: 16 * 1_024)
+            entries += 1
+            guard entries <= 256 else { throw SSHProtectionError.malformedMessage }
+        }
+    }
+
+    private static func validateStringPairs(_ encoded: Data) throws {
+        var reader = SSHWireReader(encoded)
+        var entries = 0
+        while !reader.isAtEnd {
+            _ = try reader.readString(maximumBytes: 16 * 1_024)
+            _ = try reader.readString(maximumBytes: 16 * 1_024)
+            entries += 1
+            guard entries <= 256 else { throw SSHProtectionError.malformedMessage }
+        }
+    }
+
+    fileprivate func verify(
+        signatureBlob: Data,
+        message: Data,
+        policy: SSHSignatureVerificationPolicy = .modernOnly
+    ) throws -> Bool {
         var signatureReader = SSHWireReader(signatureBlob)
         let signatureAlgorithm = try signatureReader.readUTF8(maximumBytes: 128)
         let signature = try signatureReader.readString(maximumBytes: 16 * 1_024)
@@ -262,7 +442,9 @@ enum SSHPublicKey: Sendable {
             switch signatureAlgorithm {
             case "rsa-sha2-256": algorithm = .rsaSignatureMessagePKCS1v15SHA256
             case "rsa-sha2-512": algorithm = .rsaSignatureMessagePKCS1v15SHA512
-            default: return false // SHA-1 ssh-rsa signatures are deliberately refused.
+            case "ssh-rsa" where policy == .destinationHostCompatibility:
+                algorithm = .rsaSignatureMessagePKCS1v15SHA1
+            default: return false
             }
             guard let key = SSHSecurityKey.rsaPublic(exponent: exponent, modulus: modulus) else {
                 return false
@@ -301,8 +483,12 @@ public struct SSHDestinationBinding: Sendable, Equatable {
         guard !sessionIdentifier.isEmpty, sessionIdentifier.count <= 1_024 else {
             throw SSHProtectionError.destinationBindingInvalid
         }
-        let hostKey = try SSHPublicKey.parse(hostKeyBlob)
-        guard try hostKey.verify(signatureBlob: signature, message: sessionIdentifier) else {
+        let hostKey = try SSHPublicKey.parseHostKey(hostKeyBlob)
+        guard try hostKey.verify(
+            signatureBlob: signature,
+            message: sessionIdentifier,
+            policy: .destinationHostCompatibility
+        ) else {
             throw SSHProtectionError.destinationBindingInvalid
         }
         self.hostKeyBlob = hostKeyBlob

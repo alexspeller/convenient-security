@@ -81,6 +81,9 @@ let package = Package(
         ),
         // End-to-end check: agent + client over a real socket, no entitlements.
         .executableTarget(name: "cs-e2e", dependencies: ["ConvenientSecurity"]),
+        // Real OpenSSH interoperability: synthetic RSA key + Apple's ssh(1)
+        // against an isolated, unprivileged localhost sshd.
+        .executableTarget(name: "cs-ssh-e2e", dependencies: ["ConvenientSecurity"]),
         // A long-running fake agent (in-memory demo values, auto-approve) for
         // cross-language client integration tests. Not a production surface.
         .executableTarget(name: "cs-fake-agent", dependencies: ["ConvenientSecurity"]),

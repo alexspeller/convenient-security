@@ -85,17 +85,26 @@ public actor SSHAgentConnection {
 
     private let provider: any SSHAgentKeyProvider
     private let caller: CallerInfo
+    private let failureReporter: (@Sendable (String) -> Void)?
     private var binding: SSHDestinationBinding?
 
-    public init(provider: any SSHAgentKeyProvider, caller: CallerInfo) {
+    public init(
+        provider: any SSHAgentKeyProvider,
+        caller: CallerInfo,
+        failureReporter: (@Sendable (String) -> Void)? = nil
+    ) {
         self.provider = provider
         self.caller = caller
+        self.failureReporter = failureReporter
     }
 
     public func handle(_ message: Data) async -> Data {
+        var requestType: UInt8?
+        var diagnosticDetail = ""
         do {
             var reader = SSHWireReader(message)
             let type = try reader.readByte()
+            requestType = type
             switch type {
             case Message.requestIdentities:
                 guard reader.isAtEnd else { throw SSHProtectionError.malformedMessage }
@@ -128,6 +137,11 @@ public actor SSHAgentConnection {
                 let sessionIdentifier = try reader.readString(maximumBytes: 1_024)
                 let signature = try reader.readString(maximumBytes: 16 * 1_024)
                 let forwarding = try reader.readByte()
+                diagnosticDetail = " host_key_algorithm="
+                    + SSHPublicKey.diagnosticAlgorithm(in: hostKey)
+                    + " host_signature_algorithm="
+                    + SSHPublicKey.diagnosticAlgorithm(in: signature)
+                    + " forwarding=\(forwarding == 1) already_bound=\(binding != nil)"
                 guard reader.isAtEnd, forwarding == 0 || forwarding == 1,
                       binding == nil else {
                     throw SSHProtectionError.destinationBindingInvalid
@@ -164,6 +178,12 @@ public actor SSHAgentConnection {
                 return Data([Message.failure])
             }
         } catch {
+            let reason = (error as? SSHProtectionError)?.diagnosticCode
+                ?? "internal_error"
+            failureReporter?(
+                "message=\(requestType.map(String.init) ?? "unparsed") "
+                    + "reason=\(reason)\(diagnosticDetail)"
+            )
             return Data([Message.failure])
         }
     }
@@ -216,7 +236,15 @@ public final class SSHAgentServer: @unchecked Sendable {
             description: "Apple SSH [verified] (pid \(peer.audit.pid))",
             peerIdentity: peer
         )
-        let connection = SSHAgentConnection(provider: provider, caller: caller)
+        let connection = SSHAgentConnection(
+            provider: provider,
+            caller: caller,
+            failureReporter: { diagnostic in
+                FileHandle.standardError.write(
+                    Data("csecd: SSH agent refused request (\(diagnostic))\n".utf8)
+                )
+            }
+        )
 
         while let request = readSSHFrame(fd) {
             let response = await connection.handle(request)

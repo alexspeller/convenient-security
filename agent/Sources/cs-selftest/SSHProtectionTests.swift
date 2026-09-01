@@ -26,6 +26,12 @@ private struct SSHFixtureWriter {
         data.append(UInt8(value & 0xff))
     }
 
+    mutating func uint64(_ value: UInt64) {
+        for shift in stride(from: 56, through: 0, by: -8) {
+            data.append(UInt8((value >> UInt64(shift)) & 0xff))
+        }
+    }
+
     mutating func string(_ value: Data) {
         uint32(UInt32(value.count))
         data.append(value)
@@ -280,6 +286,23 @@ private actor SSHFixtureCounter {
     func count() -> Int { value }
 }
 
+private final class SSHDiagnosticCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+
+    func record(_ diagnostic: String) {
+        lock.lock()
+        value = diagnostic
+        lock.unlock()
+    }
+
+    func latest() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 private struct SSHFixtureProvider: SecretProvider {
     let scheme: String
     let values: [String: Data]
@@ -342,6 +365,34 @@ private func sshFingerprint(_ publicKeyBlob: Data) -> String {
     let digest = Data(SHA256.hash(data: publicKeyBlob)).base64EncodedString()
         .trimmingCharacters(in: CharacterSet(charactersIn: "="))
     return "SHA256:\(digest)"
+}
+
+private func ed25519HostCertificate(
+    host: Ed25519SSHFixture,
+    certificationAuthority: Ed25519SSHFixture,
+    certificateType: UInt32 = 2
+) throws -> Data {
+    var principals = SSHFixtureWriter()
+    principals.string("synthetic.example")
+
+    var certificate = SSHFixtureWriter()
+    certificate.string("ssh-ed25519-cert-v01@openssh.com")
+    certificate.string(Data(repeating: 0x43, count: 32))
+    certificate.string(host.key.publicKey.rawRepresentation)
+    certificate.uint64(7)
+    certificate.uint32(certificateType)
+    certificate.string("synthetic-host-certificate")
+    certificate.string(principals.data)
+    certificate.uint64(0)
+    certificate.uint64(UInt64.max)
+    certificate.string(Data()) // critical options
+    certificate.string(Data()) // extensions
+    certificate.string(Data()) // reserved
+    certificate.string(certificationAuthority.publicKeyBlob)
+
+    let signature = try certificationAuthority.signatureBlob(for: certificate.data)
+    certificate.string(signature)
+    return certificate.data
 }
 
 private func userAuthenticationRequest(
@@ -559,6 +610,72 @@ func sshProtectionTests() async {
         )
         check(binding.hostKeyFingerprint == sshFingerprint(hostKey.publicKeyBlob),
               "the destination binding verifies the host signature over the session identifier")
+
+        var rsaSHA1Error: Unmanaged<CFError>?
+        guard let rsaSHA1Signature = SecKeyCreateSignature(
+            rsaFixture.privateKey,
+            .rsaSignatureMessagePKCS1v15SHA1,
+            sessionIdentifier as CFData,
+            &rsaSHA1Error
+        ) as Data? else {
+            throw rsaSHA1Error?.takeRetainedValue() ?? SSHFixtureError.rsaKeyGeneration
+        }
+        var rsaSHA1SignatureWriter = SSHFixtureWriter()
+        rsaSHA1SignatureWriter.string("ssh-rsa")
+        rsaSHA1SignatureWriter.string(rsaSHA1Signature)
+        let legacyRSAHostBinding = try SSHDestinationBinding(
+            hostKeyBlob: parsedRSA.publicKeyBlob,
+            sessionIdentifier: sessionIdentifier,
+            signature: rsaSHA1SignatureWriter.data,
+            isForwarding: false
+        )
+        check(legacyRSAHostBinding.hostKeyFingerprint == sshFingerprint(parsedRSA.publicKeyBlob),
+              "destination binding verifies an RSA/SHA-1 host signature already accepted by SSH")
+
+        let hostCertificateAuthority = try Ed25519SSHFixture(seed: 177)
+        let hostCertificate = try ed25519HostCertificate(
+            host: hostKey,
+            certificationAuthority: hostCertificateAuthority
+        )
+        let certificateBinding = try SSHDestinationBinding(
+            hostKeyBlob: hostCertificate,
+            sessionIdentifier: sessionIdentifier,
+            signature: hostSignature,
+            isForwarding: false
+        )
+        check(certificateBinding.hostKeyBlob == hostCertificate
+              && certificateBinding.hostKeyFingerprint == sshFingerprint(hostKey.publicKeyBlob),
+              "a CA-verified OpenSSH host certificate binds the exact certificate and underlying key")
+
+        do {
+            var invalidCertificate = hostCertificate
+            invalidCertificate[invalidCertificate.index(before: invalidCertificate.endIndex)] ^= 1
+            _ = try SSHDestinationBinding(
+                hostKeyBlob: invalidCertificate,
+                sessionIdentifier: sessionIdentifier,
+                signature: hostSignature,
+                isForwarding: false
+            )
+            check(false, "a host certificate with an invalid CA signature is rejected")
+        } catch {
+            check(true, "a host certificate with an invalid CA signature is rejected")
+        }
+        do {
+            _ = try SSHDestinationBinding(
+                hostKeyBlob: ed25519HostCertificate(
+                    host: hostKey,
+                    certificationAuthority: hostCertificateAuthority,
+                    certificateType: 1
+                ),
+                sessionIdentifier: sessionIdentifier,
+                signature: hostSignature,
+                isForwarding: false
+            )
+            check(false, "a user certificate cannot be used as a destination host binding")
+        } catch let error as SSHProtectionError {
+            check(error == .destinationBindingInvalid,
+                  "a user certificate cannot be used as a destination host binding")
+        }
         do {
             _ = try SSHDestinationBinding(
                 hostKeyBlob: hostKey.publicKeyBlob,
@@ -815,6 +932,47 @@ func sshProtectionTests() async {
             publicKeyBlob: nativeKey.publicKeyBlob, signedData: signedData
         )) == Data([5]),
         "the SSH wire refuses signing before a verified session binding")
+
+        let diagnosticCapture = SSHDiagnosticCapture()
+        let diagnosticConnection = SSHAgentConnection(
+            provider: service,
+            caller: caller,
+            failureReporter: { diagnosticCapture.record($0) }
+        )
+        var invalidHostSignature = hostSignature
+        invalidHostSignature[invalidHostSignature.index(before: invalidHostSignature.endIndex)] ^= 1
+        var invalidBinding = SSHFixtureWriter()
+        invalidBinding.byte(27)
+        invalidBinding.string("session-bind@openssh.com")
+        invalidBinding.string(hostKey.publicKeyBlob)
+        invalidBinding.string(sessionIdentifier)
+        invalidBinding.string(invalidHostSignature)
+        invalidBinding.byte(0)
+        check(await diagnosticConnection.handle(invalidBinding.data) == Data([5])
+              && diagnosticCapture.latest()
+                == "message=27 reason=destination_binding_invalid "
+                    + "host_key_algorithm=ed25519 host_signature_algorithm=ed25519 "
+                    + "forwarding=false already_bound=false",
+              "session-binding diagnostics contain only fixed algorithm categories and booleans")
+
+        var untrustedHostKey = SSHFixtureWriter()
+        untrustedHostKey.string("unknown\nforged-host-metadata")
+        let untrustedDiagnosticConnection = SSHAgentConnection(
+            provider: service,
+            caller: caller,
+            failureReporter: { diagnosticCapture.record($0) }
+        )
+        var unsupportedBinding = SSHFixtureWriter()
+        unsupportedBinding.byte(27)
+        unsupportedBinding.string("session-bind@openssh.com")
+        unsupportedBinding.string(untrustedHostKey.data)
+        unsupportedBinding.string(sessionIdentifier)
+        unsupportedBinding.string(hostSignature)
+        unsupportedBinding.byte(0)
+        _ = await untrustedDiagnosticConnection.handle(unsupportedBinding.data)
+        check(diagnosticCapture.latest()?.contains("host_key_algorithm=unsupported") == true
+              && diagnosticCapture.latest()?.contains("forged-host-metadata") == false,
+              "session-binding diagnostics never echo an untrusted wire algorithm")
 
         check(await connection.handle(try sessionBindMessage(
             host: hostKey, sessionIdentifier: sessionIdentifier
