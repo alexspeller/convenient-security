@@ -12,10 +12,10 @@ running as the same login user. It provides per-reference Touch ID consent,
 process-scoped grants, a code-identity-gated at-rest cache, heap delivery for
 integrated Ruby and Node.js clients, tool-native AWS/Git credential adapters,
 anonymous inherited-fd files, capability-GID regular files, an environment
-compatibility launcher, and exact-value output redaction. Every delivery is
-gated by a single Touch-ID-approved, value-free review before provider or cache
-resolution. It can resolve from the official 1Password CLI and from device-bound
-native encrypted files.
+compatibility launcher, destination-bound SSH signing, and exact-value output
+redaction. Every delivery is gated by a Touch-ID-approved, value-free review
+before provider or cache resolution. It can resolve from the official 1Password
+CLI and from device-bound native encrypted files.
 
 It does not protect a value from root, from code already executing inside an
 authorized consumer, from a consumer the user deliberately launches, or from a
@@ -46,7 +46,9 @@ principle is catalogued in [`docs/host-audit-catalog.md`](docs/host-audit-catalo
   adapters, manages the keychain cache, holds the active-value registry used
   for output redaction, and owns the host-posture audit engine (§Host posture
   audit) — running it under Full Disk Access and driving the root helper for its
-  privileged reads and reversible fixes.
+  privileged reads and reversible fixes. It also owns a separate binary
+  OpenSSH-agent socket whose only private operation is bounded SSH
+  user-authentication signing.
 - **`csec`** is the signed CLI, bridge, launcher, output supervisor, and AI
   command broker. Its commands are listed by `csec help`; they include `csec
   setup` (onboarding) and `csec audit`, a thin client that asks `csecd` to run
@@ -96,6 +98,36 @@ through `SecretResolver` after approval, validates that the resolved private key
 still matches the catalogued public identity, and returns only the signature.
 The signing service does not know or care whether the reference is backed by
 the native encrypted store, 1Password, or a future provider.
+
+## SSH signing adapter
+
+The SSH adapter is a second, binary protocol surface inside `csecd`; it does not
+reuse the JSON access response that returns resolved values. The public catalog
+contains a canonical `SecretRef`, public-key blob, algorithm, SHA-256
+fingerprint, and bounded label. Registration resolves through `SecretResolver`
+only after trusted policy review and Touch ID, derives the public identity in
+the daemon, and persists no private bytes or provider-specific identifiers.
+
+On the signing path, the socket accepts only the current user's live,
+Apple-signed `/usr/bin/ssh`. It requires a verified, non-forwarded
+`session-bind@openssh.com` extension and parses the complete SSH user-auth
+packet before review or resolution; arbitrary-byte signing and SSH-wire catalog
+mutation are refused. An approved in-memory grant is bound to the key
+fingerprint, server host-key fingerprint, remote username, Apple SSH code
+identity/audit session, live parent process subtree, and 12-hour maximum. The
+daemon then resolves the reference, reparses the key, compares its derived
+public blob with both catalog and request, signs the exact validated packet, and
+returns only the signature.
+
+`csec protect --ssh` is a provider-specific import convenience: it durably
+writes to a chosen native store, registers the resulting canonical references,
+writes ordinary `.csec` sidecars, preserves or derives `.pub` files, and only
+then removes unchanged originals. `csec ssh register` accepts an existing
+reference from `csec://`, `op://`, or any future registered provider. This
+manual first release does not modify global shell/SSH setup, proxy another
+agent, permit forwarding, or support `ssh-add` mutations. The exact commands,
+supported key formats, failure ordering, and first-release limitations are in
+[`docs/ssh-agent.md`](docs/ssh-agent.md).
 
 ## Authenticated agent socket
 

@@ -59,6 +59,10 @@ rest and in use — as small as macOS allows.
   credential adapters use private pipes, while `exec-fd` gives file-oriented
   tools an anonymous inherited descriptor. Plaintext need not touch `ENV`,
   `argv`, or a named file.
+- **Destination-bound SSH signing.** A manual csec SSH-agent socket accepts only
+  Apple's signed `/usr/bin/ssh`, verifies OpenSSH's server/session binding,
+  rejects forwarding and arbitrary signing, and reuses one Touch-ID-approved
+  key + host-key + remote-user + process-subtree grant for up to 12 hours.
 - **Seekable files without same-UID ambient access.** The packaged `csec-rootd`
   can create root-owned regular files on bounded `nodev,nosuid,noexec` tmpfs and
   launch one approved process tree with a fresh, non-reused capability GID.
@@ -89,6 +93,7 @@ switched on.
 | Malware reads secrets from your environment / `argv` | Ruby, Node.js, and credential-helper values cross private pipes; `exec-fd` puts only non-secret `/dev/fd/N` paths in the child environment. The explicit `csec exec` compatibility mode remains an exception. |
 | Malware reads an ordinary same-user configuration file | `csec exec-file` creates root-owned `0050` directories and `0040` regular files on bounded tmpfs. Only the freshly launched capability-GID tree can traverse and read them; paths, not values, enter its environment. |
 | Malware asks a broker for your whole vault | The agent releases only references a human just approved with Touch ID, scoped to the approving process subtree. |
+| Malware connects to your SSH agent and asks it to sign | The SSH socket accepts only live Apple `/usr/bin/ssh`, requires a verified non-forwarded destination binding, parses an exact user-auth request, and binds grants to the key, host key, remote user, and process subtree. |
 | An old client or stale grant asks for a now-forbidden delivery | Protocol v1 fails closed; protocol v2 is evaluated against current risk metadata before resolution, and grants are reusable only with the same plan and policy digest. |
 | Malware reads your encrypted files off disk | Files are AES-256-GCM envelopes; the keys live in a Keychain group only the signed, provisioned agent can access, gated by the Secure Enclave. |
 | Malware tampers with or rolls back an encrypted file | Each store's Keychain record pins the current generation, file ID, and ciphertext digest, so modification, cross-store swaps, and replay of an old file fail closed. |
@@ -117,12 +122,18 @@ Security **cannot** protect a secret from:
   the capability or bytes to its descendants;
 - **the external-editor mode** of the native store, which necessarily writes
   decrypted JSON to a temp file your editor and its plugins can read;
+- **an SSH key's source backend or an explicitly approved generic delivery** —
+  the csec SSH socket is signature-only, but backend-neutral keys remain ordinary
+  references rather than becoming hardware-backed, non-exportable identities;
 - **plaintext sources reviewed or imported by `csec setup`** — setup leaves
   them intact until you verify the replacement and remediate them separately;
 - **you approving a request that turns out to be misleading.**
 
 The full attacker model — what a same-user, non-root process can and can't do,
 and why each control holds — is in [`docs/threat-model.md`](docs/threat-model.md).
+
+The manual protected-key workflow and its limits are in
+[`docs/ssh-agent.md`](docs/ssh-agent.md).
 
 ## Getting started
 
@@ -134,6 +145,18 @@ bin/ci                                        # build + run the full test suite
 swift run csecd                               # start the agent (foreground, dev mode)
 swift run csec get 'op://Vault/Item/Field'    # terminal get — identifies the parent shell and prompts once per grant
 ```
+
+To protect and use an SSH key manually (global setup is intentionally deferred):
+
+```sh
+csec protect --ssh ~/.ssh/id_ed25519
+export SSH_AUTH_SOCK="$(csec ssh socket)"
+ssh user@example.com
+```
+
+Protection and registration detect when the launching shell is not using the
+csec socket and print this profile/one-off activation guidance; csec does not
+edit shell profiles itself.
 
 > An unsigned `swift run csecd` runs without the at-rest cache and the native
 > store (it can't open the provisioned Keychain group) and prints

@@ -14,6 +14,23 @@ func check(_ condition: Bool, _ label: String) {
     if !condition { failures += 1 }
 }
 
+// Sidecar discovery intentionally scans the launcher's working tree. Keep the
+// harness in its own empty tree so a developer's real/untracked *.csec files
+// cannot become test inputs or make CI depend on local provider state.
+let e2eWorkingDirectory = NSTemporaryDirectory()
+    + "csec-e2e-cwd-\(UUID().uuidString.lowercased())"
+do {
+    try FileManager.default.createDirectory(
+        atPath: e2eWorkingDirectory, withIntermediateDirectories: true
+    )
+    guard FileManager.default.changeCurrentDirectoryPath(e2eWorkingDirectory) else {
+        throw CocoaError(.fileNoSuchFile)
+    }
+} catch {
+    FileHandle.standardError.write(Data("cs-e2e: cannot create isolated working directory\n".utf8))
+    exit(1)
+}
+
 actor ResolutionCounter {
     private var count = 0
     func record() { count += 1 }
@@ -212,12 +229,21 @@ let grants = GrantTable()
 let consent = ConsentCounter()
 let capture = RequestCapture()
 let accessReviewCapture = AccessReviewCapture()
+let policyReview = CapturingAutoApprovePolicyReview(capture: accessReviewCapture)
+let sshSigningService = SSHSigningService(
+    resolver: resolver,
+    catalog: SSHKeyCatalog(store: InMemorySSHKeyCatalogStore()),
+    consent: consent,
+    policyReview: policyReview,
+    allowUnverifiedCallersForTesting: true
+)
 let agent = Agent(
     resolver: resolver,
     grants: grants,
     consent: consent,
-    policyReview: CapturingAutoApprovePolicyReview(capture: accessReviewCapture),
+    policyReview: policyReview,
     nativeStore: nativeProvider,
+    sshSigningService: sshSigningService,
     allowUnverifiedPlansForTesting: true
 )
 
@@ -243,6 +269,8 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
             requestID: request.requestID,
             remoteApprovalStatus: RemoteApprovalConfigurationStatus(state: .disabled)
         )
+    case let .configureSSH(request):
+        return await agent.configureSSH(request: request, caller: caller)
     case let .beginSession(begin):
         return await agent.beginSession(request: begin, caller: caller)
     case let .beginOutputRedaction(begin):
@@ -1112,6 +1140,138 @@ do {
           "the protected .envrc resolves back through csec:// with full fidelity")
 } catch {
     check(false, "csec protect end-to-end succeeds (\(error))")
+}
+
+// Manual SSH protection end to end: generate a throwaway key, import it through
+// the real CLI, prove the original is removed only after registration, and
+// exercise catalog list/remove/re-register through an ordinary .csec sidecar.
+do {
+    let fixtureDirectory = NSTemporaryDirectory()
+        + "csec-protect-ssh-e2e-\(UUID().uuidString.lowercased())"
+    try FileManager.default.createDirectory(
+        atPath: fixtureDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: fixtureDirectory) }
+    let privateKeyPath = fixtureDirectory + "/id_ed25519"
+    let publicKeyPath = privateKeyPath + ".pub"
+
+    let keygen = Process()
+    keygen.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
+    keygen.arguments = [
+        "-q", "-t", "ed25519", "-N", "", "-C", "csec-synthetic-e2e",
+        "-f", privateKeyPath,
+    ]
+    keygen.standardInput = FileHandle.nullDevice
+    keygen.standardOutput = FileHandle.nullDevice
+    keygen.standardError = FileHandle.nullDevice
+    try keygen.run()
+    keygen.waitUntilExit()
+    guard keygen.terminationStatus == 0 else { throw SSHProtectionError.invalidPrivateKey }
+    let originalPublicKey = try Data(contentsOf: URL(fileURLWithPath: publicKeyPath))
+    let activationExport = "export SSH_AUTH_SOCK=\"$(csec ssh socket)\""
+    let otherAgentPath = fixtureDirectory + "/not-csec-agent.sock"
+
+    let protected = runCsec(
+        ["protect", "--ssh", privateKeyPath],
+        extraEnv: ["SSH_AUTH_SOCK": otherAgentPath]
+    )
+    check(protected.status == 0,
+          "csec protect --ssh imports and registers a synthetic key (err: \(protected.err))")
+    check(!FileManager.default.fileExists(atPath: privateKeyPath),
+          "protect --ssh removes the unchanged private-key plaintext")
+    let sidecarPath = privateKeyPath + ProtectedFileSidecar.suffix
+    check(FileManager.default.fileExists(atPath: sidecarPath),
+          "protect --ssh writes an ordinary backend-neutral .csec sidecar")
+    check(try Data(contentsOf: URL(fileURLWithPath: publicKeyPath)) == originalPublicKey,
+          "protect --ssh preserves an existing public-key file byte-for-byte")
+
+    let sidecar = try ProtectedFileSidecar(
+        data: Data(contentsOf: URL(fileURLWithPath: sidecarPath))
+    )
+    let protectedKeys = try client.listSSHKeys()
+    guard let protectedKey = protectedKeys.first(where: {
+        $0.reference == sidecar.reference.uri
+    }) else { throw SSHProtectionError.keyNotRegistered }
+    check(protectedKey.algorithm == "ssh-ed25519"
+          && protected.out.contains(protectedKey.fingerprint),
+          "protect --ssh reports the registered public fingerprint without key bytes")
+    check(protected.out.contains("Add this line to your shell profile")
+          && protected.out.contains(activationExport),
+          "protect --ssh explains how to activate csec when SSH_AUTH_SOCK points elsewhere")
+
+    let listed = runCsec(["ssh", "list"], extraEnv: [:])
+    check(listed.status == 0
+          && listed.out.contains(protectedKey.fingerprint)
+          && listed.out.contains(sidecar.reference.uri),
+          "csec ssh list reads backend-neutral public catalog metadata")
+
+    let removed = runCsec(
+        ["ssh", "remove", protectedKey.fingerprint], extraEnv: [:]
+    )
+    let keysAfterRemoval = try client.listSSHKeys()
+    check(removed.status == 0 && keysAfterRemoval.isEmpty,
+          "csec ssh remove deletes only the catalog registration")
+
+    let registered = runCsec(
+        ["ssh", "register", "--label", "sidecar fixture", sidecarPath],
+        extraEnv: ["SSH_AUTH_SOCK": otherAgentPath]
+    )
+    let restoredKeys = try client.listSSHKeys()
+    check(registered.status == 0
+          && restoredKeys.count == 1
+          && restoredKeys[0].reference == sidecar.reference.uri
+          && restoredKeys[0].label == "sidecar fixture",
+          "csec ssh register accepts an ordinary sidecar without backend-specific handling")
+    check(registered.out.contains("Add this line to your shell profile")
+          && registered.out.contains(activationExport),
+          "csec ssh register explains how to activate csec when SSH_AUTH_SOCK points elsewhere")
+
+    let registeredFromConfiguredShell = runCsec(
+        ["ssh", "register", "--label", "sidecar fixture", sidecarPath],
+        extraEnv: ["SSH_AUTH_SOCK": SSHAgentSocket.defaultPath()]
+    )
+    check(registeredFromConfiguredShell.status == 0
+          && !registeredFromConfiguredShell.out.contains(activationExport)
+          && !registeredFromConfiguredShell.out.contains("shell profile"),
+          "csec ssh register stays quiet when the shell already uses the csec socket")
+
+    // ssh-keygen's OpenSSH RSA document exercises the parser path that derives
+    // CRT exponents before importing the private key into Security.framework.
+    let rsaPrivateKeyPath = fixtureDirectory + "/id_rsa"
+    let rsaPublicKeyPath = rsaPrivateKeyPath + ".pub"
+    let rsaKeygen = Process()
+    rsaKeygen.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
+    rsaKeygen.arguments = [
+        "-q", "-t", "rsa", "-b", "2048", "-N", "", "-C", "csec-synthetic-rsa-e2e",
+        "-f", rsaPrivateKeyPath,
+    ]
+    rsaKeygen.standardInput = FileHandle.nullDevice
+    rsaKeygen.standardOutput = FileHandle.nullDevice
+    rsaKeygen.standardError = FileHandle.nullDevice
+    try rsaKeygen.run()
+    rsaKeygen.waitUntilExit()
+    guard rsaKeygen.terminationStatus == 0 else { throw SSHProtectionError.invalidPrivateKey }
+    let rsaPublicKey = try Data(contentsOf: URL(fileURLWithPath: rsaPublicKeyPath))
+
+    let protectedRSA = runCsec(
+        ["protect", "--ssh", rsaPrivateKeyPath],
+        extraEnv: ["SSH_AUTH_SOCK": SSHAgentSocket.defaultPath()]
+    )
+    let keysWithRSA = try client.listSSHKeys()
+    let rsaPublicPreserved = try Data(
+        contentsOf: URL(fileURLWithPath: rsaPublicKeyPath)
+    ) == rsaPublicKey
+    check(protectedRSA.status == 0
+          && !FileManager.default.fileExists(atPath: rsaPrivateKeyPath)
+          && FileManager.default.fileExists(
+            atPath: rsaPrivateKeyPath + ProtectedFileSidecar.suffix
+          )
+          && rsaPublicPreserved
+          && keysWithRSA.contains(where: { $0.algorithm == "ssh-rsa" })
+          && !protectedRSA.out.contains(activationExport)
+          && !protectedRSA.out.contains("shell profile"),
+          "protect --ssh supports a generated OpenSSH RSA-2048 key end to end")
+} catch {
+    check(false, "csec protect --ssh end-to-end succeeds (\(error))")
 }
 
 // `csec protect --env` end to end: drive the real picker through a PTY with
@@ -2741,6 +2901,8 @@ if fakeRoot.isRunning {
     fakeRoot.waitUntilExit()
 }
 try? FileManager.default.removeItem(atPath: rootFixtureDirectory)
+_ = FileManager.default.changeCurrentDirectoryPath(NSTemporaryDirectory())
+try? FileManager.default.removeItem(atPath: e2eWorkingDirectory)
 
 if failures == 0 {
     print("\nAll end-to-end checks passed.")

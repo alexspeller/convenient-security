@@ -51,6 +51,8 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
             requestID: request.requestID,
             remoteApprovalStatus: RemoteApprovalConfigurationStatus(state: .disabled)
         )
+    case let .configureSSH(request):
+        return await agent.configureSSH(request: request, caller: caller)
     case let .beginSession(begin):
         return await agent.beginSession(request: begin, caller: caller)
     case let .beginOutputRedaction(begin):

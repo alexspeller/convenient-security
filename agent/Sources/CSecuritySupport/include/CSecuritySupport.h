@@ -160,6 +160,9 @@ int32_t cs_spawn_with_capability_gid(
 /// Set O_NONBLOCK while preserving existing descriptor flags.
 int32_t cs_fd_set_nonblocking(int32_t fd);
 
+/// Prevent this process and its descendants from writing memory-bearing core dumps.
+int32_t cs_disable_core_dumps(void);
+
 /// Create a close-on-exec, nonblocking self-pipe and route supervisor-relevant
 /// signals into it as one-byte signal numbers. The child must be spawned before
 /// handlers are installed so it starts with the caller's original dispositions.

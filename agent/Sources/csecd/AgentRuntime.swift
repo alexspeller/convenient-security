@@ -1,5 +1,6 @@
 import ConvenientSecurity
 import CSECRemoteApprovalCloudKit
+import CSecuritySupport
 import CloudKit
 import Foundation
 import OnePasswordAdapter
@@ -18,6 +19,13 @@ func startAgentServer() async {
   // executable. Automated tests use cs-fake-agent or inject a ConsentProvider in
   // process; an environment-controlled bypass here would also be available to
   // same-uid malware launching the genuine signed binary.
+
+  guard cs_disable_core_dumps() == 0 else {
+    FileHandle.standardError.write(
+      Data("csecd: refusing startup because core dumps could not be disabled.\n".utf8)
+    )
+    exit(1)
+  }
 
   let socketPath = AgentSocket.defaultPath()
   do {
@@ -153,6 +161,30 @@ func startAgentServer() async {
     local: TrustedPolicyReview(),
     remote: remoteApproval
   )
+  let sshSigningService: SSHSigningService?
+  if cacheEnabled {
+    sshSigningService = SSHSigningService(
+      resolver: resolver,
+      catalog: SSHKeyCatalog(store: SecuritySSHKeyCatalogStore()),
+      consent: consent,
+      policyReview: policyReview
+    )
+  } else {
+    #if DEBUG
+      // Unsigned local development cannot access the product Keychain group.
+      // Keep the catalog process-local and conspicuous; release never silently
+      // falls back from code-identity-protected persistence.
+      sshSigningService = SSHSigningService(
+        resolver: resolver,
+        catalog: SSHKeyCatalog(store: InMemorySSHKeyCatalogStore()),
+        consent: consent,
+        policyReview: policyReview,
+        allowUnverifiedCallersForTesting: true
+      )
+    #else
+      sshSigningService = nil
+    #endif
+  }
   #if DEBUG
     let agent = Agent(
       resolver: resolver,
@@ -160,6 +192,7 @@ func startAgentServer() async {
       consent: consent,
       policyReview: policyReview,
       nativeStore: nativeStore,
+      sshSigningService: sshSigningService,
       allowUnverifiedPlansForTesting: true
     )
     let clientTrustPolicy: SocketPeerTrustPolicy = .allowUnverifiedForTesting
@@ -169,7 +202,8 @@ func startAgentServer() async {
       grants: grants,
       consent: consent,
       policyReview: policyReview,
-      nativeStore: nativeStore
+      nativeStore: nativeStore,
+      sshSigningService: sshSigningService
     )
     let clientTrustPolicy: SocketPeerTrustPolicy = .requireProductLauncher
   #endif
@@ -250,6 +284,8 @@ func startAgentServer() async {
           )
         }
       }
+    case .configureSSH(let request):
+      return await agent.configureSSH(request: request, caller: caller)
     case .beginSession(let begin):
       return await agent.beginSession(request: begin, caller: caller)
     case .beginOutputRedaction(let begin):
@@ -378,6 +414,26 @@ func startAgentServer() async {
         "csecd: native encrypted store OFF — a provisioned biometric keychain is required.\n".utf8
       ))
   }
+  let sshServer: SSHAgentServer?
+  if let sshSigningService {
+    #if DEBUG
+      let sshTrustPolicy: SSHSocketPeerTrustPolicy = .allowUnverifiedForTesting
+    #else
+      let sshTrustPolicy: SSHSocketPeerTrustPolicy = .requireAppleSSH
+    #endif
+    sshServer = SSHAgentServer(
+      trustPolicy: sshTrustPolicy,
+      provider: sshSigningService
+    )
+    FileHandle.standardError.write(
+      Data("csecd: SSH agent listening on \(SSHAgentSocket.defaultPath())\n".utf8)
+    )
+  } else {
+    sshServer = nil
+    FileHandle.standardError.write(
+      Data("csecd: SSH agent OFF — protected catalog persistence is unavailable.\n".utf8)
+    )
+  }
 
   // AppKit policy review must be presented on the main actor. Keep the socket
   // accept loop on its documented dedicated thread and run the accessory app's
@@ -388,6 +444,15 @@ func startAgentServer() async {
     } catch {
       FileHandle.standardError.write(Data("csecd: \(error)\n".utf8))
       exit(1)
+    }
+  }
+  if let sshServer {
+    Thread.detachNewThread {
+      do {
+        try sshServer.run()
+      } catch {
+        FileHandle.standardError.write(Data("csecd: SSH agent failed: \(error)\n".utf8))
+      }
     }
   }
 

@@ -5,6 +5,7 @@ import Darwin
 #endif
 
 /// `csec protect [--store NAME] [--keep-plaintext] [--dry-run] <path>...`
+/// `csec protect --ssh [--store NAME] [--keep-plaintext] [--dry-run] <private-key>...`
 /// `csec protect --env [--store NAME | --dest DEST] [--dry-run] <file>`
 ///
 /// Imports whole plaintext secret files under the current project directory into
@@ -27,6 +28,7 @@ func runProtect(_ arguments: [String]) -> Never {
     var storeOverride: String?
     var destOverride: String?
     var envMode = false
+    var sshMode = false
     var keepPlaintext = false
     var dryRun = false
     var paths: [String] = []
@@ -44,6 +46,8 @@ func runProtect(_ arguments: [String]) -> Never {
             destOverride = arguments[index]
         case "--env":
             envMode = true
+        case "--ssh":
+            sshMode = true
         case "--keep-plaintext":
             keepPlaintext = true
         case "--dry-run":
@@ -55,6 +59,7 @@ func runProtect(_ arguments: [String]) -> Never {
         }
         index += 1
     }
+    guard !(envMode && sshMode) else { protectFail("use either --env or --ssh, not both") }
     if envMode {
         guard paths.count == 1 else {
             protectFail("--env takes exactly one env file")
@@ -68,6 +73,16 @@ func runProtect(_ arguments: [String]) -> Never {
         runProtectEnv(
             rawPath: paths[0], storeOverride: storeOverride,
             destOverride: destOverride, dryRun: dryRun)
+    }
+    if sshMode {
+        guard destOverride == nil else { protectFail("--dest does not apply to --ssh") }
+        guard !paths.isEmpty else { usage() }
+        runProtectSSH(
+            rawPaths: paths,
+            storeOverride: storeOverride,
+            keepPlaintext: keepPlaintext,
+            dryRun: dryRun
+        )
     }
     guard destOverride == nil else {
         protectFail("--dest requires --env")
@@ -140,7 +155,7 @@ func runProtect(_ arguments: [String]) -> Never {
         // 3. Only now remove the redundant plaintext.
         var removed = 0
         if !keepPlaintext {
-            for item in planned where unlink(item.originalPath) == 0 { removed += 1 }
+            for item in planned where unlinkIfUnchanged(item) { removed += 1 }
         }
 
         FileHandle.standardOutput.write(Data((
@@ -155,6 +170,148 @@ func runProtect(_ arguments: [String]) -> Never {
         exit(0)
     } catch {
         protectFail(error.localizedDescription)
+    }
+}
+
+/// Manual SSH protection deliberately accepts explicit keys outside the current
+/// project (normally ~/.ssh). Import remains native-destination convenience; the
+/// resulting catalog registration is a canonical SecretRef and the separate
+/// `csec ssh register` command accepts op:// and future provider references.
+private func runProtectSSH(
+    rawPaths: [String],
+    storeOverride: String?,
+    keepPlaintext: Bool,
+    dryRun: Bool
+) -> Never {
+    let store: NativeStoreName
+    do {
+        store = try NativeStoreName(storeOverride ?? "ssh-keys")
+    } catch {
+        protectFail("invalid SSH key store name (\(error.localizedDescription))")
+    }
+
+    var planned: [ProtectPlannedFile] = []
+    var seenPaths = Set<String>()
+    var seenKeys = Set<String>()
+    for rawPath in rawPaths {
+        let item: ProtectPlannedFile
+        do {
+            item = try planSSHPrivateKey(rawPath: rawPath)
+        } catch let error as ProtectError {
+            protectFail("\(rawPath): \(error.message)")
+        } catch {
+            protectFail("\(rawPath): \(error.localizedDescription)")
+        }
+        guard seenPaths.insert(item.originalPath).inserted,
+              seenKeys.insert(item.key).inserted else {
+            protectFail("\(rawPath): the same private key was listed more than once")
+        }
+        planned.append(item)
+    }
+
+    let references: [SecretRef]
+    do {
+        references = try planned.map {
+            try NativeSecretReference(store: store, key: $0.key).secretRef
+        }
+    } catch {
+        protectFail("could not construct canonical SSH key references")
+    }
+    let registrations = zip(planned, references).map {
+        SSHKeyRegistrationIntent(
+            reference: $0.1.uri,
+            label: ($0.0.originalPath as NSString).lastPathComponent
+        )
+    }
+
+    if dryRun {
+        var output = "csec protect --ssh (dry run): store \(store.value)\n"
+        for (item, reference) in zip(planned, references) {
+            output += "  \(ReviewDisplay.sanitized(item.originalPath))  ->  "
+                + "\(reference.uri)  (protect + register)\n"
+        }
+        output += "  private keys unchanged; no SSH catalog entries added (dry run)\n"
+        FileHandle.standardOutput.write(Data(output.utf8))
+        exit(0)
+    }
+
+    let client = makeAgentClient()
+    do {
+        // The SSH-specific edit mode makes the single trusted review explicit.
+        // The commit first durably imports every blob, then derives/stores public
+        // catalog metadata inside csecd before the CLI touches the originals.
+        let session = try client.beginNativeStoreEdit(
+            store: store.value,
+            mode: .sshKeyImport
+        )
+        let blobs = planned.map {
+            ProtectedBlobImport(
+                key: $0.key,
+                data: $0.data,
+                mode: $0.mode,
+                path: $0.relativePath
+            )
+        }
+        let result = try client.commitNativeStoreBlobsAndRegisterSSH(
+            sessionID: session.sessionID,
+            blobs: blobs,
+            registrations: registrations
+        )
+        let metadataByReference = Dictionary(
+            uniqueKeysWithValues: result.keys.map { ($0.reference, $0) }
+        )
+
+        // Sidecars remain the ordinary provider-neutral .csec format. A missing
+        // .pub is recreated from returned public metadata; existing .pub files
+        // are preserved byte-for-byte.
+        for (item, reference) in zip(planned, references) {
+            let sidecar = try ProtectedFileSidecar(reference: reference).encoded()
+            try writeFileAtomically(path: item.sidecarPath, data: sidecar, mode: 0o600)
+            if let metadata = metadataByReference[reference.uri] {
+                try writePublicKeyIfMissing(
+                    path: item.originalPath + ".pub",
+                    data: Data(metadata.publicKeyLine.utf8)
+                )
+            }
+        }
+
+        var removed = 0
+        var retained: [ProtectPlannedFile] = []
+        if !keepPlaintext {
+            for item in planned {
+                if unlinkIfUnchanged(item) { removed += 1 }
+                else { retained.append(item) }
+            }
+        }
+
+        var output = "csec protect --ssh: protected and registered \(planned.count) key(s); "
+        output += keepPlaintext
+            ? "private-key plaintext left in place (--keep-plaintext)\n"
+            : "removed \(removed) private-key plaintext file(s)\n"
+        for (item, reference) in zip(planned, references) {
+            let fingerprint = metadataByReference[reference.uri]?.fingerprint ?? "registered"
+            let name = ReviewDisplay.sanitized((item.originalPath as NSString).lastPathComponent)
+            output += "  \(name)  ->  "
+                + "\(reference.uri)  \(fingerprint)\n"
+        }
+        output += sshActivationGuidanceIfNeeded()
+        FileHandle.standardOutput.write(Data(output.utf8))
+        if !retained.isEmpty {
+            for item in retained {
+                let path = ReviewDisplay.sanitized(item.originalPath)
+                FileHandle.standardError.write(Data(
+                    "csec protect: warning: \(path) changed or could not be removed; plaintext remains\n"
+                        .utf8
+                ))
+            }
+            exit(1)
+        }
+        exit(0)
+    } catch {
+        protectFail(
+            "SSH protection did not complete; original private key files were left in place: "
+                + error.localizedDescription
+        )
     }
 }
 
@@ -371,6 +528,7 @@ private struct ProtectPlannedFile {
     let key: String
     let data: Data
     let mode: UInt16
+    let info: stat
 }
 
 private struct ProtectError: Error {
@@ -418,7 +576,37 @@ private func planProtectedFile(
         sidecarPath: canonicalFile + ProtectedFileSidecar.suffix,
         key: ProtectedFileImportPlanner.storeKey(forRelativePath: relative),
         data: data,
-        mode: mode
+        mode: mode,
+        info: info
+    )
+}
+
+private func planSSHPrivateKey(rawPath: String) throws -> ProtectPlannedFile {
+    let current = FileManager.default.currentDirectoryPath
+    let absolute = (rawPath as NSString).isAbsolutePath
+        ? rawPath
+        : (current as NSString).appendingPathComponent(rawPath)
+    let parent = (absolute as NSString).deletingLastPathComponent
+    let baseName = (absolute as NSString).lastPathComponent
+    guard !baseName.isEmpty, baseName != ".", baseName != "..",
+          !baseName.hasSuffix(".pub"),
+          !baseName.hasSuffix(ProtectedFileSidecar.suffix),
+          let canonicalParent = canonicalPath(parent) else {
+        throw ProtectError(message: "must name a private-key file, not a public key or sidecar")
+    }
+    let canonicalFile = (canonicalParent as NSString).appendingPathComponent(baseName)
+    let (data, info) = try readRegularFile(atPath: canonicalFile)
+    guard !data.isEmpty else { throw ProtectError(message: "is empty; nothing to protect") }
+    return ProtectPlannedFile(
+        originalPath: canonicalFile,
+        relativePath: "ssh-keys/\(baseName)",
+        sidecarPath: canonicalFile + ProtectedFileSidecar.suffix,
+        key: ProtectedFileImportPlanner.storeKey(forRelativePath: canonicalFile),
+        data: data,
+        // If this ordinary blob is ever restored through another delivery path,
+        // do not carry forward an accidentally permissive private-key mode.
+        mode: 0o600,
+        info: info
     )
 }
 
@@ -500,6 +688,48 @@ private func writeFileAtomically(
     }
     guard renamed == 0 else { throw ProtectError(message: "the sidecar could not replace the file") }
     keepTemporary = false
+}
+
+private func writePublicKeyIfMissing(path: String, data: Data) throws {
+    let fd = path.withCString {
+        open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)
+    }
+    if fd < 0, errno == EEXIST { return }
+    guard fd >= 0 else { throw ProtectError(message: "the public key could not be created") }
+    var complete = false
+    defer {
+        close(fd)
+        if !complete { path.withCString { _ = unlink($0) } }
+    }
+    var offset = 0
+    try data.withUnsafeBytes { raw in
+        while offset < raw.count {
+            let count = Darwin.write(fd, raw.baseAddress!.advanced(by: offset), raw.count - offset)
+            if count < 0, errno == EINTR { continue }
+            guard count > 0 else { throw ProtectError(message: "the public key could not be written") }
+            offset += count
+        }
+    }
+    guard fchmod(fd, 0o644) == 0, fsync(fd) == 0 else {
+        throw ProtectError(message: "the public key could not be persisted")
+    }
+    complete = true
+}
+
+/// Do not unlink a path that changed while the human was reviewing the import.
+/// A concurrent replacement remains plaintext, but is never accidentally lost.
+private func unlinkIfUnchanged(_ item: ProtectPlannedFile) -> Bool {
+    var current = stat()
+    guard item.originalPath.withCString({ lstat($0, &current) }) == 0,
+          (current.st_mode & S_IFMT) == S_IFREG,
+          current.st_dev == item.info.st_dev,
+          current.st_ino == item.info.st_ino,
+          current.st_size == item.info.st_size,
+          current.st_mtimespec.tv_sec == item.info.st_mtimespec.tv_sec,
+          current.st_mtimespec.tv_nsec == item.info.st_mtimespec.tv_nsec else {
+        return false
+    }
+    return item.originalPath.withCString { unlink($0) } == 0
 }
 
 /// Canonicalize an existing path via realpath(3), resolving symlinks and `..`.

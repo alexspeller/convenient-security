@@ -7,6 +7,8 @@ public actor Agent {
         let callerPID: pid_t
         let callerStartTime: UInt64
         let expiresAt: Date
+        let store: NativeStoreName
+        let mode: NativeStoreEditorMode
     }
 
     private struct RedactionCaller: Sendable {
@@ -50,6 +52,7 @@ public actor Agent {
     private let consent: ConsentProvider
     private let policyReview: PolicyReviewProvider
     private let nativeStore: NativeEncryptedFileProvider?
+    private let sshSigningService: SSHSigningService?
     private let allowLegacyAccessForTesting: Bool
     private let allowUnverifiedPlansForTesting: Bool
     private var activeSecrets = ActiveSecretRegistry()
@@ -63,6 +66,7 @@ public actor Agent {
         consent: ConsentProvider,
         policyReview: PolicyReviewProvider,
         nativeStore: NativeEncryptedFileProvider? = nil,
+        sshSigningService: SSHSigningService? = nil,
         allowLegacyAccessForTesting: Bool = false,
         allowUnverifiedPlansForTesting: Bool = false
     ) {
@@ -71,6 +75,7 @@ public actor Agent {
         self.consent = consent
         self.policyReview = policyReview
         self.nativeStore = nativeStore
+        self.sshSigningService = sshSigningService
         self.allowLegacyAccessForTesting = allowLegacyAccessForTesting
         self.allowUnverifiedPlansForTesting = allowUnverifiedPlansForTesting
     }
@@ -692,7 +697,7 @@ public actor Agent {
 
         let plannedExecutable: PlannedExecutable
         switch request.mode {
-        case .builtInMemory, .onboardingImport:
+        case .builtInMemory, .onboardingImport, .sshKeyImport:
             guard let executablePath = ProcessAncestry.executablePath(of: caller.pid) else {
                 return .failed(
                     .unverifiedPeer,
@@ -719,6 +724,8 @@ public actor Agent {
             operationContext = "built-in native-store editor"
         case .onboardingImport:
             operationContext = "explicit onboarding import into the native encrypted store"
+        case .sshKeyImport:
+            operationContext = "protect and register private SSH keys for signature-only use"
         case .externalTemporaryFile:
             operationContext = "external native-store editor using a named plaintext file"
         }
@@ -787,7 +794,9 @@ public actor Agent {
             nativeEditAuthorizations[edit.sessionID] = NativeEditAuthorization(
                 callerPID: caller.pid,
                 callerStartTime: caller.startTime,
-                expiresAt: now.addingTimeInterval(TimeInterval(decision.grantedTTLSeconds))
+                expiresAt: now.addingTimeInterval(TimeInterval(decision.grantedTTLSeconds)),
+                store: store,
+                mode: request.mode
             )
             return Response(
                 requestID: request.requestID,
@@ -862,7 +871,10 @@ public actor Agent {
               let nativeStore,
               let authorization = nativeEditAuthorizations[request.editSessionID],
               authorization.callerPID == caller.pid,
-              authorization.callerStartTime == caller.startTime else {
+              authorization.callerStartTime == caller.startTime,
+              request.sshKeyRegistrations.isEmpty || (
+                authorization.mode == .sshKeyImport && sshSigningService != nil
+              ) else {
             return .failed(
                 .invalidRequest,
                 message: "the native-store blob import request is invalid",
@@ -888,6 +900,21 @@ public actor Agent {
                 requestID: request.requestID
             )
         }
+        if !request.sshKeyRegistrations.isEmpty {
+            let expected = Set(request.blobs.compactMap {
+                try? NativeSecretReference(store: authorization.store, key: $0.key).uri
+            })
+            let requested = Set(request.sshKeyRegistrations.map(\.reference))
+            guard expected.count == request.blobs.count,
+                  requested.count == request.sshKeyRegistrations.count,
+                  requested == expected else {
+                return .failed(
+                    .invalidRequest,
+                    message: "SSH registrations must exactly match the imported canonical references",
+                    requestID: request.requestID
+                )
+            }
+        }
         guard Date() < authorization.expiresAt else {
             await nativeStore.cancelEdit(
                 sessionID: request.editSessionID,
@@ -912,10 +939,31 @@ public actor Agent {
                 callerStartTime: caller.startTime
             )
             nativeEditAuthorizations[request.editSessionID] = nil
+            var sshKeys: [SSHKeyMetadata]?
+            if !request.sshKeyRegistrations.isEmpty {
+                guard let sshSigningService else {
+                    return .failed(
+                        .sshAgentUnavailable,
+                        message: "the SSH signing service is unavailable",
+                        requestID: request.requestID
+                    )
+                }
+                do {
+                    sshKeys = try await sshSigningService.registerAlreadyAuthorized(
+                        request.sshKeyRegistrations,
+                        caller: caller
+                    )
+                } catch {
+                    // The encrypted import is already durable. Returning failure
+                    // keeps csec from writing sidecars or unlinking plaintext.
+                    return sshFailure(error, requestID: request.requestID)
+                }
+            }
             return Response(
                 requestID: request.requestID,
                 generation: result.generation,
-                secretCount: result.secretCount
+                secretCount: result.secretCount,
+                sshKeys: sshKeys
             )
         } catch {
             return nativeStoreFailure(error, requestID: request.requestID)
@@ -963,6 +1011,79 @@ public actor Agent {
             }
         }
         return Response(capabilities: ProtocolCapabilities(features: features))
+    }
+
+    public func configureSSH(
+        request: SSHKeyCatalogRequest,
+        caller: CallerInfo
+    ) async -> Response {
+        guard UUID(uuidString: request.requestID) != nil,
+              isVerifiedLauncher(caller),
+              let sshSigningService else {
+            return .failed(
+                .sshAgentUnavailable,
+                message: "the SSH signing service is unavailable",
+                requestID: request.requestID
+            )
+        }
+        do {
+            switch request.action {
+            case .list:
+                guard request.registrations.isEmpty, request.fingerprint == nil else {
+                    throw SSHProtectionError.malformedMessage
+                }
+                return Response(
+                    requestID: request.requestID,
+                    sshKeys: try await sshSigningService.listedSSHKeys()
+                )
+            case .register:
+                guard request.fingerprint == nil else {
+                    throw SSHProtectionError.malformedMessage
+                }
+                return Response(
+                    requestID: request.requestID,
+                    sshKeys: try await sshSigningService.register(
+                        request.registrations,
+                        caller: caller
+                    )
+                )
+            case .remove:
+                guard request.registrations.isEmpty,
+                      let fingerprint = request.fingerprint else {
+                    throw SSHProtectionError.malformedMessage
+                }
+                guard try await sshSigningService.remove(
+                    fingerprint: fingerprint,
+                    caller: caller
+                ) else { throw SSHProtectionError.keyNotRegistered }
+                return Response(
+                    requestID: request.requestID,
+                    sshKeys: try await sshSigningService.listedSSHKeys()
+                )
+            }
+        } catch {
+            return sshFailure(error, requestID: request.requestID)
+        }
+    }
+
+    private func sshFailure(_ error: Error, requestID: String) -> Response {
+        guard let error = error as? SSHProtectionError else {
+            return .failed(
+                .internalError,
+                message: "the SSH signing operation failed",
+                requestID: requestID
+            )
+        }
+        switch error {
+        case .authorizationDenied:
+            return .failed(.consentDenied, message: error.localizedDescription, requestID: requestID)
+        case .providerResolutionFailed:
+            return .failed(.resolutionFailed, message: error.localizedDescription, requestID: requestID)
+        case .catalogUnavailable:
+            return .failed(.sshAgentUnavailable, message: error.localizedDescription, requestID: requestID)
+        default:
+            return .failed(.invalidSSHKey, message: error.localizedDescription, requestID: requestID)
+        }
     }
 
     /// Batched host remediation: run the audit, present the fixable set as a
@@ -1251,7 +1372,7 @@ public actor Agent {
         _ request: BeginNativeStoreEditRequest
     ) -> Bool {
         switch request.mode {
-        case .builtInMemory, .onboardingImport:
+        case .builtInMemory, .onboardingImport, .sshKeyImport:
             return request.externalEditorPath == nil
         case .externalTemporaryFile:
             guard let path = request.externalEditorPath else { return false }

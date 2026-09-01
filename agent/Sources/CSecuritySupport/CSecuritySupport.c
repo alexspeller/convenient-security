@@ -101,6 +101,11 @@ int cs_accept(int listen_fd) {
     return fd;
 }
 
+int32_t cs_disable_core_dumps(void) {
+    struct rlimit limit = {0, 0};
+    return setrlimit(RLIMIT_CORE, &limit);
+}
+
 int32_t cs_send_frame_header_with_fds(
     int32_t fd, uint32_t body_length, const int32_t *fds, int32_t fd_count
 ) {

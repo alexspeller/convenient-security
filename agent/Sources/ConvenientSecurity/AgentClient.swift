@@ -224,6 +224,66 @@ public struct AgentClient {
         return NativeStoreEditCommit(generation: generation, secretCount: secretCount)
     }
 
+    /// One already-reviewed native import plus provider-neutral SSH catalog
+    /// registration. Private bytes travel inward in `blobs`; only public key
+    /// metadata returns.
+    public func commitNativeStoreBlobsAndRegisterSSH(
+        sessionID: String,
+        blobs: [ProtectedBlobImport],
+        registrations: [SSHKeyRegistrationIntent]
+    ) throws -> (commit: NativeStoreEditCommit, keys: [SSHKeyMetadata]) {
+        let request = CommitNativeStoreBlobsRequest(
+            editSessionID: sessionID,
+            blobs: blobs,
+            sshKeyRegistrations: registrations
+        )
+        let response = try send(.commitNativeStoreBlobs(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let generation = response.generation,
+              generation > 0,
+              let secretCount = response.secretCount,
+              secretCount == blobs.count,
+              let keys = response.sshKeys,
+              keys.count == registrations.count else {
+            throw ClientError.transportFailed
+        }
+        return (
+            NativeStoreEditCommit(generation: generation, secretCount: secretCount),
+            keys
+        )
+    }
+
+    public func listSSHKeys() throws -> [SSHKeyMetadata] {
+        try configureSSH(action: .list).sshKeys ?? []
+    }
+
+    public func registerSSHKeys(
+        _ registrations: [SSHKeyRegistrationIntent]
+    ) throws -> [SSHKeyMetadata] {
+        guard !registrations.isEmpty else { throw ClientError.transportFailed }
+        return try configureSSH(action: .register, registrations: registrations).sshKeys ?? []
+    }
+
+    public func removeSSHKey(fingerprint: String) throws -> [SSHKeyMetadata] {
+        try configureSSH(action: .remove, fingerprint: fingerprint).sshKeys ?? []
+    }
+
+    private func configureSSH(
+        action: SSHKeyCatalogAction,
+        registrations: [SSHKeyRegistrationIntent] = [],
+        fingerprint: String? = nil
+    ) throws -> Response {
+        let request = SSHKeyCatalogRequest(
+            action: action,
+            registrations: registrations,
+            fingerprint: fingerprint
+        )
+        let response = try send(.configureSSH(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard response.sshKeys != nil else { throw ClientError.transportFailed }
+        return response
+    }
+
     public func cancelNativeStoreEdit(sessionID: String) {
         let request = CancelNativeStoreEditRequest(editSessionID: sessionID)
         _ = try? send(.cancelNativeStoreEdit(request))

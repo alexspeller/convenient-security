@@ -86,6 +86,8 @@ func usage() -> Never {
       csec edit [--editor] <store>
       csec edit <reference>
       csec protect [--store <store>] [--keep-plaintext] [--dry-run] <path>…
+      csec protect --ssh [--store <store>] [--keep-plaintext] [--dry-run]
+                   <private-key>…
       csec protect --env [--store <store> | --dest <csec://STORE|op://VAULT[/ITEM]>]
                    [--dry-run] <file>
       csec setup [--apply] [--agent claude|codex]… [--skip-agents]
@@ -95,6 +97,9 @@ func usage() -> Never {
                  [--replace-secret] [--no-audit-prompt]
       csec audit [--report-only] [--json] [--attest] [--scan-filesystem]
       csec remote status | enable <phone-pairing-code> | disable
+      csec ssh socket | env | status | list
+      csec ssh register [--label <label>] <reference|sidecar.csec>
+      csec ssh remove <SHA256:fingerprint>
       csec install | uninstall | status
       csec root-status
 
@@ -148,6 +153,11 @@ func usage() -> Never {
                is rewritten in place with csec://-/op://-references — values are
                durable at the destination before the file is touched, and
                csec exec resolves the references at run time.
+               --ssh protects explicitly named private keys (including paths outside
+               the current project), registers only their canonical references and
+               public metadata with csecd's SSH signer, preserves existing .pub files,
+               and creates a missing .pub. One Touch ID covers the native import and
+               registration; the private key is removed only after both succeed.
     bridge     Private framed stdin/stdout protocol for language clients; not for terminals.
     tool-exec  Fail-closed AI command broker using csecd's active-value scanner.
     hook       PreToolUse stdin/stdout adapter for Claude Code or Codex.
@@ -182,6 +192,12 @@ func usage() -> Never {
                sides are paired, the local and phone prompts race; the first
                authenticated decision wins. `disable` removes the pin under
                local Touch ID. Pairing codes contain no credential values.
+    ssh        Manage the backend-neutral SSH key catalog and print the manual agent
+               socket. `register` accepts csec://, op://, future provider references,
+               or an ordinary .csec sidecar. Use `export SSH_AUTH_SOCK="$(csec ssh
+               socket)"`; signing is limited to Apple /usr/bin/ssh, a verified
+               non-forwarded destination session, SSH user-auth payloads, and bounded
+               host-key + remote-user + process-subtree grants.
     install    Register csecd as a login-item LaunchAgent so it runs in the background.
     uninstall  Unregister the csecd LaunchAgent.
     status     Show whether the csecd LaunchAgent is registered/enabled.
@@ -226,6 +242,8 @@ case "audit":
     runAudit(Array(arguments.dropFirst()))
 case "remote":
     runRemote(Array(arguments.dropFirst()))
+case "ssh":
+    runSSH(Array(arguments.dropFirst()))
 case "install":
     runInstall()
 case "uninstall":

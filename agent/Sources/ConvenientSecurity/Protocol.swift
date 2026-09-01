@@ -47,6 +47,8 @@ public enum WireErrorCode: String, Codable, Sendable {
     case providerUnavailable = "provider_unavailable"
     case resolutionFailed = "resolution_failed"
     case nativeStoreUnavailable = "native_store_unavailable"
+    case sshAgentUnavailable = "ssh_agent_unavailable"
+    case invalidSSHKey = "invalid_ssh_key"
     case invalidStoreDocument = "invalid_store_document"
     case editSessionExpired = "edit_session_expired"
     case editConflict = "edit_conflict"
@@ -207,6 +209,7 @@ public struct EndOutputRedactionRequest: Codable, Sendable {
 public enum NativeStoreEditorMode: String, Codable, Sendable, CaseIterable {
     case builtInMemory = "built_in_memory"
     case onboardingImport = "onboarding_import"
+    case sshKeyImport = "ssh_key_import"
     case externalTemporaryFile = "external_temporary_file"
 }
 
@@ -274,11 +277,20 @@ public struct CommitNativeStoreBlobsRequest: Codable, Sendable {
     public let requestID: String
     public let editSessionID: String
     public let blobs: [ProtectedBlobImport]
+    /// Canonical provider-neutral references to register after this already-
+    /// authorized import. Non-empty only for explicit `csec protect --ssh`.
+    public let sshKeyRegistrations: [SSHKeyRegistrationIntent]
 
-    public init(editSessionID: String, blobs: [ProtectedBlobImport], requestID: UUID = UUID()) {
+    public init(
+        editSessionID: String,
+        blobs: [ProtectedBlobImport],
+        sshKeyRegistrations: [SSHKeyRegistrationIntent] = [],
+        requestID: UUID = UUID()
+    ) {
         self.requestID = requestID.uuidString.lowercased()
         self.editSessionID = editSessionID
         self.blobs = blobs
+        self.sshKeyRegistrations = sshKeyRegistrations
     }
 }
 
@@ -349,6 +361,7 @@ public enum Request: Sendable {
     case hostRemediate(HostRemediationRequest)
     case hostRecordTriage(HostTriageRequest)
     case configureRemoteApproval(RemoteApprovalConfigurationRequest)
+    case configureSSH(SSHKeyCatalogRequest)
 }
 
 extension Request: Codable {
@@ -356,11 +369,11 @@ extension Request: Codable {
         case version, type, requestID, references, reason, ttlSeconds
         case deliveryPlan, deliveryPlanDigest
         case destination, streams, includeShortValues, labelStyle, sessionID, stream, data, finish
-        case store, editSessionID, document, mode, externalEditorPath, blobs
+        case store, editSessionID, document, mode, externalEditorPath, blobs, sshKeyRegistrations
         case protectedLaunchApproval
         case scanFilesystem, selectedKeys, jobID
         case exemptions, todos, cleared
-        case action, phonePairingCode
+        case action, phonePairingCode, registrations, fingerprint
     }
 
     public init(from decoder: Decoder) throws {
@@ -443,6 +456,10 @@ extension Request: Codable {
             self = .commitNativeStoreBlobs(CommitNativeStoreBlobsRequest(
                 editSessionID: try container.decode(String.self, forKey: .editSessionID),
                 blobs: try container.decode([ProtectedBlobImport].self, forKey: .blobs),
+                sshKeyRegistrations: try container.decodeIfPresent(
+                    [SSHKeyRegistrationIntent].self,
+                    forKey: .sshKeyRegistrations
+                ) ?? [],
                 requestID: try Self.decodeUUID(container, forKey: .requestID)
             ))
         case "cancel_native_store_edit":
@@ -514,6 +531,16 @@ extension Request: Codable {
                 phonePairingCode: phonePairingCode,
                 requestID: try Self.decodeUUID(container, forKey: .requestID)
             ))
+        case "configure_ssh":
+            self = .configureSSH(SSHKeyCatalogRequest(
+                action: try container.decode(SSHKeyCatalogAction.self, forKey: .action),
+                registrations: try container.decodeIfPresent(
+                    [SSHKeyRegistrationIntent].self,
+                    forKey: .registrations
+                ) ?? [],
+                fingerprint: try container.decodeIfPresent(String.self, forKey: .fingerprint),
+                requestID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: container, debugDescription: "unknown request type"
@@ -583,6 +610,7 @@ extension Request: Codable {
             try container.encode(request.requestID, forKey: .requestID)
             try container.encode(request.editSessionID, forKey: .editSessionID)
             try container.encode(request.blobs, forKey: .blobs)
+            try container.encode(request.sshKeyRegistrations, forKey: .sshKeyRegistrations)
         case let .cancelNativeStoreEdit(request):
             try container.encode("cancel_native_store_edit", forKey: .type)
             try container.encode(WireProtocol.version, forKey: .version)
@@ -630,6 +658,13 @@ extension Request: Codable {
                 request.phonePairingCode,
                 forKey: .phonePairingCode
             )
+        case let .configureSSH(request):
+            try container.encode("configure_ssh", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.action, forKey: .action)
+            try container.encode(request.registrations, forKey: .registrations)
+            try container.encodeIfPresent(request.fingerprint, forKey: .fingerprint)
         }
     }
 
@@ -676,6 +711,7 @@ public struct Response: Codable, Sendable {
     public let hostRemediation: HostRemediationSummary?
     public let remoteApprovalStatus: RemoteApprovalConfigurationStatus?
     public let remoteApprovalMacPairingCode: String?
+    public let sshKeys: [SSHKeyMetadata]?
     public let failure: ProtocolFailure?
     public let error: String?
 
@@ -702,6 +738,7 @@ public struct Response: Codable, Sendable {
         hostRemediation: HostRemediationSummary? = nil,
         remoteApprovalStatus: RemoteApprovalConfigurationStatus? = nil,
         remoteApprovalMacPairingCode: String? = nil,
+        sshKeys: [SSHKeyMetadata]? = nil,
         failure: ProtocolFailure? = nil,
         error: String? = nil
     ) {
@@ -727,6 +764,7 @@ public struct Response: Codable, Sendable {
         self.hostRemediation = hostRemediation
         self.remoteApprovalStatus = remoteApprovalStatus
         self.remoteApprovalMacPairingCode = remoteApprovalMacPairingCode
+        self.sshKeys = sshKeys
         self.failure = failure
         self.error = error
     }

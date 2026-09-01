@@ -3613,6 +3613,7 @@ envSelectModelTests()
 secretDestinationSpecTests()
 onePasswordItemWriteTests()
 await remoteApprovalTests()
+await sshProtectionTests()
 
 if failures == 0 {
     print("\nAll checks passed.")
