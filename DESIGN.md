@@ -67,6 +67,36 @@ principle is catalogued in [`docs/host-audit-catalog.md`](docs/host-audit-catalo
   bridge` binary and receive framed values through a private pipe. They do not
   connect to the agent socket themselves.
 
+## Backend-agnostic storage and delivery
+
+Storage selection is orthogonal to authorization, policy, and delivery. Every
+consumer operates on a canonical `SecretRef`; only `SecretResolver` dispatches
+that reference to the `SecretProvider` registered for its scheme. `csec://`,
+`op://`, and future schemes are peers at this boundary. No delivery adapter may
+depend on native-store records, 1Password internals, or any other provider-
+specific representation.
+
+Provider-specific code is allowed at the storage edge: importing or updating a
+value necessarily uses a destination's write API, and not every provider must
+support writes. That capability must not leak into later use. A value written by
+one import adapter, or created externally and named by an existing reference,
+is consumed through the same authorization and delivery path as every other
+backend.
+
+Persistent plans, grants, sidecars, and adapter catalogs therefore contain the
+canonical reference plus bounded value-free metadata, never a provider-private
+record identifier. Resolution happens only after the complete request passes
+policy and consent, and the plaintext remains inside the narrow delivery
+implementation. Adding a provider must not require changes to SSH signing,
+credential helpers, process launchers, or other consumers.
+
+For example, an SSH-agent catalog records a secret reference together with the
+derived public key and fingerprint. A signing request resolves the reference
+through `SecretResolver` after approval, validates that the resolved private key
+still matches the catalogued public identity, and returns only the signature.
+The signing service does not know or care whether the reference is backed by
+the native encrypted store, 1Password, or a future provider.
+
 ## Authenticated agent socket
 
 The agent listens on an `AF_UNIX` socket inside a per-user `0700` temporary
