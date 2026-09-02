@@ -216,6 +216,47 @@ public struct DeliveryPlan: Codable, Sendable, Equatable {
         return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Everything about a release *except* which command performs it.
+    private struct ReleaseShape: Encodable {
+        let mechanism: DeliveryMechanism
+        let descendantScope: DescendantScope
+        let destination: DestinationClass
+        let recipientAssurance: RecipientAssurance?
+        let outputGuard: OutputGuardPlan?
+        let interactive: Bool
+        let plaintextExposureAcknowledged: Bool
+    }
+
+    /// Digest of the exposure shape of a release, used as the reuse key for a
+    /// grant the human deliberately widened past the requesting command.
+    ///
+    /// It deliberately omits `executable`, `requestingExecutable`, `root`,
+    /// `requestedTTLSeconds`, `operationContext`, and `commandDigest`: a widened
+    /// scope means "anything this subtree runs", so binding the exact command
+    /// would defeat it. It retains every field that decides how much plaintext
+    /// exposure the human accepted, so an approved sealed/fd/credential-protocol
+    /// release can never be silently reused as a raw-plaintext one.
+    ///
+    /// The digest is domain-separated from `digest()` so the two values can
+    /// never be compared or substituted for one another.
+    public func releaseShapeDigest() throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let bytes = try encoder.encode(ReleaseShape(
+            mechanism: mechanism,
+            descendantScope: descendantScope,
+            destination: destination,
+            recipientAssurance: recipientAssurance,
+            outputGuard: outputGuard,
+            interactive: interactive,
+            plaintextExposureAcknowledged: plaintextExposureAcknowledged
+        ))
+        var hasher = SHA256()
+        hasher.update(data: Data("csec-release-shape-v1".utf8))
+        hasher.update(data: bytes)
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
     public static func directHeap(
         executablePath: String,
         root: DeliveryRoot = .caller,

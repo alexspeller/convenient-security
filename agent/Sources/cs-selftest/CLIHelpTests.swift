@@ -7,18 +7,18 @@ import Foundation
 // `switch command` in csec/main.swift, and a drift in either direction fails.
 
 func cliHelpTests() {
-    // The 22 commands the launcher dispatches (csec/main.swift `switch command`).
+    // The 24 commands the launcher dispatches (csec/main.swift `switch command`).
     let dispatched: Set<String> = [
         "get", "exec", "session", "creds", "exec-fd", "exec-file", "bridge",
         "tool-exec", "hook", "hook-config", "edit", "protect", "setup", "audit",
-        "remote", "ssh", "automation", "install", "uninstall", "status", "doctor",
-        "root-status",
+        "remote", "ssh", "automation", "grants", "revoke", "install", "uninstall",
+        "status", "doctor", "root-status",
     ]
     let cataloged = Set(CLICatalog.commands.map(\.name))
     check(cataloged == dispatched,
           "the help catalog has exactly one entry per dispatched command")
-    check(CLICatalog.commands.count == 22,
-          "the catalog has all 22 commands")
+    check(CLICatalog.commands.count == 24,
+          "the catalog has all 24 commands")
     for name in dispatched {
         check(CLICatalog.command(named: name) != nil,
               "catalog lookup finds dispatched command '\(name)'")

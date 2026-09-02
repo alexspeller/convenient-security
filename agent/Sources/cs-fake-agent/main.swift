@@ -55,6 +55,8 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.configureSSH(request: request, caller: caller)
     case let .configureAutomation(request):
         return await agent.configureAutomation(request: request, caller: caller)
+    case let .grants(request):
+      return await agent.handleGrants(request: request, caller: caller)
     case let .beginSession(begin):
         return await agent.beginSession(request: begin, caller: caller)
     case let .beginOutputRedaction(begin):

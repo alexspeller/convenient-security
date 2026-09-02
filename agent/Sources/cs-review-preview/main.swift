@@ -10,7 +10,7 @@ import Foundation
 //
 // Usage: cs-review-preview <scenario> <output.png> [light|dark]
 //   scenarios: basic | warning | unknown | file | mixed | automation
-//              account | ambiguous-account
+//              account | ambiguous-account | scope
 //   CSEC_PREVIEW_EXPAND=1 opens progressive-disclosure details before capture.
 
 func fail(_ message: String) -> Never {
@@ -19,7 +19,7 @@ func fail(_ message: String) -> Never {
 }
 
 guard (3...4).contains(CommandLine.arguments.count) else {
-    fail("usage: cs-review-preview <basic|warning|unknown|file|mixed|automation|account|ambiguous-account> <output.png> [light|dark]")
+    fail("usage: cs-review-preview <basic|warning|unknown|file|mixed|automation|account|ambiguous-account|scope> <output.png> [light|dark]")
 }
 let scenario = CommandLine.arguments[1]
 let outputPath = CommandLine.arguments[2]
@@ -207,6 +207,56 @@ case "automation":
         ),
         credentials: [credential(references: [reference])],
         automation: AutomationReviewDetails(job: job)
+    )
+case "scope":
+    // The measured coding-agent shape: a `csec exec` under a per-tool-call shell
+    // under Claude Code under an interactive fish session.
+    review = AccessPolicyReview(
+        caller: CallerInfo(
+            pid: 65060,
+            startTime: 999_999,
+            // Production omits a "(grant root pid …)" suffix when the scope
+            // selector is shown; the selector states the root instead.
+            description: "csec [verified] for rails [unverified]"
+        ),
+        reason: "csec exec rails db:migrate",
+        plan: DeliveryPlan(
+            mechanism: .unrestrictedInitialEnvironment,
+            executable: PlannedExecutable(
+                canonicalPath: "/Users/dev/project/bin/rails",
+                assurance: .unverified
+            ),
+            root: .caller,
+            descendantScope: .subtree,
+            destination: .localDevelopment,
+            requestedTTLSeconds: 12 * 3600,
+            operationContext: "csec exec rails",
+            outputGuard: OutputGuardPlan(mode: .tty)
+        ),
+        credentials: [credential(references: [
+            ref("op://Engineering/Postgres/url"),
+            ref("op://Engineering/Postgres/password"),
+        ])],
+        scopeChoices: GrantScopeChoices(
+            options: [
+                GrantScopeOption(
+                    kind: .requestingCommand, pid: 65060,
+                    startTime: 999_999, processLabel: "rails"
+                ),
+                GrantScopeOption(
+                    kind: .codingAgent, pid: 31163,
+                    startTime: 999_997, processLabel: "Claude Code"
+                ),
+                GrantScopeOption(
+                    kind: .terminalSession, pid: 2589,
+                    startTime: 999_996, processLabel: "fish"
+                ),
+            ],
+            defaultOptionID: GrantScopeOption(
+                kind: .codingAgent, pid: 31163,
+                startTime: 999_997, processLabel: "Claude Code"
+            ).id
+        )
     )
 case "account":
     review = AccessPolicyReview(

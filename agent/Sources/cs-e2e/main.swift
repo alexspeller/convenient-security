@@ -246,6 +246,22 @@ let automationService = AutomationService(
     consent: consent,
     policyReview: policyReview
 )
+/// This suite asserts how *plan roots* behave — per-invocation roots, verified
+/// direct parents, registered sessions — so grant-scope discovery is pinned to
+/// "offer nothing wider". Otherwise the results would depend on whatever tree the
+/// suite happens to run under: launched from a coding agent or an interactive
+/// terminal, csecd would legitimately default to a wider root and those
+/// per-invocation assertions would describe the harness, not the code. Ancestry
+/// and start times stay live, so every kernel check remains real; only the two
+/// signals that *nominate* a wider root are suppressed. The widened path has its
+/// own coverage in cs-selftest (`grantScopeAgentWiringTests`).
+let narrowScopeInspection = ProcessInspection(
+    startTime: { ProcessAncestry.startTime(of: $0) },
+    parent: { ProcessAncestry.parent(of: $0) },
+    name: { _ in nil },
+    executablePath: { _ in nil },
+    hasControllingTerminal: { _ in false }
+)
 let agent = Agent(
     resolver: resolver,
     grants: grants,
@@ -255,7 +271,8 @@ let agent = Agent(
     sshSigningService: sshSigningService,
     automationService: automationService,
     allowUnverifiedPlansForTesting: true,
-    allowUnverifiedAutomationCallersForTesting: true
+    allowUnverifiedAutomationCallersForTesting: true,
+    processInspection: narrowScopeInspection
 )
 
 let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedForTesting) { request, caller in
@@ -284,6 +301,8 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         return await agent.configureSSH(request: request, caller: caller)
     case let .configureAutomation(request):
         return await agent.configureAutomation(request: request, caller: caller)
+    case let .grants(request):
+        return await agent.handleGrants(request: request, caller: caller)
     case let .beginSession(begin):
         return await agent.beginSession(request: begin, caller: caller)
     case let .beginOutputRedaction(begin):
@@ -1601,6 +1620,21 @@ do {
           "protect --env without a TTY fails with a clear message")
     check((try? Data(contentsOf: URL(fileURLWithPath: envPath))) == fixtureData,
           "protect --env without a TTY leaves the file byte-identical")
+
+    // Values stay hidden by default but an explicit `v` reveals every
+    // importable candidate long enough to compare before another key action.
+    let revealed = runCsecInPTYAt(
+        cwd: projectDir, ["protect", "--env", "--store", store, ".envrc"],
+        keystrokes: "vq"
+    )
+    check(revealed.status == 1
+          && revealed.out.contains("xoxb-e2e-1234567890abcdef")
+          && revealed.out.contains("quoted-secret-value")
+          && revealed.out.contains("commented-out-password")
+          && revealed.out.contains("Values visible"),
+          "protect --env reveals candidate values only after the picker shortcut")
+    check((try? Data(contentsOf: URL(fileURLWithPath: envPath))) == fixtureData,
+          "revealing then cancelling leaves the env file byte-identical")
 
     // Cancelling the picker changes nothing.
     let cancelled = runCsecInPTYAt(
@@ -2994,6 +3028,56 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
 } else {
     check(false, "built csec binary is present at \(csecURL.path)")
 }
+
+// `csec grants` / `csec revoke` over the real socket. Everything runs inside
+// one registered session so the grant's root process is still alive while it
+// is listed and revoked.
+let grantsScript = "\"$1\" creds aws "
+    + "--access-key-id-ref op://secure-delivery/aws/access-key-id "
+    + "--secret-access-key-ref op://secure-delivery/aws/secret-access-key "
+    + "--session-token-ref op://secure-delivery/aws/session-token --for 60 | /bin/cat >/dev/null; "
+    + "\"$1\" creds aws "
+    + "--access-key-id-ref op://secure-delivery/aws/access-key-id "
+    + "--secret-access-key-ref op://secure-delivery/aws/secret-access-key "
+    + "--session-token-ref op://secure-delivery/aws/session-token --for 60 | /bin/cat >/dev/null; "
+    + "/usr/bin/printf 'LISTED\\n'; \"$1\" grants; "
+    + "\"$1\" revoke --all; "
+    + "/usr/bin/printf 'AFTER\\n'; \"$1\" grants; "
+    + "\"$1\" creds aws "
+    + "--access-key-id-ref op://secure-delivery/aws/access-key-id "
+    + "--secret-access-key-ref op://secure-delivery/aws/secret-access-key "
+    + "--session-token-ref op://secure-delivery/aws/session-token --for 60 | /bin/cat >/dev/null"
+let consentBeforeGrantsCLI = await consent.calls()
+let grantsCLI = runCsec(
+    ["session", "--", "/bin/sh", "-c", grantsScript, "csec-grants-e2e", csecURL.path],
+    extraEnv: [:]
+)
+let consentAfterGrantsCLI = await consent.calls()
+let listedSection = grantsCLI.out
+    .components(separatedBy: "LISTED\n").last?
+    .components(separatedBy: "AFTER\n").first ?? ""
+let afterSection = grantsCLI.out.components(separatedBy: "AFTER\n").last ?? ""
+check(grantsCLI.status == 0
+      && listedSection.contains("op://secure-delivery/aws/access-key-id")
+      && listedSection.contains("root:")
+      && listedSection.contains("expires:")
+      && !grantsCLI.out.contains("aws-csec-synthetic-secret")
+      && !grantsCLI.out.contains("aws-csec-synthetic-session"),
+      "csec grants lists a live grant's references, root, and expiry but never a value")
+check(grantsCLI.out.contains("csec: revoked ")
+      && afterSection.contains("no live grants")
+      && consentAfterGrantsCLI == consentBeforeGrantsCLI + 2,
+      "csec revoke --all drops the live grant so the next access prompts again")
+
+let revokeUnknown = runCsec(["revoke", "deadbeef"], extraEnv: [:])
+check(revokeUnknown.status == 1 && revokeUnknown.err.contains("no live grant matches"),
+      "revoking an unknown grant id fails rather than silently succeeding")
+let revokeEmptyAll = runCsec(["revoke", "--all"], extraEnv: [:])
+check(revokeEmptyAll.status == 0,
+      "revoke --all is idempotent when nothing is left to revoke")
+let revokeUsage = runCsec(["revoke"], extraEnv: [:])
+check(revokeUsage.status != 0,
+      "csec revoke requires either a grant id or --all")
 
 unlink(socketPath)
 unlink(sshSocketPath)

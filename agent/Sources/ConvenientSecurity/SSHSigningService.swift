@@ -11,71 +11,6 @@ public protocol SSHAgentKeyProvider: Sendable {
     ) async throws -> Data
 }
 
-/// Value-free process metadata used to bind SSH grants to live process trees.
-/// Production always uses the kernel-backed `live` implementation. The
-/// injectable form keeps session-root selection deterministic in synthetic
-/// tests without weakening the release caller checks.
-public struct SSHProcessInspection: Sendable {
-    private let startTimeLookup: @Sendable (pid_t) -> UInt64?
-    private let parentLookup: @Sendable (pid_t) -> pid_t?
-    private let nameLookup: @Sendable (pid_t) -> String?
-    private let executablePathLookup: @Sendable (pid_t) -> String?
-
-    public init(
-        startTime: @escaping @Sendable (pid_t) -> UInt64?,
-        parent: @escaping @Sendable (pid_t) -> pid_t?,
-        name: @escaping @Sendable (pid_t) -> String?,
-        executablePath: @escaping @Sendable (pid_t) -> String?
-    ) {
-        startTimeLookup = startTime
-        parentLookup = parent
-        nameLookup = name
-        executablePathLookup = executablePath
-    }
-
-    public static let live = SSHProcessInspection(
-        startTime: { ProcessAncestry.startTime(of: $0) },
-        parent: { ProcessAncestry.parent(of: $0) },
-        name: { ProcessAncestry.name(of: $0) },
-        executablePath: { ProcessAncestry.executablePath(of: $0) }
-    )
-
-    fileprivate func startTime(of pid: pid_t) -> UInt64? {
-        startTimeLookup(pid)
-    }
-
-    fileprivate func parent(of pid: pid_t) -> pid_t? {
-        parentLookup(pid)
-    }
-
-    fileprivate func name(of pid: pid_t) -> String? {
-        nameLookup(pid)
-    }
-
-    fileprivate func executablePath(of pid: pid_t) -> String? {
-        executablePathLookup(pid)
-    }
-
-    fileprivate func descends(
-        _ pid: pid_t,
-        from root: pid_t,
-        rootStartTime: UInt64
-    ) -> Bool {
-        guard startTime(of: root) == rootStartTime else { return false }
-
-        var current = pid
-        var hops = 0
-        while hops < 128 {
-            if current == root { return true }
-            if current <= 1 { return false }
-            guard let next = parent(of: current), next != current else { return false }
-            current = next
-            hops += 1
-        }
-        return false
-    }
-}
-
 /// Provider-neutral SSH consumer. Catalog entries retain only SecretRef URIs and
 /// public metadata. Private key bytes enter this actor only after a complete,
 /// destination-bound request is authorized, and leave only as an SSH signature.
@@ -96,7 +31,7 @@ public actor SSHSigningService: SSHAgentKeyProvider {
             authentication: SSHBoundUserAuthentication,
             caller: CallerInfo,
             now: Date,
-            processInspection: SSHProcessInspection
+            processInspection: ProcessInspection
         ) -> Bool {
             guard now < expiresAt,
                   key.fingerprint == fingerprint,
@@ -125,7 +60,7 @@ public actor SSHSigningService: SSHAgentKeyProvider {
     private let consent: any ConsentProvider
     private let policyReview: any PolicyReviewProvider
     private let allowUnverifiedCallersForTesting: Bool
-    private let processInspection: SSHProcessInspection
+    private let processInspection: ProcessInspection
     private var grants: [Grant] = []
 
     public init(
@@ -134,7 +69,7 @@ public actor SSHSigningService: SSHAgentKeyProvider {
         consent: any ConsentProvider,
         policyReview: any PolicyReviewProvider,
         allowUnverifiedCallersForTesting: Bool = false,
-        processInspection: SSHProcessInspection = .live
+        processInspection: ProcessInspection = .live
     ) {
         self.resolver = resolver
         self.catalog = catalog
@@ -481,7 +416,7 @@ public actor SSHSigningService: SSHAgentKeyProvider {
                 return nil
             }
 
-            if Self.codingAgentClient(name: name, executablePath: executablePath) != nil,
+            if CodingAgentIdentity.client(name: name, executablePath: executablePath) != nil,
                processInspection.descends(
                  sshPID, from: candidate, rootStartTime: startTime
                ) {
@@ -492,27 +427,6 @@ public actor SSHSigningService: SSHAgentKeyProvider {
             candidate = parent
         }
         return nil
-    }
-
-    private static func codingAgentClient(
-        name: String?,
-        executablePath: String?
-    ) -> AICommandHookClient? {
-        if let name, let client = AICommandHookClient(rawValue: name) { return client }
-        guard let executablePath, executablePath.hasPrefix("/") else { return nil }
-
-        let basename = (executablePath as NSString).lastPathComponent
-        if let client = AICommandHookClient(rawValue: basename) { return client }
-
-        // Anthropic's native installer currently execs a version-named binary,
-        // so proc_name and the basename are both the version. Match only its
-        // dedicated CLI versions directory; do not collapse Claude.app or an
-        // arbitrary process whose argv happens to call itself "claude".
-        let marker = "/.local/share/claude/versions/"
-        guard !executablePath.contains(".app/Contents/"),
-              let markerRange = executablePath.range(of: marker) else { return nil }
-        let version = executablePath[markerRange.upperBound...]
-        return !version.isEmpty && !version.contains("/") ? .claude : nil
     }
 
     private func pruneGrants(now: Date) {
@@ -562,10 +476,11 @@ public actor SSHSigningService: SSHAgentKeyProvider {
         let processName = processInspection.name(of: root.pid)
         let executablePath = processInspection.executablePath(of: root.pid)
         let rootName: String
-        switch Self.codingAgentClient(name: processName, executablePath: executablePath) {
-        case .claude: rootName = "Claude Code"
-        case .codex: rootName = "Codex"
-        case nil:
+        if let client = CodingAgentIdentity.client(
+            name: processName, executablePath: executablePath
+        ) {
+            rootName = CodingAgentIdentity.displayName(client)
+        } else {
             rootName = ReviewDisplay.sanitized(processName ?? "requesting process")
         }
         return "Apple SSH [verified] (pid \(caller.pid)); grant root \(rootName) (pid \(root.pid))"

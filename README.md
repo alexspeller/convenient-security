@@ -285,13 +285,11 @@ BUGSNAG_TOKEN='csec://development/BUGSNAG_TOKEN' \
   swift run csec exec -- bin/rails server
 ```
 
-One Touch ID prompt covers `rails` and every process it spawns for the grant's
-lifetime. Because this delivery is readable by unrelated same-UID processes, it
-is allowed for low-risk credentials and requires a separate, time-bounded
-compatibility acceptance for standard-risk credentials. High and critical
-remain unavailable to this generic launcher because its complete environment
-consumer is unverified, rather than merely because the channel is a
-compatibility mechanism.
+One Touch ID prompt covers `rails` and every process it spawns. By default it
+also covers the rest of the process tree you are working in — see
+[grant scope](#choosing-how-wide-a-grant-is) — so a coding agent or a terminal
+session does not re-prompt for every command. This delivery is readable by
+unrelated same-UID processes, and the review window says so before you tap.
 
 ### Secure no-root delivery
 
@@ -409,9 +407,44 @@ The first access to a credential opens a trusted, value-free review in `csecd`:
 it shows the references, where the value is going, and a warning if that
 destination is same-user-inspectable — then a single Touch ID authorizes it.
 There is no risk classification and no separate compatibility checkbox; the tap
-is the decision. One approval covers the requesting shell and its descendants for
-up to 12 hours (override with `--for`, capped at 24h), so a loop of `csec get` in
-the same terminal does not re-prompt.
+is the decision. One approval lasts up to 12 hours (override with `--for`, capped
+at 24h).
+
+#### Choosing how wide a grant is
+
+The same window asks *which process tree* the approval covers. `csecd` walks the
+kernel process ancestry above the request itself and offers up to three roots:
+
+```
+Grant scope
+  ( ) Requesting process only     csec (pid 65060) and its descendants — this command only
+  (•) Claude Code and everything it runs   Claude Code (pid 31163)
+  ( ) This terminal session       fish (pid 2589) — everything started in this terminal
+```
+
+The default is the coding agent if one is running the command, else the terminal
+session, else just the requesting process. The pre-selected default means the
+usual flow is still a single tap; pick a different row before you touch the
+sensor to narrow or widen it.
+
+Choosing a wider root also lets *other commands* in that tree reuse the grant.
+That is the point: an agent's next tool call is a different command, so a grant
+bound to one command line would re-prompt constantly. Reuse still requires the
+same delivery shape — mechanism, destination, recipient, output guard, and the
+plaintext-exposure gate — so an approved `csec exec` can never be reused as a
+`csec get --reveal`, a new reference still prompts for the delta, and the caller
+must still descend from that exact live process.
+
+Live grants are visible and cancellable:
+
+```sh
+csec grants          # root process, references, expiry, and reuse for each grant
+csec revoke <id>     # drop one
+csec revoke --all    # drop all of them
+```
+
+Grants live only in `csecd`'s memory: they also disappear when their root process
+exits, when they expire, or when the agent restarts.
 
 `csec get` prints a raw value, so it is gated by where that value would land:
 

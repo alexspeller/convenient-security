@@ -28,19 +28,25 @@ public struct AccessPolicyReview: Sendable {
     /// Present only for explicit attended enrollment of a persistent unattended
     /// job. It carries value-free job metadata and is never inferred from access.
     public let automation: AutomationReviewDetails?
+    /// The grant roots csecd resolved from live kernel ancestry above this
+    /// request, with the pre-selected default. Nil when the reviewer must not
+    /// offer a choice (automation enrollment) or none could be resolved.
+    public let scopeChoices: GrantScopeChoices?
 
     public init(
         caller: CallerInfo,
         reason: String,
         plan: DeliveryPlan,
         credentials: [PolicyReviewCredential],
-        automation: AutomationReviewDetails? = nil
+        automation: AutomationReviewDetails? = nil,
+        scopeChoices: GrantScopeChoices? = nil
     ) {
         self.caller = caller
         self.reason = reason
         self.plan = plan
         self.credentials = credentials
         self.automation = automation
+        self.scopeChoices = scopeChoices
     }
 }
 
@@ -104,9 +110,18 @@ public struct AccessPolicyApproval: Sendable {
     /// unlocked by the same biometric. Injected/headless reviewers leave this
     /// nil and use the ordinary ConsentProvider instead.
     public let authenticationSession: (any AccessPolicyAuthenticationSession)?
+    /// Which `GrantScopeOption` the human had selected when the biometric
+    /// succeeded. A lookup hint only: the agent resolves it against the list it
+    /// computed itself and re-verifies ancestry, so an unknown value falls back
+    /// to the displayed default and can never widen the grant.
+    public let selectedScopeOptionID: String?
 
-    public init(authenticationSession: (any AccessPolicyAuthenticationSession)? = nil) {
+    public init(
+        authenticationSession: (any AccessPolicyAuthenticationSession)? = nil,
+        selectedScopeOptionID: String? = nil
+    ) {
         self.authenticationSession = authenticationSession
+        self.selectedScopeOptionID = selectedScopeOptionID
     }
 }
 

@@ -110,6 +110,32 @@ public struct AgentClient {
         return (schemes, response.providerStatus ?? [])
     }
 
+    /// Live grants, value-free. Bounds are re-checked here so a malformed reply
+    /// cannot reach the renderer.
+    public func listGrants() throws -> [GrantSummary] {
+        let request = GrantsRequest(action: .list)
+        let response = try send(.grants(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let grants = response.grants,
+              grants.count <= 256,
+              grants.allSatisfy(\.isWellFormed) else {
+            throw ClientError.transportFailed
+        }
+        return grants
+    }
+
+    /// Revoke one grant by id (or id prefix), or every live grant. Returns how
+    /// many were removed.
+    public func revokeGrants(grantID: String? = nil, all: Bool = false) throws -> Int {
+        let request = GrantsRequest(action: .revoke, grantID: grantID, all: all)
+        let response = try send(.grants(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let count = response.revokedGrantCount, count >= 0 else {
+            throw ClientError.transportFailed
+        }
+        return count
+    }
+
     public func capabilities() throws -> ProtocolCapabilities {
         let response = try send(.capabilities)
         if let failure = response.failure {

@@ -512,6 +512,34 @@ public enum CLICatalog {
             ],
             category: .onboarding
         ),
+        CLICommand(
+            name: "grants",
+            summary: "List the live grants csecd is holding",
+            synopsis: ["csec grants"],
+            discussion: """
+            Show every live grant: the process subtree it is rooted at, the \
+            references it covers, when it expires, and whether it is reusable by \
+            other commands in that tree. Grants live only in csecd's memory, \
+            disappear when their root process exits or csecd restarts, and are \
+            never shown with a secret value. The scope of each grant is the one \
+            picked in its Touch ID review window.
+            """,
+            category: .secrets
+        ),
+        CLICommand(
+            name: "revoke",
+            summary: "Drop a live grant before it expires",
+            synopsis: ["csec revoke <grant-id>", "csec revoke --all"],
+            discussion: """
+            Drop one grant (by the id or id prefix shown in `csec grants`) or every \
+            live grant. The next access to those references prompts again. \
+            Revocation only removes access, so it needs no Touch ID.
+            """,
+            options: [
+                CLIOption(flags: "--all", summary: "Revoke every live grant"),
+            ],
+            category: .secrets
+        ),
 
         // MARK: - Service & status
 

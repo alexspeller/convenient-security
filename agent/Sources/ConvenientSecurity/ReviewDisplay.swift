@@ -172,6 +172,37 @@ public enum ReviewDisplay {
         }
     }
 
+    /// Short title for one selectable grant scope, e.g. shown beside a radio
+    /// button. `processLabel` is already sanitized when the option is built.
+    public static func scopeTitle(_ option: GrantScopeOption) -> String {
+        switch option.kind {
+        case .requestingCommand:
+            return "Requesting process only"
+        case .codingAgent:
+            return "\(option.processLabel) and everything it runs"
+        case .terminalSession:
+            return "This terminal session"
+        }
+    }
+
+    /// The process this scope is rooted at, plus what the choice means.
+    public static func scopeDetail(_ option: GrantScopeOption) -> String {
+        switch option.kind {
+        case .requestingCommand:
+            return "\(option.processLabel) (pid \(option.pid)) and its descendants — this command only"
+        case .codingAgent:
+            return "\(option.processLabel) (pid \(option.pid)) — every command it runs, until the grant expires"
+        case .terminalSession:
+            return "\(option.processLabel) (pid \(option.pid)) — everything started in this terminal, until the grant expires"
+        }
+    }
+
+    /// One-line scope description for the Touch ID reason text, the post-approval
+    /// status line, and the mirrored phone review.
+    public static func scopeSummary(_ option: GrantScopeOption) -> String {
+        "\(scopeTitle(option)) — \(option.processLabel) (pid \(option.pid))"
+    }
+
     public static func root(_ root: DeliveryRoot) -> String {
         switch root {
         case .caller: return "Requesting launcher"

@@ -35,10 +35,18 @@
     private var statusLabel: NSTextField!
     private var denyButton: NSButton!
     private var automationDetailsView: NSView?
+    /// Radio buttons for the offered grant scopes, keyed by option id. The live
+    /// selection is authoritative: `LAAuthenticationView` is documented as
+    /// non-textual ("the reason for the authentication must be apparent from the
+    /// surrounding UI"), so this window — not the LAContext reason string — is
+    /// what the human is reading when they touch the sensor.
+    private var scopeButtons: [(id: String, button: NSButton)] = []
+    private var selectedScopeOptionID: String?
 
     private init(review: AccessPolicyReview) {
       self.review = review
       self.context = LAContext()
+      self.selectedScopeOptionID = review.scopeChoices?.defaultOptionID
       super.init()
       configureAuthentication()
       configureWindow()
@@ -148,6 +156,16 @@
         root.addArrangedSubview(makeAutomationSummary(automation, width: Self.innerWidth))
       } else {
         root.addArrangedSubview(makeDetailsGrid())
+      }
+
+      if review.automation == nil, let choices = review.scopeChoices, choices.options.count > 1 {
+        root.addArrangedSubview(Self.makeSectionLabel("Grant scope"))
+        root.setCustomSpacing(6, after: root.arrangedSubviews.last!)
+        let selector = makeScopeSelector(choices, width: Self.innerWidth)
+        root.addArrangedSubview(selector)
+        NSLayoutConstraint.activate([
+          selector.widthAnchor.constraint(equalToConstant: Self.innerWidth)
+        ])
       }
 
       if review.automation == nil {
@@ -726,6 +744,98 @@
       window.setFrameOrigin(NSPoint(x: window.frame.minX, y: previousTop - window.frame.height))
     }
 
+    // MARK: - Grant scope
+
+    /// Radio buttons for the roots csecd resolved from live kernel ancestry.
+    /// The default is pre-selected, so the one-tap path is unchanged; changing
+    /// the selection needs no re-authentication because the LAContext reason is
+    /// never displayed with an embedded `LAAuthenticationView`, and the choice is
+    /// read at biometric success.
+    private func makeScopeSelector(
+      _ choices: GrantScopeChoices, width: CGFloat
+    ) -> NSView {
+      let rows = NSStackView()
+      rows.orientation = .vertical
+      rows.alignment = .leading
+      rows.spacing = 10
+      rows.translatesAutoresizingMaskIntoConstraints = false
+
+      for option in choices.options {
+        let button = NSButton(
+          radioButtonWithTitle: Self.safe(ReviewDisplay.scopeTitle(option)),
+          target: self,
+          action: #selector(scopePressed(_:))
+        )
+        button.font = .systemFont(ofSize: 13, weight: .medium)
+        button.state = option.id == choices.defaultOptionID ? .on : .off
+        button.tag = scopeButtons.count
+        scopeButtons.append((id: option.id, button: button))
+
+        let detail = NSTextField(
+          wrappingLabelWithString: Self.safe(ReviewDisplay.scopeDetail(option))
+        )
+        detail.font = .systemFont(ofSize: 11)
+        detail.textColor = .secondaryLabelColor
+        detail.maximumNumberOfLines = 2
+        detail.preferredMaxLayoutWidth = width - 60
+
+        let row = NSStackView(views: [button, detail])
+        row.orientation = .vertical
+        row.alignment = .leading
+        row.spacing = 1
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        // Indent the detail under its radio label without breaking the button's
+        // own leading edge.
+        row.setCustomSpacing(1, after: button)
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        rows.addArrangedSubview(row)
+        NSLayoutConstraint.activate([
+          detail.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 20)
+        ])
+      }
+
+      let footnote = NSTextField(
+        wrappingLabelWithString:
+          "A wider scope lets other commands in that process tree reuse these "
+          + "credentials, without another prompt, until the grant expires."
+      )
+      footnote.font = .systemFont(ofSize: 11)
+      footnote.textColor = .tertiaryLabelColor
+      footnote.maximumNumberOfLines = 3
+      footnote.preferredMaxLayoutWidth = width - 28
+
+      let content = NSStackView(views: [rows, footnote])
+      content.orientation = .vertical
+      content.alignment = .leading
+      content.spacing = 10
+      return Self.paddedBox(
+        content: content,
+        cornerRadius: 9,
+        fill: NSColor.controlBackgroundColor,
+        border: NSColor.separatorColor,
+        horizontalPadding: 14,
+        verticalPadding: 12,
+        width: width
+      )
+    }
+
+    @objc private func scopePressed(_ sender: NSButton) {
+      // The selection is only meaningful until the biometric is consumed.
+      guard state == .selecting || state == .authenticating else {
+        for entry in scopeButtons {
+          entry.button.state = entry.id == selectedScopeOptionID ? .on : .off
+        }
+        return
+      }
+      guard sender.tag >= 0, sender.tag < scopeButtons.count else { return }
+      selectedScopeOptionID = scopeButtons[sender.tag].id
+      // Group the radios explicitly rather than relying on implicit sibling
+      // grouping, which the nested per-row stacks would defeat.
+      for entry in scopeButtons {
+        entry.button.state = entry.id == selectedScopeOptionID ? .on : .off
+      }
+    }
+
     private func makeDetailsGrid() -> NSView {
       let plan = review.plan
       let executableName = URL(fileURLWithPath: plan.executable.canonicalPath).lastPathComponent
@@ -749,7 +859,7 @@
       emitterValue.lineBreakMode = .byTruncatingTail
       emitterValue.toolTip = Self.safe(plan.executable.canonicalPath)
 
-      let rows: [(String, NSView)] = [
+      var rows: [(String, NSView)] = [
         ("Requested by", Self.gridValue(Self.safe(review.caller.description))),
         ("Emitted by", emitterValue),
         ("Delivered to", Self.gridValue(DeliveryReviewCopy.recipientDescription(for: plan))),
@@ -759,7 +869,13 @@
             "\(ReviewDisplay.mechanism(plan.mechanism)) · \(ReviewDisplay.scope(plan.descendantScope))"
           )
         ),
-        ("Grant root", Self.gridValue(ReviewDisplay.root(plan.root))),
+      ]
+      // The scope selector below is the authoritative statement of the root
+      // whenever it is shown; a static row here would contradict a live choice.
+      if (review.scopeChoices?.options.count ?? 0) <= 1 {
+        rows.append(("Grant root", Self.gridValue(ReviewDisplay.root(plan.root))))
+      }
+      rows += [
         ("Destination", Self.gridValue(ReviewDisplay.destination(plan.destination))),
         (
           "Requested duration",
@@ -924,10 +1040,17 @@
       statusLabel.textColor = .secondaryLabelColor
       statusLabel.stringValue = "Touch ID accepted…"
 
+      // Freeze the scope the human had selected at the moment the biometric
+      // succeeded; later clicks are ignored by `scopePressed`.
+      for entry in scopeButtons { entry.button.isEnabled = false }
+
       let continuation = selectionContinuation
       selectionContinuation = nil
       continuation?.resume(
-        returning: .approved(AccessPolicyApproval(authenticationSession: self)))
+        returning: .approved(AccessPolicyApproval(
+          authenticationSession: self,
+          selectedScopeOptionID: selectedScopeOptionID
+        )))
     }
 
     private func finishDenied(closeWindow shouldClose: Bool) {
@@ -955,9 +1078,15 @@
         return "Allow unattended job \(safe(automation.job.name)) to use the displayed references until revoked"
       }
       let plan = review.plan
+      // The default scope only; the live selection is displayed in this window,
+      // which is the authoritative surface for an embedded (non-textual)
+      // LAAuthenticationView. See `scopeButtons`.
+      let scopeLine = review.scopeChoices.map {
+        "; grant scope \(ReviewDisplay.scopeSummary($0.defaultOption))"
+      } ?? ""
       let policySummary =
         "delivery \(plan.mechanism.rawValue); scope \(plan.descendantScope.rawValue); "
-        + "destination \(plan.destination.rawValue)"
+        + "destination \(plan.destination.rawValue)\(scopeLine)"
       return BiometricConsent.prompt(
         caller: review.caller,
         references: review.credentials.flatMap(\.references),

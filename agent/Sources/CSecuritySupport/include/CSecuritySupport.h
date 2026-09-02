@@ -70,6 +70,12 @@ uint64_t cs_proc_start_time(int32_t pid);
 /// advisory lifecycle information, never a code-identity decision.
 uint32_t cs_proc_status(int32_t pid);
 
+/// Controlling terminal device of `pid`, or -1 when it has none (or the lookup
+/// failed). Only the presence of a terminal is used: it distinguishes a real
+/// interactive terminal session from the transient, pipe-wired shell a coding
+/// agent creates per tool call. Advisory grant-scope input, never an identity gate.
+int32_t cs_proc_controlling_terminal(int32_t pid);
+
 /// Short accounting name of `pid` (e.g. "ruby", "psql") into `buf`. Returns the
 /// number of bytes written (NUL-terminated), or 0 if unavailable. Advisory only
 /// — shown to the human in the consent prompt, never used as an identity gate.

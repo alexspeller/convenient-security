@@ -157,7 +157,16 @@ public extension RemoteApprovalReview {
             deliveryDescription:
                 "\(ReviewDisplay.mechanism(plan.mechanism)) · "
                 + ReviewDisplay.scope(plan.descendantScope),
-            grantRootDescription: ReviewDisplay.root(plan.root),
+            // The phone has no scope selector, so it renders — and approving on
+            // it applies — exactly the default scope the Mac window pre-selects.
+            // `MirroredPolicyReview` returns no `selectedScopeOptionID`, which
+            // the agent resolves to that same default.
+            grantRootDescription: ReviewDisplay.bounded(
+                review.scopeChoices.map {
+                    ReviewDisplay.scopeSummary($0.defaultOption)
+                } ?? ReviewDisplay.root(plan.root),
+                maxBytes: 512
+            ),
             destinationDescription: ReviewDisplay.destination(plan.destination),
             requestedDurationDescription: ReviewDisplay.duration(
                 seconds: plan.requestedTTLSeconds

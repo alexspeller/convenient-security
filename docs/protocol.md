@@ -274,6 +274,46 @@ A registered `broad_session` plan and an ordinary caller-root plan have differen
 digests and cannot share a grant, so registering a session never silently widens
 an existing per-command grant.
 
+## Grant scope and grant control
+
+`access` carries no scope field. After the plan root is verified, csecd walks
+kernel ancestry above it and offers the trusted review window up to three roots —
+the requesting process, the nearest coding agent, and the outermost shell owning
+a controlling terminal — with the coding agent pre-selected, else the terminal
+session, else the requesting process. The window returns the selected option's
+identifier in-process only; it is resolved against the list csecd built and
+re-proved against live ancestry before the grant is minted, so it authorizes
+nothing by possession. A phone mirroring the review has no selector and applies
+the displayed default.
+
+A grant rooted at the requesting process is reusable only for an identical
+`deliveryPlanDigest`. A grant rooted at a coding agent or terminal session is
+instead reusable for a matching *release-shape* digest — SHA-256 over the
+mechanism, descendant scope, destination, recipient assurance, output-guard plan,
+`interactive`, and `plaintextExposureAcknowledged`, domain-separated by
+`csec-release-shape-v1` — plus a matching audit-session ID. The executable,
+command digest, operation context, and requested TTL are deliberately excluded.
+
+The `grants` request inspects or drops the live set:
+
+```json
+{
+  "version": 2,
+  "type": "grants",
+  "requestID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "action": "list",
+  "all": false
+}
+```
+
+`action` is `list` or `revoke`; `revoke` takes either `grantID` (an id or
+unambiguous prefix) or `all`. A `list` reply carries `grants`, a value-free array
+of `{id, rootPID, rootProcessLabel, scopeKind, references, reason, expiresAt}`; a
+`revoke` reply carries `revokedGrantCount`. Both require an authenticated
+launcher. Neither releases a value and revocation only removes access, so neither
+is gated by Touch ID. The capabilities `selectable_grant_scopes` and
+`grant_revocation` advertise this.
+
 ## Secure no-root delivery plans
 
 Credential helpers declare `credential_protocol` with destination

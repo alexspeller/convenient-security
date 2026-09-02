@@ -853,7 +853,7 @@ func sshProtectionTests() async {
             otherWrapperPID: "/bin/zsh",
             otherSSHPID: "/usr/bin/ssh",
         ]
-        let processInspection = SSHProcessInspection(
+        let processInspection = ProcessInspection(
             startTime: { processStartTimes[$0] },
             parent: { processParents[$0] },
             name: { processNames[$0] },

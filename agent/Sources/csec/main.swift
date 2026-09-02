@@ -80,6 +80,10 @@ case "ssh":
     runSSH(Array(arguments.dropFirst()))
 case "automation":
     runAutomation(Array(arguments.dropFirst()))
+case "grants":
+    runGrants(Array(arguments.dropFirst()))
+case "revoke":
+    runRevoke(Array(arguments.dropFirst()))
 case "install":
     runInstall()
 case "uninstall":

@@ -8,6 +8,7 @@
 #include <bsm/libbsm.h>
 #include <libproc.h>
 #include <sys/proc_info.h>
+#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -330,6 +331,16 @@ uint64_t cs_proc_start_time(int32_t pid) {
     int n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
     if (n != (int)sizeof(info)) return 0;
     return (uint64_t)info.pbi_start_tvsec * 1000000ULL + (uint64_t)info.pbi_start_tvusec;
+}
+
+int32_t cs_proc_controlling_terminal(int32_t pid) {
+    struct proc_bsdinfo info;
+    int n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
+    if (n != (int)sizeof(info)) return -1;
+    // NODEV is the "no controlling terminal" sentinel; report it as absent so
+    // callers cannot mistake it for a real device number.
+    if (info.e_tdev == (uint32_t)NODEV) return -1;
+    return (int32_t)info.e_tdev;
 }
 
 uint32_t cs_proc_status(int32_t pid) {

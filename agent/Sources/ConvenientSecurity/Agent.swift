@@ -57,6 +57,10 @@ public actor Agent {
     private let allowLegacyAccessForTesting: Bool
     private let allowUnverifiedPlansForTesting: Bool
     private let allowUnverifiedAutomationCallersForTesting: Bool
+    /// Kernel process metadata used to resolve and re-verify grant scopes.
+    /// Production always uses `.live`; the seam keeps synthetic-ancestry tests
+    /// possible without weakening any release check.
+    private let processInspection: ProcessInspection
     private var activeSecrets = ActiveSecretRegistry()
     private var redactionSessions: [String: RedactionSession] = [:]
     private var nativeEditAuthorizations: [String: NativeEditAuthorization] = [:]
@@ -72,8 +76,10 @@ public actor Agent {
         automationService: AutomationService? = nil,
         allowLegacyAccessForTesting: Bool = false,
         allowUnverifiedPlansForTesting: Bool = false,
-        allowUnverifiedAutomationCallersForTesting: Bool = false
+        allowUnverifiedAutomationCallersForTesting: Bool = false,
+        processInspection: ProcessInspection = .live
     ) {
+        self.processInspection = processInspection
         self.resolver = resolver
         self.grants = grants
         self.consent = consent
@@ -256,10 +262,14 @@ public actor Agent {
         }
         let grantedTTL = decision.grantedTTLSeconds
 
-        // Grant reuse: a live grant rooted at the caller or an ancestor, minted
-        // for this exact delivery-plan digest, covers these references without
-        // another prompt. Capability-GID launches never reuse — each is a fresh
-        // two-party rendezvous whose new root must not outlive its authorization.
+        // Grant reuse: a live grant rooted at the caller or an ancestor covers
+        // these references without another prompt. A per-command grant needs this
+        // exact delivery-plan digest; a grant the human widened to an agent or
+        // terminal session needs the same release shape (see
+        // `DeliveryPlan.releaseShapeDigest`). Capability-GID launches never reuse
+        // — each is a fresh two-party rendezvous whose new root must not outlive
+        // its authorization.
+        let releaseShapeDigest = try? plan.releaseShapeDigest()
         let accessible: Set<String>
         if plan.mechanism == .capabilityGIDFile {
             accessible = []
@@ -267,7 +277,9 @@ public actor Agent {
             accessible = await grants.accessibleReferences(
                 for: caller.pid,
                 now: now,
-                deliveryPlanDigest: planDigest
+                deliveryPlanDigest: planDigest,
+                releaseShapeDigest: releaseShapeDigest,
+                callerAuditSessionID: caller.peerIdentity?.audit.auditSessionID
             )
         }
         let newReferenceURIs = Set(refs.map(\.uri)).subtracting(accessible)
@@ -314,11 +326,29 @@ public actor Agent {
                 }
                 .map(\.references)
         )
+        // csecd — not the launcher — resolves which roots may be offered, by
+        // walking kernel ancestry above the already-verified plan root. A
+        // capability-GID rendezvous is deliberately single-use, so it is never
+        // offered a wider root.
+        let scopeChoices: GrantScopeChoices? =
+            plan.mechanism == .capabilityGIDFile
+            ? nil
+            : GrantScopeInspector.choices(
+                planRootPID: rootPID,
+                planRootStartTime: rootStartTime,
+                requestingLabel: scopeRequestingLabel(plan: plan, rootPID: rootPID),
+                inspection: processInspection
+            )
+        let offersScopeChoice = (scopeChoices?.options.count ?? 0) > 1
         let review = AccessPolicyReview(
-            caller: displayedCaller(caller, plan: plan, rootPID: rootPID),
+            caller: displayedCaller(
+                caller, plan: plan, rootPID: rootPID,
+                statesGrantRoot: !offersScopeChoice
+            ),
             reason: request.reason,
             plan: plan,
-            credentials: reviewCredentials
+            credentials: reviewCredentials,
+            scopeChoices: scopeChoices
         )
         guard case let .approved(approval) = await policyReview.reviewAccess(review) else {
             return .failed(
@@ -328,14 +358,34 @@ public actor Agent {
             )
         }
 
+        // Resolve the reviewer's selection against the list csecd itself built,
+        // then prove the chosen root is still the same live process and still
+        // contains the plan root. An unknown identifier resolves to the displayed
+        // default and can never widen the grant.
+        let selectedScope = scopeChoices.map {
+            $0.resolved(selectedID: approval.selectedScopeOptionID)
+        }
+        if let selectedScope, selectedScope.kind != .requestingCommand {
+            guard verifiedScopeRoot(selectedScope, planRootPID: rootPID) else {
+                return .failed(
+                    .invalidRequest,
+                    message: "the selected grant scope changed before release",
+                    requestID: request.requestID
+                )
+            }
+        }
+
         let newReferences = refs.filter { newReferenceURIs.contains($0.uri) }
         let outcome = await authenticateReviewedAccess(
             approval: approval,
-            caller: displayedCaller(caller, plan: plan, rootPID: rootPID),
+            caller: displayedCaller(
+                caller, plan: plan, rootPID: rootPID,
+                statesGrantRoot: !offersScopeChoice
+            ),
             newReferences: newReferences,
             reason: request.reason,
             ttl: TimeInterval(grantedTTL),
-            policySummary: releasePolicySummary(plan: plan)
+            policySummary: releasePolicySummary(plan: plan, scope: selectedScope)
         )
         guard case let .approved(approvedUnlock) = outcome else {
             return .failed(
@@ -355,6 +405,25 @@ public actor Agent {
             )
         }
 
+        // The chosen root must still be live and still contain the plan root at
+        // the moment the grant is minted, not only when the window was shown.
+        let scope = selectedScope ?? GrantScopeOption(
+            kind: .requestingCommand,
+            pid: rootPID,
+            startTime: rootStartTime,
+            processLabel: ReviewDisplay.sanitized(
+                scopeRequestingLabel(plan: plan, rootPID: rootPID)
+            )
+        )
+        guard scope.kind == .requestingCommand
+                || verifiedScopeRoot(scope, planRootPID: rootPID) else {
+            return .failed(
+                .invalidRequest,
+                message: "the selected grant scope changed before release",
+                requestID: request.requestID
+            )
+        }
+
         // Mint one subtree-bound grant per credential group for the newly
         // approved references, valid for the bounded lifetime.
         for group in CredentialGrouping.groups(for: refs) {
@@ -363,8 +432,8 @@ public actor Agent {
             })
             guard !references.isEmpty else { continue }
             await grants.add(Grant(
-                rootPID: rootPID,
-                rootStartTime: rootStartTime,
+                rootPID: scope.pid,
+                rootStartTime: scope.startTime,
                 references: references,
                 reason: request.reason,
                 expiresAt: now.addingTimeInterval(TimeInterval(grantedTTL)),
@@ -372,7 +441,14 @@ public actor Agent {
                 deliveryPlanDigest: planDigest,
                 peerPIDVersion: caller.peerIdentity?.audit.pidVersion,
                 peerCDHash: caller.peerIdentity?.code.cdHash,
-                plannedExecutable: plan.executable
+                plannedExecutable: plan.executable,
+                scopeKind: scope.kind,
+                // A per-command root keeps the original exact-digest binding; a
+                // widened one is reusable by any command of the same shape.
+                scopeReuseDigest: scope.kind.reusesAcrossCommands
+                    ? releaseShapeDigest : nil,
+                auditSessionID: caller.peerIdentity?.audit.auditSessionID,
+                rootProcessLabel: scope.processLabel
             ))
         }
 
@@ -501,7 +577,11 @@ public actor Agent {
     private func displayedCaller(
         _ caller: CallerInfo,
         plan: DeliveryPlan,
-        rootPID: pid_t
+        rootPID: pid_t,
+        // When the review offers a scope selector, that selector is the
+        // authoritative statement of the grant root; naming a root here too
+        // would contradict a live selection.
+        statesGrantRoot: Bool = true
     ) -> CallerInfo {
         var displayed = caller
         let executableName = URL(fileURLWithPath: plan.executable.canonicalPath).lastPathComponent
@@ -513,8 +593,9 @@ public actor Agent {
             displayed.description = "\(requesterName) [\(requester.assurance.rawValue)] "
                 + "(pid \(rootPID)) via \(caller.description)"
         } else {
+            let root = statesGrantRoot ? " (grant root pid \(rootPID))" : ""
             displayed.description = "\(caller.description) for \(executableName) "
-                + "[\(plan.executable.assurance.rawValue)] (grant root pid \(rootPID))"
+                + "[\(plan.executable.assurance.rawValue)]\(root)"
         }
         return displayed
     }
@@ -532,12 +613,47 @@ public actor Agent {
         )
     }
 
+    /// Label for the plan's own root, which is not always the emitter. For a
+    /// direct-parent root (an interactive `csec get`) the root process is the
+    /// requester — the shell — not the signed csec that emits the bytes; for a
+    /// registered session it is neither, so the live kernel name is the only
+    /// honest description of that pid.
+    private func scopeRequestingLabel(plan: DeliveryPlan, rootPID: pid_t) -> String {
+        if case .registeredSession = plan.root {
+            return processInspection.name(of: rootPID)
+                ?? URL(fileURLWithPath: plan.executable.canonicalPath).lastPathComponent
+        }
+        let requester = plan.requestingExecutable ?? plan.executable
+        return URL(fileURLWithPath: requester.canonicalPath).lastPathComponent
+    }
+
+    /// A widened root is honored only while it is the same live process it was
+    /// when the window was drawn, and only while it still contains the plan root.
+    /// Both are fresh kernel checks; nothing the reviewer returns is trusted.
+    private func verifiedScopeRoot(
+        _ scope: GrantScopeOption,
+        planRootPID: pid_t
+    ) -> Bool {
+        scope.pid > 1
+            && processInspection.startTime(of: scope.pid) == scope.startTime
+            && processInspection.descends(
+                planRootPID, from: scope.pid, rootStartTime: scope.startTime
+            )
+    }
+
     /// A value-free one-line summary of the delivery shown in the Touch ID
     /// reason string. It names the mechanism, root, scope, destination, and
-    /// recipient — there is no risk level, because there no longer is one.
-    private func releasePolicySummary(plan: DeliveryPlan) -> String {
+    /// recipient — there is no risk level, because there no longer is one. When
+    /// the review offered a scope selector, the root is the option that was
+    /// actually selected.
+    private func releasePolicySummary(
+        plan: DeliveryPlan,
+        scope: GrantScopeOption? = nil
+    ) -> String {
         let root: String
-        if case .registeredSession = plan.root {
+        if let scope {
+            root = ReviewDisplay.scopeSummary(scope)
+        } else if case .registeredSession = plan.root {
             root = "registered session"
         } else {
             root = "per-command"
@@ -1319,6 +1435,56 @@ public actor Agent {
             auditSessionID: caller.peerIdentity?.audit.auditSessionID
         )
         return Response(requestID: request.requestID, registeredSessionID: sessionID)
+    }
+
+    /// Inspect or drop live grants.
+    ///
+    /// Neither action releases a value: listing returns the same value-free
+    /// metadata the review window already showed, and revocation only removes
+    /// access, so it fails safe and needs no Touch ID of its own. Both still
+    /// require an authenticated signed launcher.
+    public func handleGrants(
+        request: GrantsRequest,
+        caller: CallerInfo
+    ) async -> Response {
+        guard UUID(uuidString: request.requestID) != nil, isVerifiedLauncher(caller) else {
+            return .failed(
+                .unverifiedPeer,
+                message: "a verified launcher is required to inspect or revoke grants",
+                requestID: request.requestID
+            )
+        }
+        let now = Date()
+        switch request.action {
+        case .list:
+            return Response(
+                requestID: request.requestID,
+                grants: await grants.summaries(now: now)
+            )
+        case .revoke:
+            if request.all {
+                await grants.sweep(now: now)
+                return Response(
+                    requestID: request.requestID,
+                    revokedGrantCount: await grants.revokeAll()
+                )
+            }
+            guard let grantID = request.grantID,
+                  !grantID.isEmpty,
+                  grantID.utf8.count <= 64,
+                  grantID.allSatisfy({ $0.isHexDigit || $0 == "-" }) else {
+                return .failed(
+                    .invalidRequest,
+                    message: "a grant id (or --all) is required",
+                    requestID: request.requestID
+                )
+            }
+            await grants.sweep(now: now)
+            return Response(
+                requestID: request.requestID,
+                revokedGrantCount: await grants.revoke(idPrefix: grantID)
+            )
+        }
     }
 
     private func isVerifiedLauncher(_ caller: CallerInfo) -> Bool {

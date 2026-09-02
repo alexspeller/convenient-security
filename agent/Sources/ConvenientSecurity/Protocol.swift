@@ -21,6 +21,8 @@ public enum WireCapability: String, Codable, Sendable, CaseIterable {
     case protectedRegularFiles = "protected_regular_files"
     case remoteApprovals = "remote_approvals"
     case unattendedAutomation = "unattended_automation"
+    case selectableGrantScopes = "selectable_grant_scopes"
+    case grantRevocation = "grant_revocation"
 }
 
 public struct ProtocolCapabilities: Codable, Sendable, Equatable {
@@ -366,6 +368,7 @@ public enum Request: Sendable {
     case configureRemoteApproval(RemoteApprovalConfigurationRequest)
     case configureSSH(SSHKeyCatalogRequest)
     case configureAutomation(AutomationRequest)
+    case grants(GrantsRequest)
 }
 
 extension Request: Codable {
@@ -378,6 +381,7 @@ extension Request: Codable {
         case scanFilesystem, selectedKeys, jobID
         case exemptions, todos, cleared
         case action, phonePairingCode, registrations, fingerprint, automation
+        case grantID, all
     }
 
     public init(from decoder: Decoder) throws {
@@ -406,6 +410,13 @@ extension Request: Codable {
             self = .schemes
         case "capabilities":
             self = .capabilities
+        case "grants":
+            self = .grants(GrantsRequest(
+                action: try container.decode(GrantsAction.self, forKey: .action),
+                grantID: try container.decodeIfPresent(String.self, forKey: .grantID),
+                all: try container.decodeIfPresent(Bool.self, forKey: .all) ?? false,
+                requestID: try Self.decodeUUID(container, forKey: .requestID)
+            ))
         case "begin_session":
             self = .beginSession(BeginSessionRequest(
                 requestID: try Self.decodeUUID(container, forKey: .requestID)
@@ -581,6 +592,13 @@ extension Request: Codable {
         case .capabilities:
             try container.encode("capabilities", forKey: .type)
             try container.encode(WireProtocol.version, forKey: .version)
+        case let .grants(request):
+            try container.encode("grants", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request.action, forKey: .action)
+            try container.encodeIfPresent(request.grantID, forKey: .grantID)
+            try container.encode(request.all, forKey: .all)
         case let .beginSession(request):
             try container.encode("begin_session", forKey: .type)
             try container.encode(WireProtocol.version, forKey: .version)
@@ -738,6 +756,8 @@ public struct Response: Codable, Sendable {
     public let automationJobs: [AutomationJob]?
     public let automationRun: AutomationRunAuthorization?
     public let automationNextEligibleAt: Date?
+    public let grants: [GrantSummary]?
+    public let revokedGrantCount: Int?
     public let failure: ProtocolFailure?
     public let error: String?
 
@@ -769,6 +789,8 @@ public struct Response: Codable, Sendable {
         automationJobs: [AutomationJob]? = nil,
         automationRun: AutomationRunAuthorization? = nil,
         automationNextEligibleAt: Date? = nil,
+        grants: [GrantSummary]? = nil,
+        revokedGrantCount: Int? = nil,
         failure: ProtocolFailure? = nil,
         error: String? = nil
     ) {
@@ -799,6 +821,8 @@ public struct Response: Codable, Sendable {
         self.automationJobs = automationJobs
         self.automationRun = automationRun
         self.automationNextEligibleAt = automationNextEligibleAt
+        self.grants = grants
+        self.revokedGrantCount = revokedGrantCount
         self.failure = failure
         self.error = error
     }

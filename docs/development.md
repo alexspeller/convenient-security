@@ -50,6 +50,23 @@ leave the source intact, protect an existing destination, and exercise explicit
 replacement. All fixture values are synthetic and assertions require that they
 never appear in setup stdout or stderr.
 
+Grant-scope checks run the ancestry walk over synthetic process trees shaped like
+a measured `iTerm2 → login → fish → claude → per-tool-call zsh → csec` chain:
+which roots are offered, that the pipe-wired per-tool-call shells (which own no
+controlling terminal) are never mistaken for the terminal session, that the
+nearest coding agent wins, that a non-ancestor candidate is dropped, and that a
+forged option identifier resolves to the displayed default instead of an invented
+root. Release-shape digests are checked to survive a command/TTL/context change,
+to differ for every exposure-shaping field, and to be domain-separated from the
+delivery-plan digest. An `Agent`-level test then proves the wiring end to end
+against live ancestry: one approval at a widened root covers a *different* later
+command of the same shape, a different delivery shape prompts again, and choosing
+the requesting-process root still prompts per command. The end-to-end suite
+exercises `csec grants` and `csec revoke` over the real socket and asserts the
+listing never contains a value. That suite pins scope discovery to "offer nothing
+wider" so its per-invocation root assertions do not depend on whether it was
+launched from a coding agent or an interactive terminal.
+
 Secure no-root delivery checks exercise session registration over the real
 socket, one-prompt descendant reuse, copied/forged/stale ID rejection, and
 high-risk fallback to an exact per-command root. AWS checks cover separate

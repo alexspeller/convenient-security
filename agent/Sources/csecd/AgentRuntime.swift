@@ -328,6 +328,8 @@ func startAgentServer() async {
       return await agent.configureSSH(request: request, caller: caller)
     case .configureAutomation(let request):
       return await agent.configureAutomation(request: request, caller: caller)
+    case let .grants(request):
+      return await agent.handleGrants(request: request, caller: caller)
     case .beginSession(let begin):
       return await agent.beginSession(request: begin, caller: caller)
     case .beginOutputRedaction(let begin):

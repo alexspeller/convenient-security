@@ -153,7 +153,7 @@ value-free failures, and a canonical digest of the delivery plan. See
 
 A grant is held only in `csecd` memory. It records a root PID and process start
 time, the approved references, reason, expiry, the originating protocol-v2
-delivery binding, and the delivery-plan digest that bounds its reuse.
+delivery binding, the approved scope kind, and the digest that bounds its reuse.
 
 The daemon obtains the caller PID from the kernel rather than JSON. A grant is
 usable only when kernel parent traversal reaches the recorded root with the same
@@ -161,12 +161,52 @@ start time, which prevents PID reuse from reviving it. References already
 covered by a compatible live grant are returned without another prompt. Adding
 a reference prompts for the delta and then expands the grant. Grants expire by
 TTL and disappear when the daemon exits; orphaned descendants no longer satisfy
-the ancestry check. Reuse also requires the current delivery-plan digest to
-match exactly.
+the ancestry check. `csec grants` lists the live set and `csec revoke` drops it
+early; neither releases a value, and revocation only removes access, so neither
+needs Touch ID.
 
 The subtree model intentionally gives descendants of an approved root access to
 the same granted references. Code running inside that subtree is therefore part
 of the trusted consumer boundary.
+
+### Selectable grant scope
+
+The launcher does not choose the root. `csecd` walks kernel ancestry above the
+already-verified plan root and offers the human up to three roots in the trusted
+review window, narrowest first:
+
+- **Requesting process** — the root the delivery plan asked for.
+- **Coding agent** — the nearest Claude Code / Codex ancestor. An agent creates a
+  fresh non-interactive shell for every tool call, so the agent, not that shell,
+  is the stable boundary a human is actually approving.
+- **Terminal session** — the outermost shell ancestor that owns a controlling
+  terminal. The controlling-terminal test is what separates a real interactive
+  session from the pipe-wired shells an agent spawns per tool call and from
+  daemon `sh` wrappers.
+
+The pre-selected default is the coding agent if one is present, else the terminal
+session, else the requesting process. A candidate is offered only if a fresh
+ancestry walk proves it still contains the plan root, and the same proof is
+repeated before the grant is minted. The identifier the window returns is a
+lookup hint resolved against the list `csecd` itself built: an unknown value
+falls back to the displayed default and can never widen a grant.
+
+The two widened roots also loosen *reuse*. A requesting-process grant keeps the
+original rule — reusable only for an identical delivery-plan digest, which
+includes the command. That is useless to an agent, whose whole job is running
+different commands, so a widened grant is instead keyed on the plan's
+**release-shape digest**: mechanism, descendant scope, destination, recipient
+assurance, output guard, interactivity, and the plaintext-exposure
+acknowledgement, with the executable, command digest, operation context, and
+requested TTL removed. A widened grant additionally requires the caller's audit
+session to match the approving one.
+
+So one Touch ID lets an agent or a terminal session keep using the same
+credentials for different commands until the grant expires, while an approved
+sealed-environment, inherited-fd, or credential-protocol release can still never
+be reused as a raw-plaintext `csec get`. Widening is a deliberate, displayed
+choice: everything inside the chosen subtree is inside the trusted consumer
+boundary for that reference set.
 
 ### Explicit persistent automation exception
 

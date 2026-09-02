@@ -62,15 +62,16 @@ its remaining ordinary environment. Users who cannot accept that boundary must
 not enroll it. Ordinary access remains time-bounded and unchanged. See
 [`automation.md`](automation.md).
 
-`csec session` makes that wider boundary explicit. The daemon records the
+`csec session` makes a wider boundary explicit for callers that want one without
+the review window choosing it. The daemon records the
 signed launcher's kernel PID, process start time, and audit session before the
 launcher becomes the requested shell or command. Its inherited random ID is
 non-secret and does not authorize anything by possession: each use must come
 from the authenticated signed helper and pass a fresh ancestry walk to that
 exact live process incarnation. Copying the ID to a sibling, racing PID reuse,
 or inventing an ID fails closed. A grant may span descendants of the approved
-root, bounded by the delivery-plan digest and a fresh ancestry walk to that exact
-live root incarnation.
+root, bounded by its reuse digest and a fresh ancestry walk to that exact live
+root incarnation.
 
 ### Release authorization and stale authorization
 
@@ -82,12 +83,22 @@ acceptance — the value-free review shows the references, delivery, scope,
 destination, and any inspectable-shape warning, and embedded Touch ID starts when
 the window becomes visible; a successful biometric is itself the authorization.
 
-Every grant is bound to the delivery-plan digest and the requesting process
-subtree. Grants expire by TTL and drop when their root exits; a caller reuses one
-only when it descends from that root and presents the same plan digest. There is
-no risk-shaped binding left to recompute. Protocol-v1 access is recognized only to
-return `upgrade_required`, so an older or hand-written client cannot omit a plan
-to select the legacy authorization path.
+Every grant is bound to a process subtree and to a digest. The root is the one
+the human selected in the review window — the requesting process, the nearest
+coding agent, or the outermost shell owning a controlling terminal — resolved by
+csecd from a live kernel ancestry walk, never proposed by the launcher. A
+requesting-process grant is reusable only for an identical delivery-plan digest.
+A deliberately widened grant is reusable by any command in that subtree whose
+release *shape* matches — mechanism, descendant scope, destination, recipient
+assurance, output guard, interactivity, plaintext acknowledgement — and whose
+audit session matches the approving one. That is the point of widening: an agent
+runs different commands, and binding to one command would make the choice
+meaningless. It also means everything in the chosen subtree is inside the trusted
+consumer boundary for those references until the grant expires; the narrower
+per-command root remains one click away, and `csec revoke` drops a grant early.
+Grants expire by TTL and drop when their root exits. Protocol-v1 access is
+recognized only to return `upgrade_required`, so an older or hand-written client
+cannot omit a plan to select the legacy authorization path.
 
 An inspectable delivery is warn-and-confirm rather than an integrity failure: the
 review warns and one Touch ID authorizes it. Authorization still fails closed on

@@ -37,6 +37,13 @@ public enum ProcessAncestry {
         return name.isEmpty ? nil : name
     }
 
+    /// Whether `pid` has a controlling terminal. True for a login/terminal shell
+    /// and its ordinary children; false for the pipe-wired shell a coding agent
+    /// spawns per tool call, and for daemons. Advisory grant-scope input only.
+    public static func hasControllingTerminal(_ pid: pid_t) -> Bool {
+        cs_proc_controlling_terminal(pid) >= 0
+    }
+
     /// Executable path guarded against PID reuse during the lookup.
     public static func executablePath(of pid: pid_t) -> String? {
         guard let before = startTime(of: pid) else { return nil }
