@@ -199,7 +199,7 @@ private func stepCodingAgentHooks(detections: [CodingAgentDetection]) -> [String
         case .unchanged:
             Prompt.success("\(client): the exact fail-closed csec hook is already configured.")
         case .create, .merge:
-            showHookFragment(for: detection.client)
+            showHookPlan(plan, client: detection.client)
             if Prompt.confirm("Configure the \(client) hook (merges only the csec hook)?") {
                 if applyHookPlan(plan, client: client) { configured.append(client) }
             } else {
@@ -213,7 +213,7 @@ private func stepCodingAgentHooks(detections: [CodingAgentDetection]) -> [String
                 detection: detection, csecExecutablePath: currentExecutablePath(),
                 replaceExistingCSECHook: true), replacement.action == .merge {
                 Prompt.warn("\(client): \(ReviewDisplay.sanitized(plan.detail))")
-                showHookFragment(for: detection.client)
+                showHookPlan(replacement, client: detection.client)
                 if Prompt.confirm("Replace the existing csec hook in \(client)?") {
                     if applyHookPlan(replacement, client: client) { configured.append(client) }
                 } else {
@@ -227,9 +227,12 @@ private func stepCodingAgentHooks(detections: [CodingAgentDetection]) -> [String
     return configured
 }
 
-/// Show the exact value-free hook fragment csec would merge. Bidi is neutralized;
-/// newlines and other formatting are preserved so the JSON reads normally.
-private func showHookFragment(for client: AICommandHookClient) {
+/// Show which file csec will touch and the exact value-free hook fragment it
+/// would merge. Bidi is neutralized; newlines and other formatting are preserved
+/// so the JSON reads normally.
+private func showHookPlan(_ plan: CodingAgentConfigurationPlan, client: AICommandHookClient) {
+    let verb = plan.action == .create ? "create" : "edit"
+    Prompt.note("Will \(verb) \(displayPath(plan.path))")
     guard let data = try? AICommandHook.hookConfiguration(
         client: client, csecExecutablePath: currentExecutablePath()),
         let fragment = String(data: data, encoding: .utf8) else { return }
@@ -240,13 +243,28 @@ private func showHookFragment(for client: AICommandHookClient) {
 private func applyHookPlan(_ plan: CodingAgentConfigurationPlan, client: String) -> Bool {
     do {
         try CodingAgentSetup.apply(plan)
-        Prompt.success("\(client): hook configured — restart \(client) and trust the exact hook in "
-            + "its hook UI before relying on coverage.")
+        Prompt.success("\(client): hook configured in \(displayPath(plan.path)) — restart \(client) "
+            + "and trust the exact hook in its hook UI before relying on coverage.")
         return true
     } catch {
         csecError("setup", "\(client): could not update the hook — \(ReviewDisplay.sanitized(error.localizedDescription))")
         return false
     }
+}
+
+/// A configuration path prepared for display: the user's home directory is
+/// abbreviated to `~`, and the whole path is sanitized as untrusted metadata.
+private func displayPath(_ path: String) -> String {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    let abbreviated: String
+    if path == home {
+        abbreviated = "~"
+    } else if path.hasPrefix(home + "/") {
+        abbreviated = "~" + path.dropFirst(home.count)
+    } else {
+        abbreviated = path
+    }
+    return ReviewDisplay.sanitized(abbreviated)
 }
 
 // MARK: - Step 4: audit prompt + host audit
