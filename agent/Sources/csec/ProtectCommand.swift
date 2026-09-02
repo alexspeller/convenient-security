@@ -13,6 +13,11 @@ import Darwin
 /// `<name>.csec` sidecar pointing at its `csec://store/key` value, and removes the
 /// now-redundant plaintext.
 ///
+/// `--ssh` instead registers the imported backend reference in the SSH catalog,
+/// preserves or creates the public-key file, removes the unchanged private-key
+/// plaintext, and deliberately leaves no sidecar that could drift from the
+/// catalog.
+///
 /// `--env` instead treats the file as an env file (direnv/.envrc semantics):
 /// an interactive picker chooses which variables to import into a selectable
 /// destination (the native store or 1Password), and the file is rewritten in
@@ -261,12 +266,11 @@ private func runProtectSSH(
             uniqueKeysWithValues: result.keys.map { ($0.reference, $0) }
         )
 
-        // Sidecars remain the ordinary provider-neutral .csec format. A missing
-        // .pub is recreated from returned public metadata; existing .pub files
-        // are preserved byte-for-byte.
+        // SSH registration itself durably retains the provider-neutral reference,
+        // so do not create a second on-disk pointer that can drift from the
+        // catalog. A missing .pub is recreated from returned public metadata;
+        // existing .pub files are preserved byte-for-byte.
         for (item, reference) in zip(planned, references) {
-            let sidecar = try ProtectedFileSidecar(reference: reference).encoded()
-            try writeFileAtomically(path: item.sidecarPath, data: sidecar, mode: 0o600)
             if let metadata = metadataByReference[reference.uri] {
                 try writePublicKeyIfMissing(
                     path: item.originalPath + ".pub",

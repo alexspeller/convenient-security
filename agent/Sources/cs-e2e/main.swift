@@ -1181,8 +1181,9 @@ do {
 }
 
 // Manual SSH protection end to end: generate a throwaway key, import it through
-// the real CLI, prove the original is removed only after registration, and
-// exercise catalog list/remove/re-register through an ordinary .csec sidecar.
+// the real CLI, prove the original is removed only after registration without
+// leaving a redundant sidecar, and separately exercise re-registration through
+// the ordinary backend-neutral sidecar format accepted by `csec ssh register`.
 do {
     let fixtureDirectory = NSTemporaryDirectory()
         + "csec-protect-ssh-e2e-\(UUID().uuidString.lowercased())"
@@ -1217,18 +1218,15 @@ do {
     check(!FileManager.default.fileExists(atPath: privateKeyPath),
           "protect --ssh removes the unchanged private-key plaintext")
     let sidecarPath = privateKeyPath + ProtectedFileSidecar.suffix
-    check(FileManager.default.fileExists(atPath: sidecarPath),
-          "protect --ssh writes an ordinary backend-neutral .csec sidecar")
+    check(!FileManager.default.fileExists(atPath: sidecarPath),
+          "protect --ssh does not leave a redundant .csec sidecar")
     check(try Data(contentsOf: URL(fileURLWithPath: publicKeyPath)) == originalPublicKey,
           "protect --ssh preserves an existing public-key file byte-for-byte")
 
-    let sidecar = try ProtectedFileSidecar(
-        data: Data(contentsOf: URL(fileURLWithPath: sidecarPath))
-    )
     let protectedKeys = try client.listSSHKeys()
-    guard let protectedKey = protectedKeys.first(where: {
-        $0.reference == sidecar.reference.uri
-    }) else { throw SSHProtectionError.keyNotRegistered }
+    guard protectedKeys.count == 1, let protectedKey = protectedKeys.first else {
+        throw SSHProtectionError.keyNotRegistered
+    }
     check(protectedKey.algorithm == "ssh-ed25519"
           && protected.out.contains(protectedKey.fingerprint),
           "protect --ssh reports the registered public fingerprint without key bytes")
@@ -1239,7 +1237,7 @@ do {
     let listed = runCsec(["ssh", "list"], extraEnv: [:])
     check(listed.status == 0
           && listed.out.contains(protectedKey.fingerprint)
-          && listed.out.contains(sidecar.reference.uri),
+          && listed.out.contains(protectedKey.reference),
           "csec ssh list reads backend-neutral public catalog metadata")
 
     let removed = runCsec(
@@ -1249,6 +1247,15 @@ do {
     check(removed.status == 0 && keysAfterRemoval.isEmpty,
           "csec ssh remove deletes only the catalog registration")
 
+    // Sidecar registration remains useful for a private key protected through
+    // the generic file workflow or another backend-neutral reference file. It
+    // is deliberately independent from `protect --ssh`.
+    let sidecar = try ProtectedFileSidecar(
+        reference: SecretRef(protectedKey.reference)
+    )
+    try sidecar.encoded().write(
+        to: URL(fileURLWithPath: sidecarPath), options: .atomic
+    )
     let registered = runCsec(
         ["ssh", "register", "--label", "sidecar fixture", sidecarPath],
         extraEnv: ["SSH_AUTH_SOCK": otherAgentPath]
@@ -1300,7 +1307,7 @@ do {
     ) == rsaPublicKey
     check(protectedRSA.status == 0
           && !FileManager.default.fileExists(atPath: rsaPrivateKeyPath)
-          && FileManager.default.fileExists(
+          && !FileManager.default.fileExists(
             atPath: rsaPrivateKeyPath + ProtectedFileSidecar.suffix
           )
           && rsaPublicPreserved

@@ -121,12 +121,14 @@ returns only the signature.
 
 `csec protect --ssh` is a provider-specific import convenience: it durably
 writes to a chosen native store, registers the resulting canonical references,
-writes ordinary `.csec` sidecars, preserves or derives `.pub` files, and only
-then removes unchanged originals. `csec ssh register` accepts an existing
-reference from `csec://`, `op://`, or any future registered provider. This
-manual first release does not modify global shell/SSH setup, proxy another
-agent, permit forwarding, or support `ssh-add` mutations. The exact commands,
-supported key formats, failure ordering, and first-release limitations are in
+preserves or derives `.pub` files, and only then removes unchanged originals.
+It does not write a `.csec` sidecar because the SSH catalog is the durable owner
+of that provider-neutral reference; avoiding a second pointer prevents lifecycle
+drift. `csec ssh register` still accepts an existing generic sidecar or reference
+from `csec://`, `op://`, or any future registered provider. This manual first
+release does not modify global shell/SSH setup, proxy another agent, permit
+forwarding, or support `ssh-add` mutations. The exact commands, supported key
+formats, failure ordering, and first-release limitations are in
 [`docs/ssh-agent.md`](docs/ssh-agent.md).
 
 ## Authenticated agent socket

@@ -25,11 +25,16 @@ whole batch. It then:
 2. imports the private keys durably into the native blob destination;
 3. parses them inside `csecd` and atomically registers their canonical
    `csec://` references plus public metadata;
-4. writes ordinary `.csec` sidecars next to the original paths;
-5. preserves an existing `.pub` file byte-for-byte, or creates one from the
+4. preserves an existing `.pub` file byte-for-byte, or creates one from the
    derived public metadata when it is missing; and
-6. removes each original private-key file only if its identity, size, and
+5. removes each original private-key file only if its identity, size, and
    modification time are unchanged since it was read.
+
+It does not write a `.csec` sidecar. The SSH catalog already durably retains the
+backend reference, and a second on-disk pointer could drift from it. Earlier
+development builds did create these sidecars; SSH never reads them during
+normal operation, so they may be deleted after `csec ssh list` confirms the key
+is registered.
 
 The default native store is `ssh-keys`. The useful migration controls are:
 
@@ -39,13 +44,12 @@ csec protect --ssh --keep-plaintext ~/.ssh/id_ed25519
 csec protect --ssh --store work-ssh ~/.ssh/id_work
 ```
 
-If import or registration fails, csec does not write sidecars or remove the
-originals. If a later filesystem step fails or a source changes during review,
-the encrypted import remains recoverable and the original private key remains
-in place; an unexpected retained plaintext makes the command exit nonzero and
-names the retained path. Unlinking a file is not secure erasure on APFS or SSD
-storage; backups, snapshots, synchronized copies, and previously copied data
-remain outside csec's control.
+If import or registration fails, csec does not remove the originals. If a later
+filesystem step fails or a source changes during review, the encrypted import
+remains recoverable and the original private key remains in place; an unexpected
+retained plaintext makes the command exit nonzero and names the retained path.
+Unlinking a file is not secure erasure on APFS or SSD storage; backups, snapshots,
+synchronized copies, and previously copied data remain outside csec's control.
 
 ## Register a key in any backend
 
@@ -55,7 +59,7 @@ destination for convenience, but SSH registration is backend-neutral:
 ```sh
 csec ssh register 'op://Private/SSH key/private key'
 csec ssh register 'future-provider://account/key'
-csec ssh register ~/.ssh/id_ed25519.csec
+csec ssh register ./key-protected-by-generic-csec-protect.csec
 ```
 
 The named provider must already be registered with `csecd`, and the reference
@@ -71,12 +75,14 @@ derives the public identity, and persists only:
 No SSH code depends on native blob IDs, 1Password record IDs, or provider
 internals. Adding another `SecretProvider` requires no SSH signing changes.
 
-The `.csec` sidecar and the source backend retain their ordinary semantics.
-This is intentionally not a separate hardware-backed or non-exportable key
-store: someone can still deliberately request the referenced value through an
-authorized generic csec delivery, or through the source backend's own tools.
-The narrower guarantee is that the SSH-agent socket itself never exports the
-private key and cannot be used for arbitrary signing.
+An explicitly supplied `.csec` sidecar and the source backend retain their
+ordinary semantics; `csec ssh register` accepts the sidecar as a convenient way
+to read its provider-neutral reference. This is intentionally not a separate
+hardware-backed or non-exportable key store: someone can still deliberately
+request the referenced value through an authorized generic csec delivery, or
+through the source backend's own tools. The narrower guarantee is that the
+SSH-agent socket itself never exports the private key and cannot be used for
+arbitrary signing.
 
 ## Manual socket and catalog commands
 

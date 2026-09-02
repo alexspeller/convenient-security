@@ -156,7 +156,9 @@ ssh user@example.com
 
 Protection and registration detect when the launching shell is not using the
 csec socket and print this profile/one-off activation guidance; csec does not
-edit shell profiles itself.
+edit shell profiles itself. SSH protection preserves or creates the public-key
+file but deliberately leaves no `.csec` sidecar: the SSH catalog already owns
+the backend-neutral reference used for signing.
 
 > An unsigned `swift run csecd` runs without the at-rest cache and the native
 > store (it can't open the provisioned Keychain group) and prints
