@@ -14,12 +14,12 @@ enum TerminalKey: Equatable {
     case unknown
 }
 
-/// Minimal `termios` raw-mode session for the interactive `csec audit` pickers.
-/// Byte-at-a-time input with echo and canonical line editing off, but `ISIG` left
-/// on so Ctrl-C still raises `SIGINT` — a handler then restores the terminal and
-/// shows the cursor before exiting, so an interrupt never leaves the terminal raw
-/// or the cursor hidden. Normal exit restores via `deinit`/`restore()`. Drawing
-/// goes to stderr; keys come from stdin.
+/// Minimal `termios` raw-mode session for interactive pickers. Byte-at-a-time
+/// input has echo and canonical line editing off. Most callers leave `ISIG` on,
+/// so Ctrl-C raises `SIGINT` and the handler restores the terminal. A caller
+/// displaying explicitly revealed values may capture Ctrl-C as input instead,
+/// clear its rendered block, and then restore normally. Drawing goes to stderr;
+/// keys come from stdin.
 final class TerminalRawMode {
     private var saved = termios()
     private var active = false
@@ -32,13 +32,14 @@ final class TerminalRawMode {
 
     /// Enter raw mode. Returns nil when stdin is not a terminal (non-interactive),
     /// so callers fall back to a non-interactive path.
-    init?() {
+    init?(captureInterrupt: Bool = false) {
         guard isatty(STDIN_FILENO) == 1 else { return nil }
         guard tcgetattr(STDIN_FILENO, &saved) == 0 else { return nil }
         Self.savedForSignal = saved
 
         var raw = saved
         raw.c_lflag &= ~(UInt(ECHO) | UInt(ICANON))
+        if captureInterrupt { raw.c_lflag &= ~UInt(ISIG) }
         // Read one byte at a time with no inter-byte timeout.
         withUnsafeMutablePointer(to: &raw.c_cc) { tuple in
             tuple.withMemoryRebound(to: UInt8.self, capacity: Int(NCCS)) { cc in

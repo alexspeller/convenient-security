@@ -27,6 +27,7 @@ func secretHeuristicsTests() {
         "-----BEGIN RSA PRIVATE KEY-----",
         "d41d8cd98f00b204e9800998ecf8427ea3f8b1c2d41d8cd9",
         "QmFzZTY0UmFuZG9tRGF0YTEyMzQ1Ng==",
+        "postgresql://synthetic-user:synthetic-password@db.example.test/app",
     ] {
         check(SecretHeuristics.valueLooksSecretLike(value), "value heuristic: secret-like accepted")
     }
@@ -35,10 +36,26 @@ func secretHeuristicsTests() {
     for value in [
         "3000", "true", "development", "postgres", "/usr/local/bin",
         "en_US.UTF-8", "hello world this is text", "my-app-name-for-prod-use",
-        "sk-x",
+        "sk-x", "http://192.0.2.140:8123",
+        "https://service.example.test/a-long-path-with-1234567890",
+        "postgresql://synthetic-user@db.example.test/app",
+        "postgresql://synthetic-user:@db.example.test/app",
     ] {
         check(!SecretHeuristics.valueLooksSecretLike(value), "value heuristic: plain value rejected (\(value))")
     }
+
+    check(
+        !SecretHeuristics.environmentVariableLooksSecretLike(
+            name: "HA_URL", value: "http://192.0.2.140:8123"
+        ),
+        "combined heuristic rejects passwordless URL under an ordinary name"
+    )
+    check(
+        SecretHeuristics.environmentVariableLooksSecretLike(
+            name: "DATABASE_URL", value: "postgresql://db.example.test/app"
+        ),
+        "combined heuristic retains an independently secret-like name"
+    )
 
     // Entropy: repeated bytes are zero; uniform distinct bytes hit log2(n);
     // random-looking text scores above repetitive text.
@@ -102,6 +119,19 @@ func envFileDocumentTests() {
         candidate(envDoc("RANDOM_THING=xoxb-123456789\n"), "RANDOM_THING")?.preselect == true,
         "secret-like value preselects an unremarkable name"
     )
+    do {
+        let document = envDoc("export HA_URL=\"http://192.0.2.140:8123\"\n")
+        let homeAssistantURL = candidate(document, "HA_URL")
+        check(homeAssistantURL?.secretLike == false, "passwordless URL is not secret-like")
+        check(homeAssistantURL?.preselect == false, "passwordless URL is not preselected")
+        let (rows, selected) = EnvSelectModel.rows(for: document?.candidates ?? [])
+        check(rows.first?.secretLike == false, "picker uses the candidate's centralized verdict")
+        check(
+            rows.first?.annotation.contains("secret-like") == false,
+            "picker omits the secret-like annotation"
+        )
+        check(selected.isEmpty, "picker leaves a passwordless URL unchecked")
+    }
 
     // Splicing: every quoting style collapses to a double-quoted reference,
     // with surrounding bytes (indentation, export, trailing comments) intact.
@@ -270,11 +300,38 @@ func envSelectModelTests() {
 
     let rendered = model.render(color: false, width: 100)
     check(rendered.contains("[ ] SLACK_TOKEN"), "render shows checkbox and name")
+    check(rendered.contains("v reveal"), "hidden picker advertises the reveal shortcut")
     check(rendered.contains(" -  EXISTING"), "render shows info glyph for unselectable rows")
     check(!rendered.contains("xoxb-"), "render never shows values")
     check(!rendered.contains("hunter2"), "render never shows commented values")
     check(!rendered.contains("\u{1B}"), "colorless render has no ANSI escapes")
     check(rendered.contains("0 of 3 selected"), "footer counts selectable rows")
+
+    let revealed = model.render(
+        color: false,
+        width: 100,
+        revealedValues: [
+            "SLACK_TOKEN": "xoxb-synthetic-fixture-aaaabbbbccccdddd",
+            "PORT": "3000",
+            "DB_PASSWORD": "hunter2hunter2",
+        ]
+    )
+    check(revealed.contains("v hide"), "revealed picker advertises the hide shortcut")
+    check(revealed.contains("Values visible"), "revealed picker warns that values are visible")
+    check(revealed.contains("\"xoxb-synthetic-fixture-aaaabbbbccccdddd\""),
+          "explicit reveal renders a selected value")
+    check(revealed.contains("\"3000\""), "explicit reveal also renders an unselected value")
+    check(revealed.contains("\"hunter2hunter2\""),
+          "explicit reveal renders a commented candidate value")
+
+    let escapedReveal = model.render(
+        color: false,
+        width: 160,
+        revealedValues: ["SLACK_TOKEN": "line\n\u{1B}[31m\u{202E}tail"]
+    )
+    check(escapedReveal.contains("line\\n\\u{001B}[31m\\u{202E}tail"),
+          "revealed values escape newlines, terminal controls, and bidi controls")
+    check(!escapedReveal.contains("\u{1B}"), "revealed env content cannot inject ANSI escapes")
 
     let stray = EnvSelectModel(rows: rows, initiallySelected: [0, 3, 99])
     check(stray.selectedNames == ["SLACK_TOKEN"],

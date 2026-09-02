@@ -7,6 +7,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 agent_directory="$repo_root/agent"
 source_file="$repo_root/packaging/sudo/pam_csec_sudo.c"
+heuristics_source="$repo_root/agent/Sources/CSECSecretHeuristics/CSECSecretHeuristics.c"
+heuristics_include="$repo_root/agent/Sources/CSECSecretHeuristics/include"
 output_directory="$repo_root/packaging/build/sudo-review"
 helper="$output_directory/csec-sudo-review"
 wire_probe="$output_directory/csec-sudo-review-wire-probe"
@@ -57,9 +59,11 @@ xcrun clang \
   -Werror \
   -Wno-unused-function \
   -fstack-protector-strong \
+  -I "$heuristics_include" \
   -DCSEC_PAM_PROMPT_PREVIEW=1 \
   -DCSEC_PAM_REVIEW_FRAME_PROBE=1 \
   "$source_file" \
+  "$heuristics_source" \
   -framework Security \
   -lpam \
   -o "$wire_probe"

@@ -22,10 +22,10 @@
 #include <Security/SecBase.h>
 #include <Security/SecCode.h>
 #include <Security/SecStaticCode.h>
+#include "CSECSecretHeuristics.h"
 #include <crt_externs.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <math.h>
 #include <poll.h>
 #include <spawn.h>
 #include <signal.h>
@@ -184,169 +184,6 @@ csec_prompt_append_argument(struct csec_prompt_builder *builder,
     csec_prompt_append(builder, "\"");
 }
 
-static unsigned char
-csec_upper_name_byte(unsigned char byte)
-{
-    if (byte >= 'a' && byte <= 'z') {
-        return (unsigned char)(byte - ('a' - 'A'));
-    }
-    return byte == '-' ? '_' : byte;
-}
-
-static bool
-csec_name_contains_marker(const char *name, size_t name_length,
-    const char *marker)
-{
-    const size_t marker_length = strlen(marker);
-    if (marker_length > name_length) {
-        return false;
-    }
-    for (size_t start = 0; start + marker_length <= name_length; start++) {
-        bool matches = true;
-        for (size_t offset = 0; offset < marker_length; offset++) {
-            if (csec_upper_name_byte((unsigned char)name[start + offset]) !=
-                (unsigned char)marker[offset]) {
-                matches = false;
-                break;
-            }
-        }
-        if (matches) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* Keep this marker set aligned with SecretHeuristics.nameLooksSecretLike. */
-static bool
-csec_name_looks_secret_like(const char *name, size_t name_length)
-{
-    static const char *const markers[] = {
-        "TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "PRIVATE_KEY",
-        "ACCESS_KEY", "CREDENTIAL", "AUTH", "SIGNING_KEY", "ENCRYPTION_KEY",
-        "COOKIE", "WEBHOOK", "DATABASE_URL", "REDIS_URL", "DSN", NULL,
-    };
-    while (name_length > 0 && *name == '-') {
-        name++;
-        name_length--;
-    }
-    for (size_t index = 0; markers[index] != NULL; index++) {
-        if (csec_name_contains_marker(name, name_length, markers[index])) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool
-csec_is_token_byte(unsigned char byte)
-{
-    return (byte >= 'A' && byte <= 'Z') ||
-        (byte >= 'a' && byte <= 'z') ||
-        (byte >= '0' && byte <= '9') ||
-        byte == '+' || byte == '/' || byte == '=' || byte == '_' ||
-        byte == '-' || byte == '.' || byte == ':';
-}
-
-static bool
-csec_is_hex_byte(unsigned char byte)
-{
-    return (byte >= '0' && byte <= '9') ||
-        (byte >= 'a' && byte <= 'f') ||
-        (byte >= 'A' && byte <= 'F');
-}
-
-static bool
-csec_is_base64_byte(unsigned char byte)
-{
-    return (byte >= 'A' && byte <= 'Z') ||
-        (byte >= 'a' && byte <= 'z') ||
-        (byte >= '0' && byte <= '9') ||
-        byte == '+' || byte == '/' || byte == '=' || byte == '_' || byte == '-';
-}
-
-static bool
-csec_has_known_secret_prefix(const char *value)
-{
-    static const char *const prefixes[] = {
-        "sk-", "sk_live_", "sk_test_", "rk_live_",
-        "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
-        "glpat-", "npm_", "dop_v1_", "shpat_", "shpss_",
-        "AKIA", "ASIA", "AIza", "eyJ", NULL,
-    };
-    for (size_t index = 0; prefixes[index] != NULL; index++) {
-        if (strncmp(value, prefixes[index], strlen(prefixes[index])) == 0) {
-            return true;
-        }
-    }
-    return strlen(value) >= 5 && value[0] == 'x' && value[1] == 'o' &&
-        value[2] == 'x' && value[4] == '-';
-}
-
-/* Keep this conservative detector aligned with SecretHeuristics. */
-static bool
-csec_value_looks_secret_like(const char *value)
-{
-    if (strstr(value, "-----BEGIN") != NULL &&
-        strstr(value, "PRIVATE KEY") != NULL) {
-        return true;
-    }
-    const size_t length = strlen(value);
-    if (length < 8) {
-        return false;
-    }
-    if (csec_has_known_secret_prefix(value)) {
-        return true;
-    }
-    if (length < 20) {
-        return false;
-    }
-
-    size_t token_byte_count = 0;
-    bool has_letter = false;
-    bool has_digit = false;
-    bool all_hex = true;
-    bool all_base64 = true;
-    size_t counts[256] = {0};
-    for (size_t index = 0; index < length; index++) {
-        const unsigned char byte = (unsigned char)value[index];
-        if (byte == ' ' || byte == '\t') {
-            return false;
-        }
-        counts[byte]++;
-        if (csec_is_token_byte(byte)) {
-            token_byte_count++;
-        }
-        has_letter = has_letter ||
-            (byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z');
-        has_digit = has_digit || (byte >= '0' && byte <= '9');
-        all_hex = all_hex && csec_is_hex_byte(byte);
-        all_base64 = all_base64 && csec_is_base64_byte(byte);
-    }
-    if ((double)token_byte_count < 0.9 * (double)length) {
-        return false;
-    }
-    if (length >= 32 && all_hex) {
-        return true;
-    }
-    if (!has_letter || !has_digit) {
-        return false;
-    }
-    if (length >= 24 && all_base64) {
-        return true;
-    }
-
-    double entropy = 0.0;
-    for (size_t index = 0; index < 256; index++) {
-        if (counts[index] == 0) {
-            continue;
-        }
-        const double probability = (double)counts[index] / (double)length;
-        entropy -= probability * log2(probability);
-    }
-    return entropy >= 3.5;
-}
-
 static bool
 csec_is_opaque_redaction_label(const char *value)
 {
@@ -381,8 +218,10 @@ csec_argument_for_display(const char *argument, bool redact_entire,
         if (csec_is_opaque_redaction_label(equals + 1)) {
             return argument;
         }
-        if (csec_name_looks_secret_like(argument, name_length) ||
-            csec_value_looks_secret_like(equals + 1)) {
+        if (cs_secret_name_looks_secret_like(
+                (const uint8_t *)argument, name_length) ||
+            cs_secret_value_looks_secret_like(
+                (const uint8_t *)(equals + 1), strlen(equals + 1))) {
             if (name_length + 1 + strlen(redacted) < 256) {
                 memcpy(replacement, argument, name_length + 1);
                 strcpy(replacement + name_length + 1, redacted);
@@ -393,10 +232,12 @@ csec_argument_for_display(const char *argument, bool redact_entire,
     }
 
     if (argument[0] == '-' && equals == NULL &&
-        csec_name_looks_secret_like(argument, strlen(argument))) {
+        cs_secret_name_looks_secret_like(
+            (const uint8_t *)argument, strlen(argument))) {
         *redact_next = true;
     }
-    if (csec_value_looks_secret_like(argument)) {
+    if (cs_secret_value_looks_secret_like(
+            (const uint8_t *)argument, strlen(argument))) {
         return redacted;
     }
     return argument;

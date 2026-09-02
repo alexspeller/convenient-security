@@ -11,17 +11,26 @@ import Darwin
 /// apply, an empty array when nothing is selected, or nil when the user
 /// cancels or the terminal is non-interactive.
 enum EnvSelectView {
-    static func run(rows: [EnvSelectRow], initiallySelected: Set<Int>) -> [String]? {
+    static func run(
+        rows: [EnvSelectRow],
+        initiallySelected: Set<Int>,
+        valuesByName: [String: String]
+    ) -> [String]? {
         guard !rows.isEmpty else { return [] }
-        guard let raw = TerminalRawMode() else { return nil }
+        guard let raw = TerminalRawMode(captureInterrupt: true) else { return nil }
         defer { raw.restore() }
         let color = TerminalStyle.colorEnabled(STDERR_FILENO)
         var model = EnvSelectModel(rows: rows, initiallySelected: initiallySelected)
+        var valuesRevealed = false
         var previousLines = 0
 
         func redraw() {
             let width = max(20, TerminalStyle.terminalWidth(fd: STDERR_FILENO)) - 1
-            previousLines = draw(model.render(color: color, width: width), previousLines: previousLines)
+            previousLines = draw(model.render(
+                color: color,
+                width: width,
+                revealedValues: valuesRevealed ? valuesByName : nil
+            ), previousLines: previousLines)
         }
         redraw()
 
@@ -31,6 +40,7 @@ enum EnvSelectView {
             case .down, .char("j"): model.moveDown(); redraw()
             case .space: model.toggle(); redraw()
             case .char("a"), .char("A"): model.toggleAll(); redraw()
+            case .char("v"), .char("V"): valuesRevealed.toggle(); redraw()
             case .enter:
                 clearBlock(previousLines)
                 return model.selectedNames

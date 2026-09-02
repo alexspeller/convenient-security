@@ -6,6 +6,8 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_file="$here/sudo/pam_csec_sudo.c"
+heuristics_source="$here/../agent/Sources/CSECSecretHeuristics/CSECSecretHeuristics.c"
+heuristics_include="$here/../agent/Sources/CSECSecretHeuristics/include"
 output_dir="$here/build/sudo-pam"
 module="$output_dir/pam_csec_sudo.so"
 preview="$output_dir/pam-csec-sudo-prompt-preview"
@@ -32,6 +34,7 @@ common_flags=(
   -Wextra
   -Werror
   -fstack-protector-strong
+  -I "$heuristics_include"
 )
 
 build_module_arch() {
@@ -42,6 +45,7 @@ build_module_arch() {
     -dynamiclib \
     -Wl,-install_name,/usr/local/lib/pam/pam_csec_sudo.so \
     "$source_file" \
+    "$heuristics_source" \
     -framework CoreFoundation \
     -framework Security \
     -lpam \
@@ -60,6 +64,7 @@ lipo -create \
 xcrun clang "${common_flags[@]}" \
   -DCSEC_PAM_PROMPT_PREVIEW=1 \
   "$source_file" \
+  "$heuristics_source" \
   -framework CoreFoundation \
   -framework Security \
   -lpam \
@@ -68,6 +73,7 @@ xcrun clang "${common_flags[@]}" \
 xcrun clang "${common_flags[@]}" \
   -DCSEC_PAM_REDACTOR_PROBE=1 \
   "$source_file" \
+  "$heuristics_source" \
   -framework CoreFoundation \
   -framework Security \
   -lpam \
@@ -105,6 +111,16 @@ check_preview \
   "safe environment assignment" \
   $'approve this sudo invocation:\n  sudo CSEC_SYNTHETIC_MODE=test /usr/bin/env'"$context_suffix" \
   sudo CSEC_SYNTHETIC_MODE=test /usr/bin/env
+
+check_preview \
+  "passwordless URL" \
+  $'approve this sudo invocation:\n  sudo /usr/bin/tool http://192.0.2.140:8123'"$context_suffix" \
+  sudo /usr/bin/tool http://192.0.2.140:8123
+
+check_preview \
+  "password-bearing URL" \
+  $'approve this sudo invocation:\n  sudo /usr/bin/tool "[csec:secret-like]"'"$context_suffix" \
+  sudo /usr/bin/tool http://synthetic-user:synthetic-password@example.test
 
 check_preview \
   "secret-named environment assignment" \

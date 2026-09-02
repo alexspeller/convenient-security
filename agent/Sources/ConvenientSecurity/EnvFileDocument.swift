@@ -76,6 +76,9 @@ public struct EnvFileDocument: Equatable {
         /// True when parsed occurrences disagree; a rewrite scrubs the stale
         /// shadowed values by pointing every occurrence at the same reference.
         public let differingValues: Bool
+        /// One centralized name/value verdict, retained so picker rendering
+        /// cannot drift from the initial-selection decision.
+        public let secretLike: Bool
         public let preselect: Bool
     }
 
@@ -332,9 +335,11 @@ public struct EnvFileDocument: Equatable {
             }
 
             let parsedValues = occurrences.compactMap(\.value).filter { !$0.isEmpty }
-            let preselect = kind == .importable && !winningIsCommented
-                && (SecretHeuristics.nameLooksSecretLike(name)
-                    || SecretHeuristics.valueLooksSecretLike(importValue))
+            let secretLike = SecretHeuristics.environmentVariableLooksSecretLike(
+                name: name,
+                value: kind == .importable ? importValue : nil
+            )
+            let preselect = kind == .importable && !winningIsCommented && secretLike
             return Candidate(
                 name: name,
                 importValue: importValue,
@@ -343,6 +348,7 @@ public struct EnvFileDocument: Equatable {
                 lineNumber: winning.lineIndex + 1,
                 occurrenceCount: occurrences.count,
                 differingValues: Set(parsedValues).count > 1,
+                secretLike: secretLike,
                 preselect: preselect
             )
         }

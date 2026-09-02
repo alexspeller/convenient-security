@@ -51,12 +51,9 @@ public struct EnvSelectModel: Equatable {
             if candidate.differingValues { notes.append("values differ") }
 
             var selectable = false
-            var secretLike = SecretHeuristics.nameLooksSecretLike(candidate.name)
             switch candidate.kind {
             case .importable:
                 selectable = true
-                secretLike = secretLike
-                    || SecretHeuristics.valueLooksSecretLike(candidate.importValue)
             case .alreadyReference(let scheme):
                 notes.append("already \(scheme)://")
             case .unsupported:
@@ -64,14 +61,14 @@ public struct EnvSelectModel: Equatable {
             case .empty:
                 notes.append("empty")
             }
-            if secretLike { notes.append("secret-like") }
+            if candidate.secretLike { notes.append("secret-like") }
 
             if candidate.preselect { initiallySelected.insert(rows.count) }
             rows.append(EnvSelectRow(
                 name: candidate.name,
                 selectable: selectable,
                 annotation: notes.joined(separator: " · "),
-                secretLike: secretLike
+                secretLike: candidate.secretLike
             ))
         }
         return (rows, initiallySelected)
@@ -99,17 +96,32 @@ public struct EnvSelectModel: Equatable {
 
     public var selectableCount: Int { rows.filter(\.selectable).count }
 
-    /// Render the picker as a single redraw block (no trailing newline). Each
-    /// line is truncated to `width` so the block never soft-wraps.
-    public func render(color: Bool, width: Int) -> String {
+    /// Render the picker as a single redraw block (no trailing newline). Values
+    /// stay absent unless the interactive caller explicitly supplies them after
+    /// a reveal action. Every line is bounded so the block never soft-wraps.
+    public func render(
+        color: Bool,
+        width: Int,
+        revealedValues: [String: String]? = nil
+    ) -> String {
         let clamp = max(8, width)
         var lines: [String] = []
         lines.append(TerminalStyle.paint(
             TerminalStyle.truncate("Select variables to protect", to: clamp),
             TerminalStyle.Code.bold, color: color))
+        let revealAction = revealedValues == nil ? "v reveal" : "v hide"
         lines.append(TerminalStyle.paint(
-            TerminalStyle.truncate("space toggle · ↑/↓ move · a all/none · enter import · q cancel", to: clamp),
+            TerminalStyle.truncate(
+                "space toggle · ↑/↓ move · a all/none · \(revealAction) · enter import · q cancel",
+                to: clamp
+            ),
             TerminalStyle.Code.dim, color: color))
+
+        if revealedValues != nil {
+            lines.append(TerminalStyle.paint(
+                TerminalStyle.truncate("Values visible — press v to hide", to: clamp),
+                TerminalStyle.Code.yellow, color: color))
+        }
 
         for (index, row) in rows.enumerated() {
             let onCursor = index == cursor
@@ -125,11 +137,69 @@ public struct EnvSelectModel: Equatable {
                 line = TerminalStyle.paint(line, TerminalStyle.Code.green, color: color)
             }
             lines.append(line)
+            if let value = revealedValues?[row.name] {
+                let prefix = "      value: "
+                let literal = Self.revealedValueLiteral(
+                    value,
+                    characterLimit: max(4, clamp - prefix.count)
+                )
+                let detail = TerminalStyle.truncate(prefix + literal, to: clamp)
+                lines.append(TerminalStyle.paint(
+                    detail, TerminalStyle.Code.yellow, color: color
+                ))
+            }
         }
 
         lines.append(TerminalStyle.paint(
             TerminalStyle.truncate("\(selected.count) of \(selectableCount) selected", to: clamp),
             TerminalStyle.Code.dim, color: color))
         return lines.joined(separator: "\n")
+    }
+
+    /// A bounded one-line literal for an explicitly revealed value. Control
+    /// and bidirectional-formatting scalars are escaped so env contents cannot
+    /// inject terminal commands or visually reorder the picker.
+    private static func revealedValueLiteral(
+        _ value: String,
+        characterLimit: Int
+    ) -> String {
+        let bidiControls: Set<UInt32> = [
+            0x061c, 0x200e, 0x200f,
+            0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
+            0x2066, 0x2067, 0x2068, 0x2069,
+        ]
+        let limit = max(4, characterLimit)
+        var result = "\""
+        var used = 1
+        var truncated = false
+        for scalar in value.unicodeScalars {
+            let fragment: String
+            switch scalar.value {
+            case 0x09: fragment = "\\t"
+            case 0x0a: fragment = "\\n"
+            case 0x0d: fragment = "\\r"
+            case 0x22: fragment = "\\\""
+            case 0x5c: fragment = "\\\\"
+            default:
+                if CharacterSet.controlCharacters.contains(scalar)
+                    || bidiControls.contains(scalar.value) {
+                    fragment = String(format: "\\u{%04X}", scalar.value)
+                } else {
+                    fragment = String(scalar)
+                }
+            }
+            if used + fragment.count + 1 > limit {
+                truncated = true
+                break
+            }
+            result += fragment
+            used += fragment.count
+        }
+        if truncated {
+            if used + 2 <= limit {
+                result += "…"
+            }
+        }
+        return result + "\""
     }
 }

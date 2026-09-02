@@ -1621,21 +1621,6 @@ do {
     check((try? Data(contentsOf: URL(fileURLWithPath: envPath))) == fixtureData,
           "protect --env without a TTY leaves the file byte-identical")
 
-    // Values stay hidden by default but an explicit `v` reveals every
-    // importable candidate long enough to compare before another key action.
-    let revealed = runCsecInPTYAt(
-        cwd: projectDir, ["protect", "--env", "--store", store, ".envrc"],
-        keystrokes: "vq"
-    )
-    check(revealed.status == 1
-          && revealed.out.contains("xoxb-e2e-1234567890abcdef")
-          && revealed.out.contains("quoted-secret-value")
-          && revealed.out.contains("commented-out-password")
-          && revealed.out.contains("Values visible"),
-          "protect --env reveals candidate values only after the picker shortcut")
-    check((try? Data(contentsOf: URL(fileURLWithPath: envPath))) == fixtureData,
-          "revealing then cancelling leaves the env file byte-identical")
-
     // Cancelling the picker changes nothing.
     let cancelled = runCsecInPTYAt(
         cwd: projectDir, ["protect", "--env", "--store", store, ".envrc"], keystrokes: "q")

@@ -167,6 +167,9 @@ clang -fsyntax-only -Wall -Wextra -Werror \
   -I "$repo_root/agent/Sources/CSecuritySupport/include" \
   "$repo_root/agent/Sources/CSecuritySupport/CSecuritySupport.c"
 clang -fsyntax-only -Wall -Wextra -Werror \
+  -I "$repo_root/agent/Sources/CSECSecretHeuristics/include" \
+  "$repo_root/agent/Sources/CSECSecretHeuristics/CSECSecretHeuristics.c"
+clang -fsyntax-only -Wall -Wextra -Werror \
   "$repo_root/agent/Sources/cs-file-probe/main.c"
 clang -fsyntax-only -Wall -Wextra -Werror \
   "$repo_root/agent/Sources/cs-gh-fixture/main.c"

@@ -23,6 +23,9 @@ let package = Package(
             name: "CSecuritySupport",
             linkerSettings: [.linkedLibrary("bsm"), .linkedLibrary("util")]
         ),
+        // Pure secret-shape classifier shared by Swift and the standalone PAM
+        // build without pulling unrelated process primitives across boundaries.
+        .target(name: "CSECSecretHeuristics"),
         // Value-free launch plans, peer identity, framing, and root wire types.
         // This target deliberately has no AppKit, LocalAuthentication, Keychain,
         // provider, or ServiceManagement implementation.
@@ -46,7 +49,8 @@ let package = Package(
         .target(
             name: "ConvenientSecurity",
             dependencies: [
-                "CSecuritySupport", "CSECRootProtocol", "CSECRemoteApproval",
+                "CSecuritySupport", "CSECSecretHeuristics", "CSECRootProtocol",
+                "CSECRemoteApproval",
             ]
         ),
         // All 1Password-specific code lives behind the provider seam.

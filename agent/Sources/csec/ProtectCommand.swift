@@ -416,7 +416,14 @@ private func runProtectEnv(
         protectFail("--env needs an interactive terminal for the picker (use --dry-run to preview)")
     }
 
-    guard let selectedNames = EnvSelectView.run(rows: rows, initiallySelected: initiallySelected)
+    let valuesByName = Dictionary(uniqueKeysWithValues: document.candidates.compactMap {
+        $0.kind == .importable ? ($0.name, $0.importValue) : nil
+    })
+    guard let selectedNames = EnvSelectView.run(
+        rows: rows,
+        initiallySelected: initiallySelected,
+        valuesByName: valuesByName
+    )
     else {
         protectFail("cancelled; nothing changed")
     }
