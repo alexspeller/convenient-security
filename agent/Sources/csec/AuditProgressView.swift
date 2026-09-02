@@ -10,7 +10,7 @@ import Darwin
 // (which re-checks the host before presenting the Touch ID review). All drawing
 // goes to stderr so a piped/`--json` stdout stays clean; nothing here renders a
 // credential value — only catalog ids/titles and counts, sanitized once more at
-// the display boundary via `auditSafe`.
+// the display boundary via `ReviewDisplay.sanitized`.
 
 /// Bytes for "show cursor + newline", written from the SIGINT handler (which must
 /// stay async-signal-safe — a preallocated buffer, `write`, and `_exit` only).
@@ -57,7 +57,7 @@ struct AuditProgressView {
     /// Draw the current snapshot, advancing the spinner one frame.
     mutating func render(_ snapshot: HostAuditProgressSnapshot, now: Date = Date()) {
         defer { frame += 1 }
-        let width = Self.terminalWidth()
+        let width = TerminalStyle.terminalWidth(fd: fileno(stderr))
 
         let spin = Self.spinner[frame % Self.spinner.count]
         let total = max(snapshot.total, 1)
@@ -80,7 +80,7 @@ struct AuditProgressView {
         // Variable tail: counts, the domain phase, and the check now running.
         var tail = "  \(completed)/\(total)  \(phaseLabel(for: snapshot.currentID))"
         if !snapshot.currentID.isEmpty {
-            let title = auditSafe(snapshot.currentTitle)
+            let title = ReviewDisplay.sanitized(snapshot.currentTitle, allowNewlines: true)
             tail += " · \(snapshot.currentID) \(title)"
         }
         tail += "  (\(elapsedText(now: now)))"
@@ -101,7 +101,7 @@ struct AuditProgressView {
     // MARK: - helpers
 
     private func paint(_ text: String, _ code: String) -> String {
-        useColor && !text.isEmpty ? "\u{1B}[\(code)m\(text)\u{1B}[0m" : text
+        TerminalStyle.paint(text, code, color: useColor)
     }
 
     private func elapsedText(now: Date) -> String {
@@ -133,19 +133,6 @@ struct AuditProgressView {
         if text.count <= limit { return text }
         if limit <= 1 { return "…" }
         return String(text.prefix(limit - 1)) + "…"
-    }
-
-    static func terminalWidth() -> Int {
-        #if canImport(Darwin)
-        var ws = winsize()
-        if ioctl(fileno(stderr), UInt(TIOCGWINSZ), &ws) == 0, ws.ws_col > 0 {
-            return Int(ws.ws_col)
-        }
-        #endif
-        if let columns = ProcessInfo.processInfo.environment["COLUMNS"], let value = Int(columns), value > 0 {
-            return value
-        }
-        return 80
     }
 }
 

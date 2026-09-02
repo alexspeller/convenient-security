@@ -22,7 +22,7 @@ private struct FDDeclaration {
 }
 
 func runSession(_ arguments: [String]) -> Never {
-    guard arguments.count >= 2, arguments[0] == "--" else { usage() }
+    guard arguments.count >= 2, arguments[0] == "--" else { usage("session") }
     let commandLine = Array(arguments.dropFirst())
 
     do {
@@ -37,14 +37,14 @@ func runSession(_ arguments: [String]) -> Never {
 }
 
 func runCredentials(_ arguments: [String]) -> Never {
-    guard let kind = arguments.first else { usage() }
+    guard let kind = arguments.first else { usage("creds") }
     switch kind {
     case "aws":
         runAWSCredentials(Array(arguments.dropFirst()))
     case "git":
         runGitCredentials(Array(arguments.dropFirst()))
     default:
-        usage()
+        usage("creds")
     }
 }
 
@@ -66,26 +66,26 @@ private func runAWSCredentials(_ arguments: [String]) -> Never {
         case "--expiration-ref": role = AWSCredentialProcess.expiration
         case "--reason":
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("creds") }
             reason = arguments[index]
             role = nil
         case "--for":
             index += 1
-            guard index < arguments.count, let seconds = Int(arguments[index]) else { usage() }
+            guard index < arguments.count, let seconds = Int(arguments[index]) else { usage("creds") }
             ttlSeconds = seconds
             role = nil
         default:
-            usage()
+            usage("creds")
         }
 
         if let role {
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("creds") }
             if role == "item" {
-                guard itemReference == nil else { usage() }
+                guard itemReference == nil else { usage("creds") }
                 itemReference = arguments[index]
             } else {
-                guard roleReferences[role] == nil else { usage() }
+                guard roleReferences[role] == nil else { usage("creds") }
                 roleReferences[role] = arguments[index]
             }
         }
@@ -98,12 +98,12 @@ private func runAWSCredentials(_ arguments: [String]) -> Never {
           itemReference != nil || (
             roleReferences[AWSCredentialProcess.accessKeyID] != nil
                 && roleReferences[AWSCredentialProcess.secretAccessKey] != nil
-          ) else { usage() }
+          ) else { usage("creds") }
 
     let references = stableUnique(itemReference.map { [$0] } ?? Array(roleReferences.values))
     guard references.allSatisfy({ (try? SecretRef($0)) != nil }),
           cs_fd_is_pipe_or_socket(STDOUT_FILENO) == 1 else {
-        writeError("csec creds aws: stdout must be a private pipe and all references must be valid\n")
+        csecError("creds aws", "stdout must be a private pipe and all references must be valid")
         exit(2)
     }
 
@@ -182,23 +182,23 @@ private func runGitCredentials(_ arguments: [String]) -> Never {
         case "--reason": destination = { reason = $0 }
         case "--for":
             index += 1
-            guard index < arguments.count, let seconds = Int(arguments[index]) else { usage() }
+            guard index < arguments.count, let seconds = Int(arguments[index]) else { usage("creds") }
             ttlSeconds = seconds
             destination = nil
         default:
-            guard !token.hasPrefix("-"), operation == nil else { usage() }
+            guard !token.hasPrefix("-"), operation == nil else { usage("creds") }
             operation = token
             destination = nil
         }
         if let destination {
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("creds") }
             destination(arguments[index])
         }
         index += 1
     }
 
-    guard let operation else { usage() }
+    guard let operation else { usage("creds") }
     if operation == "capability" {
         _ = writeCredentialOutput(Data("version 0\n\n".utf8))
         exit(0)
@@ -218,7 +218,7 @@ private func runGitCredentials(_ arguments: [String]) -> Never {
           !reason.isEmpty, reason.utf8.count <= 128,
           let passwordReference,
           (try? SecretRef(passwordReference)) != nil,
-          usernameReference.map({ (try? SecretRef($0)) != nil }) ?? true else { usage() }
+          usernameReference.map({ (try? SecretRef($0)) != nil }) ?? true else { usage("creds") }
 
     do {
         let request = try GitCredentialRequest(data: input)
@@ -228,7 +228,7 @@ private func runGitCredentials(_ arguments: [String]) -> Never {
             path: expectedPath
         ) else { exit(0) }
         guard cs_fd_is_pipe_or_socket(STDOUT_FILENO) == 1 else {
-            writeError("csec creds git: refusing credential output without a private pipe\n")
+            csecError("creds git", "refusing credential output without a private pipe")
             exit(2)
         }
 
@@ -237,7 +237,7 @@ private func runGitCredentials(_ arguments: [String]) -> Never {
         let target = expectedProtocol.lowercased() + "://" + expectedHost.lowercased()
             + (expectedPath.map { "/\($0)" } ?? "")
         let operationContext = "\(reason) for \(target)"
-        guard operationContext.utf8.count <= 512 else { usage() }
+        guard operationContext.utf8.count <= 512 else { usage("creds") }
         let commandDigest = try ExecutableInspection.commandDigest([
             "git-credential", expectedProtocol.lowercased(), expectedHost.lowercased(),
             expectedPath ?? "", usernameReference ?? "", passwordReference,
@@ -298,19 +298,19 @@ func runExecFD(_ arguments: [String]) -> Never {
         case "--fd", "--preset":
             index += 1
             guard index < arguments.count,
-                  let equals = arguments[index].firstIndex(of: "=") else { usage() }
+                  let equals = arguments[index].firstIndex(of: "=") else { usage("exec-fd") }
             let name = String(arguments[index][..<equals])
             let reference = String(arguments[index][arguments[index].index(after: equals)...])
-            guard !name.isEmpty, !reference.isEmpty else { usage() }
+            guard !name.isEmpty, !reference.isEmpty else { usage("exec-fd") }
             if token == "--preset" {
-                guard let preset = InheritedFilePreset(rawValue: name) else { usage() }
+                guard let preset = InheritedFilePreset(rawValue: name) else { usage("exec-fd") }
                 declarations.append(FDDeclaration(
                     environmentName: preset.environmentName,
                     reference: reference,
                     preset: preset
                 ))
             } else {
-                guard validEnvironmentName(name), !name.hasPrefix("CSEC_") else { usage() }
+                guard validEnvironmentName(name), !name.hasPrefix("CSEC_") else { usage("exec-fd") }
                 declarations.append(FDDeclaration(
                     environmentName: name,
                     reference: reference,
@@ -319,38 +319,38 @@ func runExecFD(_ arguments: [String]) -> Never {
             }
         case "--reason":
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("exec-fd") }
             reason = arguments[index]
         case "--for":
             index += 1
-            guard index < arguments.count, let seconds = Int(arguments[index]) else { usage() }
+            guard index < arguments.count, let seconds = Int(arguments[index]) else { usage("exec-fd") }
             ttlSeconds = seconds
         case "--redact-output":
             index += 1
             guard index < arguments.count,
-                  let mode = OutputGuardMode(rawValue: arguments[index]) else { usage() }
+                  let mode = OutputGuardMode(rawValue: arguments[index]) else { usage("exec-fd") }
             outputGuard.mode = mode
         case let option where option.hasPrefix("--redact-output="):
             guard let mode = OutputGuardMode(
                 rawValue: String(option.dropFirst("--redact-output=".count))
-            ) else { usage() }
+            ) else { usage("exec-fd") }
             outputGuard.mode = mode
         case "--redact-output-label":
             index += 1
             guard index < arguments.count,
-                  let style = OutputRedactionLabelStyle(rawValue: arguments[index]) else { usage() }
+                  let style = OutputRedactionLabelStyle(rawValue: arguments[index]) else { usage("exec-fd") }
             outputGuard.labelStyle = style
         case let option where option.hasPrefix("--redact-output-label="):
             guard let style = OutputRedactionLabelStyle(
                 rawValue: String(option.dropFirst("--redact-output-label=".count))
-            ) else { usage() }
+            ) else { usage("exec-fd") }
             outputGuard.labelStyle = style
         case "--redact-short-values":
             outputGuard.includeShortValues = true
         case "--redact-output-warn":
             outputGuard.emitWarnings = true
         default:
-            usage()
+            usage("exec-fd")
         }
         index += 1
     }
@@ -360,7 +360,7 @@ func runExecFD(_ arguments: [String]) -> Never {
           Set(declarations.map(\.environmentName)).count == declarations.count,
           declarations.allSatisfy({ (try? SecretRef($0.reference)) != nil }),
           ttlSeconds > 0, ttlSeconds <= 24 * 60 * 60,
-          reason?.utf8.count ?? 0 <= 256 else { usage() }
+          reason?.utf8.count ?? 0 <= 256 else { usage("exec-fd") }
 
     do {
         let executable = try conservativeExecutable(command: commandLine[0])
@@ -612,6 +612,7 @@ private func writeError(_ message: String) {
 }
 
 private func fail(_ label: String, _ error: Error) -> Never {
-    writeError("\(label): \(error.localizedDescription)\n")
+    let command = label.hasPrefix("csec ") ? String(label.dropFirst("csec ".count)) : label
+    csecError(command, ReviewDisplay.sanitized(error.localizedDescription))
     exit(1)
 }

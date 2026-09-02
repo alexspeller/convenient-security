@@ -51,6 +51,17 @@ This limits which values the agent releases; it does not make every descendant
 trustworthy. A process deliberately launched inside an approved subtree is part
 of the authorized consumer boundary.
 
+`csec automation` is the explicit exception to memory-only, human-present
+grants. One local attended enrollment stores device-only copies for exact
+canonical refs and permits the signed runner's exact direct interpreter child to
+use them until revoke, with a bounded lease for each run. The script,
+dependencies, ordinary inputs, and sanitized trigger environment are deliberately
+not integrity-bound. Same-UID code that can modify them can obtain all refs in
+that job; any same-UID process can also invoke the registered runner and choose
+its remaining ordinary environment. Users who cannot accept that boundary must
+not enroll it. Ordinary access remains time-bounded and unchanged. See
+[`automation.md`](automation.md).
+
 `csec session` makes that wider boundary explicit. The daemon records the
 signed launcher's kernel PID, process start time, and audit session before the
 launcher becomes the requested shell or command. Its inherited random ID is
@@ -229,6 +240,31 @@ identity. Re-enrolling biometrics invalidates cached items.
 
 An unsigned development daemon cannot use this cache and runs without
 persistence. The warm plaintext cache exists only in the daemon process.
+
+### 1Password account selection
+
+An `op://VAULT/ITEM/FIELD` reference names no account, and a vault name is unique
+only within one account. With several accounts signed in, an account-less `op
+read` therefore resolves against whatever account `op`'s own configuration last
+recorded — so the value a reference yields can change without the reference,
+1Password, or csec changing at all.
+
+csec resolves the account itself, from vault ownership, and passes it explicitly.
+The residual risk is *value substitution*: an attacker who can get an account
+signed in on this Mac (an invitation the user accepts, say) could place a vault
+and item whose names match one the user already relies on, and offer their own
+value in place of the real one. That substitutes a credential; it never discloses
+the genuine one, since the two accounts cannot read each other's vaults.
+
+Three properties bound it. The vault-to-account map is derived state kept only in
+the daemon's memory — never a file, which same-uid malware could edit to redirect
+a reference at an account it controls. A reference whose vault name several
+accounts hold resolves only after a trusted review has displayed the account that
+will be used and warned that the name is ambiguous; unattended and cold-index
+paths fail closed instead. And the account each reference resolved from is
+remembered for the daemon's lifetime, so an approved reference cannot drift to a
+different account later in the session. A reference that names its vault by the
+globally unique vault id is unambiguous by construction.
 
 ### Native encrypted stores
 

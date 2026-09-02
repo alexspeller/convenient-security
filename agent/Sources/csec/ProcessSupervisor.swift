@@ -30,6 +30,7 @@ enum ProcessSupervisorError: Error, CustomStringConvertible {
     case setupFailed(String)
     case deliveryFailed
     case redactionFailed(String)
+    case timedOut
 
     var description: String {
         switch self {
@@ -43,6 +44,8 @@ enum ProcessSupervisorError: Error, CustomStringConvertible {
             return "the target closed an inherited secret channel before delivery completed"
         case let .redactionFailed(message):
             return "the trusted output scanner became unavailable: \(message)"
+        case .timedOut:
+            return "the command exceeded its registered maximum runtime"
         }
     }
 }
@@ -264,6 +267,25 @@ private final class CStringVector {
     }
 }
 
+private final class OptionalCString {
+    let pointer: UnsafeMutablePointer<CChar>?
+
+    init(_ string: String?) throws {
+        if let string {
+            guard let pointer = strdup(string) else {
+                throw ProcessSupervisorError.allocationFailed
+            }
+            self.pointer = pointer
+        } else {
+            pointer = nil
+        }
+    }
+
+    deinit {
+        if let pointer { free(pointer) }
+    }
+}
+
 enum ProcessSupervisor {
     /// Supervise one command and return its raw wait status. The caller uses
     /// `cs_terminate_like_wait_status` so a signalled child remains signalled to
@@ -272,6 +294,8 @@ enum ProcessSupervisor {
         executablePath: String,
         commandLine: [String],
         environment: [String: String],
+        workingDirectory: String? = nil,
+        timeoutSeconds: TimeInterval? = nil,
         catalog: OutputRedactionCatalog? = nil,
         agentSession: AgentOutputRedactionSession? = nil,
         mode: OutputGuardMode,
@@ -279,6 +303,7 @@ enum ProcessSupervisor {
         inheritedFiles: [InheritedSecretFile] = []
     ) throws -> Int32 {
         precondition(inheritedFiles.count <= 32)
+        precondition(timeoutSeconds == nil || (timeoutSeconds!.isFinite && timeoutSeconds! > 0))
         let patterns = mode == .never ? [] : (catalog?.patterns ?? [])
         let stdinIsTTY = isatty(STDIN_FILENO) == 1
         let stdoutIsTTY = isatty(STDOUT_FILENO) == 1
@@ -315,6 +340,7 @@ enum ProcessSupervisor {
             return "\(key)=\(value)"
         }
         let envp = try CStringVector(environmentEntries)
+        let workingDirectoryCString = try OptionalCString(workingDirectory)
 
         var childPID: Int32 = -1
         var ptyMaster: Int32 = -1
@@ -329,6 +355,7 @@ enum ProcessSupervisor {
                             path,
                             argvBuffer.baseAddress,
                             envBuffer.baseAddress,
+                            workingDirectoryCString.pointer,
                             stdinUsesPTY ? 1 : 0,
                             stdoutMode,
                             stderrMode,
@@ -456,6 +483,12 @@ enum ProcessSupervisor {
         let reporter = IncidentReporter(emitWarnings: emitWarnings)
         var relayInput = stdinUsesPTY
         var terminalStatus: Int32?
+        // Runtime limits use the monotonic system uptime rather than wall time,
+        // so a clock correction cannot extend an unattended process lifetime.
+        let timeoutDeadline = timeoutSeconds.map {
+            ProcessInfo.processInfo.systemUptime + $0
+        }
+        var timeoutTerminationSentAt: TimeInterval?
 
         func forward(_ result: OutputRedactionResult, through capture: Capture) {
             reporter.record(result.matches, stream: capture.stream)
@@ -529,6 +562,18 @@ enum ProcessSupervisor {
 
         do {
             while terminalStatus == nil || captures.contains(where: \.isOpen) {
+                let loopNow = ProcessInfo.processInfo.systemUptime
+                if terminalStatus == nil,
+                   timeoutTerminationSentAt == nil,
+                   let timeoutDeadline,
+                   loopNow >= timeoutDeadline {
+                    timeoutTerminationSentAt = loopNow
+                    _ = kill(-childPID, SIGTERM)
+                } else if terminalStatus == nil,
+                          let sentAt = timeoutTerminationSentAt,
+                          loopNow - sentAt >= 5 {
+                    _ = kill(-childPID, SIGKILL)
+                }
                 enum PollSource {
                     case signal
                     case input
@@ -686,6 +731,9 @@ enum ProcessSupervisor {
 
         guard let terminalStatus else {
             throw ProcessSupervisorError.setupFailed("child status unavailable")
+        }
+        if timeoutTerminationSentAt != nil {
+            throw ProcessSupervisorError.timedOut
         }
         return terminalStatus
     }

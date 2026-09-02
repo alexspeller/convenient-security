@@ -8,9 +8,14 @@ import Foundation
 /// risk-level collapse) no classification or acceptance state.
 public struct PolicyReviewCredential: Sendable {
     public let references: [SecretRef]
+    /// Value-free context the owning provider supplied for these references —
+    /// where the value will come from, and any warning about that choice. The
+    /// core does not interpret them; it renders them.
+    public let providerNotes: [ProviderReviewNote]
 
-    public init(references: [SecretRef]) {
+    public init(references: [SecretRef], providerNotes: [ProviderReviewNote] = []) {
         self.references = references.sorted { $0.uri < $1.uri }
+        self.providerNotes = providerNotes
     }
 }
 
@@ -20,17 +25,22 @@ public struct AccessPolicyReview: Sendable {
     public let reason: String
     public let plan: DeliveryPlan
     public let credentials: [PolicyReviewCredential]
+    /// Present only for explicit attended enrollment of a persistent unattended
+    /// job. It carries value-free job metadata and is never inferred from access.
+    public let automation: AutomationReviewDetails?
 
     public init(
         caller: CallerInfo,
         reason: String,
         plan: DeliveryPlan,
-        credentials: [PolicyReviewCredential]
+        credentials: [PolicyReviewCredential],
+        automation: AutomationReviewDetails? = nil
     ) {
         self.caller = caller
         self.reason = reason
         self.plan = plan
         self.credentials = credentials
+        self.automation = automation
     }
 }
 
@@ -38,6 +48,10 @@ public struct AccessPolicyReview: Sendable {
 /// path, argv, reference value, or resolved secret, so warnings cannot disclose
 /// the redirection target or plaintext.
 public enum DeliveryReviewCopy {
+    public static let automationWarningTitle = "Unattended access until you revoke it"
+    public static let automationWarningExplanation =
+        "Touch ID creates device-only copies that this mutable job can use without asking again. Anyone who can change its command, scripts, dependencies, working directory, arguments, or ordinary environment can obtain these secrets on its next run."
+
     public static func recipientDescription(for plan: DeliveryPlan) -> String {
         switch plan.recipientAssurance {
         case .interactiveTerminal:
@@ -57,6 +71,9 @@ public enum DeliveryReviewCopy {
     /// terminal — an agent, script, or logger is capturing the output) it also
     /// steers toward the injection commands, which never return the value here.
     public static func warning(for review: AccessPolicyReview) -> String? {
+        if review.automation != nil {
+            return "\(automationWarningTitle): \(automationWarningExplanation)"
+        }
         let plan = review.plan
         let base: String
         switch plan.recipientAssurance {

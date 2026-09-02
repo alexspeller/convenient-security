@@ -21,6 +21,54 @@ public actor SecretResolver {
         providers.keys.sorted()
     }
 
+    /// Value-free context the owning provider wants shown before this reference
+    /// is authorized (e.g. which 1Password account it resolves from). Never
+    /// consults the cache: a note describes the resolution the review is about
+    /// to authorize, not a value already held.
+    public func reviewNotes(for ref: SecretRef) async -> [ProviderReviewNote] {
+        guard let provider = providers[ref.scheme] else { return [] }
+        return await provider.reviewNotes(for: ref)
+    }
+
+    /// Reviewable credentials, one per group, each carrying its providers'
+    /// value-free context. Use this everywhere a review is built so every
+    /// consent surface describes resolution the same way.
+    public func reviewCredentials(
+        for groups: [[SecretRef]]
+    ) async -> [PolicyReviewCredential] {
+        var credentials: [PolicyReviewCredential] = []
+        for group in groups {
+            credentials.append(await reviewCredential(for: group))
+        }
+        return credentials
+    }
+
+    /// One reviewable credential with its providers' context attached. Notes
+    /// repeat across the fields of one item, so identical lines are shown once.
+    public func reviewCredential(for references: [SecretRef]) async -> PolicyReviewCredential {
+        var notes: [ProviderReviewNote] = []
+        var seen = Set<String>()
+        for reference in references {
+            for note in await reviewNotes(for: reference)
+            where seen.insert("\(note.label)\u{0}\(note.detail)").inserted {
+                notes.append(note)
+            }
+        }
+        return PolicyReviewCredential(references: references, providerNotes: notes)
+    }
+
+    /// Per-provider health lines for `csec status`, in stable scheme order.
+    public func providerStatuses() async -> [ProviderStatusSummary] {
+        var summaries: [ProviderStatusSummary] = []
+        for scheme in providers.keys.sorted() {
+            guard let provider = providers[scheme] else { continue }
+            if let summary = await provider.statusSummary() {
+                summaries.append(summary)
+            }
+        }
+        return summaries
+    }
+
     public func invalidate(references: some Sequence<String>) async {
         for reference in Set(references) {
             await cache.invalidate(reference)

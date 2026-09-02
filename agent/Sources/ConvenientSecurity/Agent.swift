@@ -53,8 +53,10 @@ public actor Agent {
     private let policyReview: PolicyReviewProvider
     private let nativeStore: NativeEncryptedFileProvider?
     private let sshSigningService: SSHSigningService?
+    private let automationService: AutomationService?
     private let allowLegacyAccessForTesting: Bool
     private let allowUnverifiedPlansForTesting: Bool
+    private let allowUnverifiedAutomationCallersForTesting: Bool
     private var activeSecrets = ActiveSecretRegistry()
     private var redactionSessions: [String: RedactionSession] = [:]
     private var nativeEditAuthorizations: [String: NativeEditAuthorization] = [:]
@@ -67,8 +69,10 @@ public actor Agent {
         policyReview: PolicyReviewProvider,
         nativeStore: NativeEncryptedFileProvider? = nil,
         sshSigningService: SSHSigningService? = nil,
+        automationService: AutomationService? = nil,
         allowLegacyAccessForTesting: Bool = false,
-        allowUnverifiedPlansForTesting: Bool = false
+        allowUnverifiedPlansForTesting: Bool = false,
+        allowUnverifiedAutomationCallersForTesting: Bool = false
     ) {
         self.resolver = resolver
         self.grants = grants
@@ -76,8 +80,11 @@ public actor Agent {
         self.policyReview = policyReview
         self.nativeStore = nativeStore
         self.sshSigningService = sshSigningService
+        self.automationService = automationService
         self.allowLegacyAccessForTesting = allowLegacyAccessForTesting
         self.allowUnverifiedPlansForTesting = allowUnverifiedPlansForTesting
+        self.allowUnverifiedAutomationCallersForTesting =
+            allowUnverifiedAutomationCallersForTesting
     }
 
     public func handle(request: AccessRequest, caller: CallerInfo) async -> Response {
@@ -196,6 +203,27 @@ public actor Agent {
             )
         }
 
+        if let automationService {
+            switch await automationService.authorizeAccess(
+                references: refs,
+                plan: plan,
+                caller: caller,
+                now: now
+            ) {
+            case .notApplicable:
+                break
+            case let .allowed(values, expiresAt):
+                activeSecrets.register(valuesByReference: values, expiresAt: expiresAt)
+                return Response(
+                    requestID: request.requestID,
+                    values: values,
+                    accessExpiresAt: expiresAt
+                )
+            case let .denied(error):
+                return automationFailure(error, requestID: request.requestID)
+            }
+        }
+
         return await handlePolicyAccess(
             refs: refs,
             request: request,
@@ -276,11 +304,16 @@ public actor Agent {
         // New references → one display-only trusted review + Touch ID. The
         // window shows the references, destination, and any inspectable-shape
         // warning; a successful biometric is itself the authorization.
-        let reviewCredentials = CredentialGrouping.groups(for: refs)
-            .filter { group in
-                group.references.contains { newReferenceURIs.contains($0.uri) }
-            }
-            .map { PolicyReviewCredential(references: $0.references) }
+        // Providers get to say where each value will come from before the window
+        // asks for Touch ID — an `op://` reference names no account, so this is
+        // where the chosen one becomes visible.
+        let reviewCredentials = await resolver.reviewCredentials(
+            for: CredentialGrouping.groups(for: refs)
+                .filter { group in
+                    group.references.contains { newReferenceURIs.contains($0.uri) }
+                }
+                .map(\.references)
+        )
         let review = AccessPolicyReview(
             caller: displayedCaller(caller, plan: plan, rootPID: rootPID),
             reason: request.reason,
@@ -413,13 +446,17 @@ public actor Agent {
             } catch {
                 // The reference URI is value-free metadata the consent window
                 // already displayed; naming it turns an opaque failure into an
-                // actionable one. The provider's own error stays out: it can
-                // carry unbounded tool output.
-                return .failed(
-                    .resolutionFailed,
-                    message: "the provider could not resolve \(ref.safeInlineURI)",
-                    requestID: requestID
-                )
+                // actionable one. A provider may add a reason only through
+                // `ProviderDiagnosableError`, which is csec-authored and
+                // bounded; a tool's own error output never reaches a client.
+                var message = "the provider could not resolve \(ref.safeInlineURI)"
+                if let diagnosable = error as? ProviderDiagnosableError {
+                    message += ": " + ReviewDisplay.bounded(
+                        ReviewDisplay.sanitized(diagnosable.boundedReason),
+                        maxBytes: 512
+                    )
+                }
+                return .failed(.resolutionFailed, message: message, requestID: requestID)
             }
         }
         if let activeUntil {
@@ -998,7 +1035,10 @@ public actor Agent {
     /// consent, no grant, no secret material — so a client can detect which
     /// environment values are secret references.
     public func schemes() async -> Response {
-        Response(schemes: await resolver.registeredSchemes())
+        Response(
+            schemes: await resolver.registeredSchemes(),
+            providerStatus: await resolver.providerStatuses()
+        )
     }
 
     public func capabilities() -> Response {
@@ -1006,6 +1046,8 @@ public actor Agent {
             switch $0 {
             case .nativeEncryptedStore, .nativeEditorPolicy:
                 return nativeStore != nil
+            case .unattendedAutomation:
+                return automationService != nil
             default:
                 return true
             }
@@ -1064,6 +1106,118 @@ public actor Agent {
         } catch {
             return sshFailure(error, requestID: request.requestID)
         }
+    }
+
+    public func configureAutomation(
+        request: AutomationRequest,
+        caller: CallerInfo
+    ) async -> Response {
+        guard UUID(uuidString: request.requestID)?.uuidString.lowercased()
+                == request.requestID else {
+            return .failed(
+                .invalidRequest,
+                message: "the automation request is invalid",
+                requestID: request.requestID
+            )
+        }
+        guard allowUnverifiedAutomationCallersForTesting || isVerifiedLauncher(caller) else {
+            return .failed(
+                .unverifiedPeer,
+                message: "unattended automation requires the verified csec launcher",
+                requestID: request.requestID
+            )
+        }
+        guard let automationService else {
+            return .failed(
+                .automationUnavailable,
+                message: "unattended automation is unavailable",
+                requestID: request.requestID
+            )
+        }
+
+        do {
+            switch request.action {
+            case .enroll:
+                guard let enrollment = request.enrollment,
+                      request.name == nil,
+                      request.runID == nil else {
+                    throw AutomationServiceError.invalidRequest
+                }
+                let job = try await automationService.enroll(enrollment, caller: caller)
+                return Response(requestID: request.requestID, automationJobs: [job])
+            case .list:
+                guard request.enrollment == nil,
+                      request.name == nil,
+                      request.runID == nil else {
+                    throw AutomationServiceError.invalidRequest
+                }
+                return Response(
+                    requestID: request.requestID,
+                    automationJobs: try await automationService.list()
+                )
+            case .beginRun:
+                guard request.enrollment == nil,
+                      let name = request.name,
+                      request.runID == nil else {
+                    throw AutomationServiceError.invalidRequest
+                }
+                switch try await automationService.beginRun(name: name, caller: caller) {
+                case let .started(run):
+                    return Response(requestID: request.requestID, automationRun: run)
+                case let .skipped(nextEligibleAt):
+                    return Response(
+                        requestID: request.requestID,
+                        automationNextEligibleAt: nextEligibleAt
+                    )
+                }
+            case .finishRun:
+                guard request.enrollment == nil,
+                      request.name == nil,
+                      let runID = request.runID,
+                      await automationService.finishRun(runID: runID, caller: caller) else {
+                    throw AutomationServiceError.invalidRequest
+                }
+                return Response(requestID: request.requestID)
+            case .revoke:
+                guard request.enrollment == nil,
+                      let name = request.name,
+                      request.runID == nil else {
+                    throw AutomationServiceError.invalidRequest
+                }
+                let job = try await automationService.revoke(name: name, caller: caller)
+                return Response(requestID: request.requestID, automationJobs: [job])
+            }
+        } catch let error as AutomationServiceError {
+            return automationFailure(error, requestID: request.requestID)
+        } catch {
+            return automationFailure(.unavailable, requestID: request.requestID)
+        }
+    }
+
+    private func automationFailure(
+        _ error: AutomationServiceError,
+        requestID: String?
+    ) -> Response {
+        let code: WireErrorCode
+        switch error {
+        case .invalidRequest, .notFound:
+            code = .invalidRequest
+        case .consentDenied:
+            code = .consentDenied
+        case .resolutionFailed:
+            code = .resolutionFailed
+        case .alreadyRunning:
+            code = .automationAlreadyRunning
+        case .unavailable, .materializationUnavailable:
+            code = .automationUnavailable
+        case .executableChanged:
+            code = .policyDenied
+        }
+        return .failed(
+            code,
+            message: error.localizedDescription,
+            requestID: requestID
+        )
     }
 
     private func sshFailure(_ error: Error, requestID: String) -> Response {

@@ -20,6 +20,7 @@ public enum WireCapability: String, Codable, Sendable, CaseIterable {
     case inheritedFileDescriptors = "inherited_file_descriptors"
     case protectedRegularFiles = "protected_regular_files"
     case remoteApprovals = "remote_approvals"
+    case unattendedAutomation = "unattended_automation"
 }
 
 public struct ProtocolCapabilities: Codable, Sendable, Equatable {
@@ -49,6 +50,8 @@ public enum WireErrorCode: String, Codable, Sendable {
     case nativeStoreUnavailable = "native_store_unavailable"
     case sshAgentUnavailable = "ssh_agent_unavailable"
     case invalidSSHKey = "invalid_ssh_key"
+    case automationUnavailable = "automation_unavailable"
+    case automationAlreadyRunning = "automation_already_running"
     case invalidStoreDocument = "invalid_store_document"
     case editSessionExpired = "edit_session_expired"
     case editConflict = "edit_conflict"
@@ -362,6 +365,7 @@ public enum Request: Sendable {
     case hostRecordTriage(HostTriageRequest)
     case configureRemoteApproval(RemoteApprovalConfigurationRequest)
     case configureSSH(SSHKeyCatalogRequest)
+    case configureAutomation(AutomationRequest)
 }
 
 extension Request: Codable {
@@ -373,7 +377,7 @@ extension Request: Codable {
         case protectedLaunchApproval
         case scanFilesystem, selectedKeys, jobID
         case exemptions, todos, cleared
-        case action, phonePairingCode, registrations, fingerprint
+        case action, phonePairingCode, registrations, fingerprint, automation
     }
 
     public init(from decoder: Decoder) throws {
@@ -541,6 +545,17 @@ extension Request: Codable {
                 fingerprint: try container.decodeIfPresent(String.self, forKey: .fingerprint),
                 requestID: try Self.decodeUUID(container, forKey: .requestID)
             ))
+        case "configure_automation":
+            let automation = try container.decode(AutomationRequest.self, forKey: .automation)
+            guard try Self.decodeUUID(container, forKey: .requestID).uuidString.lowercased()
+                    == automation.requestID else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .requestID,
+                    in: container,
+                    debugDescription: "automation request UUID mismatch"
+                )
+            }
+            self = .configureAutomation(automation)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: container, debugDescription: "unknown request type"
@@ -665,6 +680,11 @@ extension Request: Codable {
             try container.encode(request.action, forKey: .action)
             try container.encode(request.registrations, forKey: .registrations)
             try container.encodeIfPresent(request.fingerprint, forKey: .fingerprint)
+        case let .configureAutomation(request):
+            try container.encode("configure_automation", forKey: .type)
+            try container.encode(WireProtocol.version, forKey: .version)
+            try container.encode(request.requestID, forKey: .requestID)
+            try container.encode(request, forKey: .automation)
         }
     }
 
@@ -693,6 +713,9 @@ public struct Response: Codable, Sendable {
     /// value only at the injection boundary, where UTF-8/no-NUL is required.
     public let values: [String: Data]?
     public let schemes: [String]?
+    /// Per-provider health lines for `csec status`. Value-free and optional, so
+    /// an older client simply does not render them.
+    public let providerStatus: [ProviderStatusSummary]?
     public let capabilities: ProtocolCapabilities?
     public let registeredSessionID: String?
     public let outputRedactionSessionID: String?
@@ -712,6 +735,9 @@ public struct Response: Codable, Sendable {
     public let remoteApprovalStatus: RemoteApprovalConfigurationStatus?
     public let remoteApprovalMacPairingCode: String?
     public let sshKeys: [SSHKeyMetadata]?
+    public let automationJobs: [AutomationJob]?
+    public let automationRun: AutomationRunAuthorization?
+    public let automationNextEligibleAt: Date?
     public let failure: ProtocolFailure?
     public let error: String?
 
@@ -720,6 +746,7 @@ public struct Response: Codable, Sendable {
         requestID: String? = nil,
         values: [String: Data]? = nil,
         schemes: [String]? = nil,
+        providerStatus: [ProviderStatusSummary]? = nil,
         capabilities: ProtocolCapabilities? = nil,
         registeredSessionID: String? = nil,
         outputRedactionSessionID: String? = nil,
@@ -739,6 +766,9 @@ public struct Response: Codable, Sendable {
         remoteApprovalStatus: RemoteApprovalConfigurationStatus? = nil,
         remoteApprovalMacPairingCode: String? = nil,
         sshKeys: [SSHKeyMetadata]? = nil,
+        automationJobs: [AutomationJob]? = nil,
+        automationRun: AutomationRunAuthorization? = nil,
+        automationNextEligibleAt: Date? = nil,
         failure: ProtocolFailure? = nil,
         error: String? = nil
     ) {
@@ -746,6 +776,7 @@ public struct Response: Codable, Sendable {
         self.requestID = requestID
         self.values = values
         self.schemes = schemes
+        self.providerStatus = providerStatus
         self.capabilities = capabilities
         self.registeredSessionID = registeredSessionID
         self.outputRedactionSessionID = outputRedactionSessionID
@@ -765,6 +796,9 @@ public struct Response: Codable, Sendable {
         self.remoteApprovalStatus = remoteApprovalStatus
         self.remoteApprovalMacPairingCode = remoteApprovalMacPairingCode
         self.sshKeys = sshKeys
+        self.automationJobs = automationJobs
+        self.automationRun = automationRun
+        self.automationNextEligibleAt = automationNextEligibleAt
         self.failure = failure
         self.error = error
     }

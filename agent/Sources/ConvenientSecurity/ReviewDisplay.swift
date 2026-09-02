@@ -16,21 +16,64 @@ public enum ReviewDisplay {
         public let subtitle: String?
         public let fields: [String]
         public let rawReferences: [String]
+        /// Provider context lines, already labeled and sanitized, e.g.
+        /// `account: dexory.1password.eu`.
+        public let notes: [String]
+        /// Provider warnings about where the value will come from.
+        public let warnings: [String]
 
         public init(
             title: String?,
             subtitle: String?,
             fields: [String],
-            rawReferences: [String]
+            rawReferences: [String],
+            notes: [String] = [],
+            warnings: [String] = []
         ) {
             self.title = title
             self.subtitle = subtitle
             self.fields = fields
             self.rawReferences = rawReferences
+            self.notes = notes
+            self.warnings = warnings
         }
+
+        /// The same content as one string per line, for surfaces that render a
+        /// single block of text rather than styled rows.
+        public var noteLines: [String] { notes + warnings }
+    }
+
+    /// Convenience for a credential that already carries its provider notes.
+    public static func referenceGroup(
+        for credential: PolicyReviewCredential
+    ) -> CredentialReferenceGroup {
+        referenceGroup(for: credential.references, providerNotes: credential.providerNotes)
     }
 
     public static func referenceGroup(
+        for references: [SecretRef],
+        providerNotes: [ProviderReviewNote] = []
+    ) -> CredentialReferenceGroup {
+        let group = plainReferenceGroup(for: references)
+        guard !providerNotes.isEmpty else { return group }
+        // A note's label and detail both originate outside csec (a vault name, a
+        // sign-in URL), so both are sanitized and bounded before display.
+        let formatted = providerNotes.map { note -> (text: String, isWarning: Bool) in
+            let label = sanitized(String(note.label.prefix(32)))
+            let detail = sanitized(String(note.detail.prefix(400)))
+            return (label.isEmpty ? detail : "\(label): \(detail)", note.isWarning)
+        }
+        return CredentialReferenceGroup(
+            title: group.title,
+            subtitle: group.subtitle,
+            fields: group.fields,
+            rawReferences: group.rawReferences,
+            notes: formatted.filter { !$0.isWarning }.map(\.text),
+            warnings: formatted.filter(\.isWarning).map(\.text)
+        )
+    }
+
+    private static func plainReferenceGroup(
         for references: [SecretRef]
     ) -> CredentialReferenceGroup {
         let fallback = CredentialReferenceGroup(
@@ -156,19 +199,46 @@ public enum ReviewDisplay {
             : "\(unit(hours, "hour")) \(unit(minutes, "minute"))"
     }
 
-    /// Neutralizes control, newline, and bidirectional-formatting characters in
+    /// Trims `value` to at most `maxBytes` UTF-8 bytes without splitting a
+    /// character, for surfaces whose wire format enforces a byte bound.
+    public static func bounded(_ value: String, maxBytes: Int) -> String {
+        guard value.utf8.count > maxBytes else { return value }
+        var trimmed = ""
+        var used = 0
+        for character in value {
+            let size = String(character).utf8.count
+            if used + size > maxBytes - 1 { break }
+            trimmed.append(character)
+            used += size
+        }
+        return trimmed + "…"
+    }
+
+    /// Neutralizes bidirectional-formatting, newline, and control characters in
     /// text that may be attacker-influenced before it reaches a trusted window.
-    public static func sanitized(_ value: String) -> String {
+    /// Bidi overrides are always neutralized (they can reorder a consent line).
+    /// `allowNewlines` keeps newlines (for multi-line evidence/fragments) and
+    /// `allowOtherControls` keeps the remaining control characters (for value-free
+    /// document fragments that legitimately carry tabs/formatting) — the three
+    /// combinations replace the former `sanitized`, `auditSafe`, `setupSafe`,
+    /// `setupDocumentSafe`, and `promptSafe` helpers.
+    public static func sanitized(
+        _ value: String,
+        allowNewlines: Bool = false,
+        allowOtherControls: Bool = false
+    ) -> String {
         let bidiControls: Set<UInt32> = [
             0x061c, 0x200e, 0x200f,
             0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
             0x2066, 0x2067, 0x2068, 0x2069,
         ]
         return value.unicodeScalars.map { scalar in
-            if CharacterSet.controlCharacters.contains(scalar)
-                || CharacterSet.newlines.contains(scalar)
-                || bidiControls.contains(scalar.value) {
-                return "�"
+            if bidiControls.contains(scalar.value) { return "�" }
+            if CharacterSet.newlines.contains(scalar) {
+                return allowNewlines ? String(scalar) : "�"
+            }
+            if CharacterSet.controlCharacters.contains(scalar) {
+                return allowOtherControls ? String(scalar) : "�"
             }
             return String(scalar)
         }.joined()

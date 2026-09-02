@@ -573,6 +573,7 @@ int32_t cs_spawn_supervised(
     const char *executable_path,
     char *const argv[],
     char *const envp[],
+    const char *working_directory,
     int32_t stdin_uses_pty,
     cs_output_mode stdout_mode,
     cs_output_mode stderr_mode,
@@ -645,6 +646,7 @@ int32_t cs_spawn_supervised(
     pid_t pid = fork();
     if (pid < 0) goto fail;
     if (pid == 0) {
+        if (working_directory != NULL && chdir(working_directory) != 0) goto child_fail;
         if (needs_pty) {
             if (setsid() < 0 || ioctl(pty_slave, TIOCSCTTY, 0) < 0
                     || tcsetpgrp(pty_slave, getpgrp()) < 0) goto child_fail;

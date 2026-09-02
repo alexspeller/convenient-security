@@ -52,63 +52,63 @@ func runExecFile(_ arguments: [String]) -> Never {
         case "--file":
             index += 1
             guard index < arguments.count,
-                  let equals = arguments[index].firstIndex(of: "=") else { usage() }
+                  let equals = arguments[index].firstIndex(of: "=") else { usage("exec-file") }
             declarations.append(ProtectedFileDeclaration(
                 environmentName: String(arguments[index][..<equals]),
                 reference: String(arguments[index][arguments[index].index(after: equals)...])
             ))
         case "--gh-config":
             index += 1
-            guard index < arguments.count, githubReference == nil else { usage() }
+            guard index < arguments.count, githubReference == nil else { usage("exec-file") }
             githubReference = arguments[index]
         case "--github-host":
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("exec-file") }
             githubHost = arguments[index]
         case "--github-user":
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("exec-file") }
             githubUser = arguments[index]
         case "--github-git-protocol":
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("exec-file") }
             githubGitProtocol = arguments[index]
         case "--reason":
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("exec-file") }
             reason = arguments[index]
         case "--for":
             index += 1
-            guard index < arguments.count, let seconds = Int(arguments[index]) else { usage() }
+            guard index < arguments.count, let seconds = Int(arguments[index]) else { usage("exec-file") }
             ttlSeconds = seconds
         case "--hard-ttl":
             hardTTL = true
         case "--redact-output":
             index += 1
             guard index < arguments.count,
-                  let mode = OutputGuardMode(rawValue: arguments[index]) else { usage() }
+                  let mode = OutputGuardMode(rawValue: arguments[index]) else { usage("exec-file") }
             outputGuard.mode = mode
         case let option where option.hasPrefix("--redact-output="):
             guard let mode = OutputGuardMode(
                 rawValue: String(option.dropFirst("--redact-output=".count))
-            ) else { usage() }
+            ) else { usage("exec-file") }
             outputGuard.mode = mode
         case "--redact-output-label":
             index += 1
             guard index < arguments.count,
-                  let style = OutputRedactionLabelStyle(rawValue: arguments[index]) else { usage() }
+                  let style = OutputRedactionLabelStyle(rawValue: arguments[index]) else { usage("exec-file") }
             outputGuard.labelStyle = style
         case let option where option.hasPrefix("--redact-output-label="):
             guard let style = OutputRedactionLabelStyle(
                 rawValue: String(option.dropFirst("--redact-output-label=".count))
-            ) else { usage() }
+            ) else { usage("exec-file") }
             outputGuard.labelStyle = style
         case "--redact-short-values":
             outputGuard.includeShortValues = true
         case "--redact-output-warn":
             outputGuard.emitWarnings = true
         default:
-            usage()
+            usage("exec-file")
         }
         index += 1
     }
@@ -126,7 +126,7 @@ func runExecFile(_ arguments: [String]) -> Never {
           !declarations.contains(where: { $0.environmentName == "GH_CONFIG_DIR" }),
           githubReference.map({ (try? SecretRef($0)) != nil }) ?? true,
           ttlSeconds > 0, ttlSeconds <= 24 * 60 * 60,
-          reason?.utf8.count ?? 0 <= 256 else { usage() }
+          reason?.utf8.count ?? 0 <= 256 else { usage("exec-file") }
 
     do {
         let executable = try conservativeExecutable(command: commandLine[0])
@@ -245,14 +245,10 @@ func runExecFile(_ arguments: [String]) -> Never {
         defer { scanner?.close() }
 
         if outputGuard.mode == .tty, io.streams.isEmpty {
-            writeProtectedFileError(
-                "csec exec-file: warning: tty output masking is inactive for redirected output; "
-                    + "use --redact-output=always to alter captured logs\n"
-            )
+            csecWarning("exec-file", "tty output masking is inactive for redirected output; "
+                + "use --redact-output=always to alter captured logs")
         } else if outputGuard.mode == .never {
-            writeProtectedFileError(
-                "csec exec-file: warning: output detection and masking explicitly disabled\n"
-            )
+            csecWarning("exec-file", "output detection and masking explicitly disabled")
         }
 
         let child = try rootClient.start(
@@ -271,7 +267,7 @@ func runExecFile(_ arguments: [String]) -> Never {
         )
         cs_terminate_like_wait_status(status)
     } catch {
-        writeProtectedFileError("csec exec-file: \(error.localizedDescription)\n")
+        csecError("exec-file", ReviewDisplay.sanitized(error.localizedDescription))
         exit(1)
     }
 }
@@ -439,7 +435,7 @@ func runSidecarExec(
         }
     } catch {
         materialization?.removeAll()
-        writeProtectedFileError("csec exec: \(error.localizedDescription)\n")
+        csecError("exec", ReviewDisplay.sanitized(error.localizedDescription))
         // A failed resolution names the reference; the launcher knows where each
         // reference in this launch came from, which is what the user must edit.
         if case AgentClient.ClientError.protocolFailure(.resolutionFailed, _) = error {

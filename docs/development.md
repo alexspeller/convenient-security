@@ -196,4 +196,11 @@ Before treating an artifact as protected, verify on the signed installed app:
     client's effective hook/trust UI, and blocks a synthetic Bash call when
     installed `csec` or `csecd` is unavailable; a selected synthetic dotenv
     import requires Touch ID, changes only its named native-store key, emits no
-    value, and leaves the source unchanged for separate remediation.
+    value, and leaves the source unchanged for separate remediation. Multi-account
+    1Password is verified with at least two accounts signed in: `csec status`
+    reports the authorized account and indexed vault counts, a reference into a
+    non-default account's vault resolves, the review window names the account it
+    will read from, and `csec edit op://…` edits the existing item rather than
+    creating a duplicate in another account. Run `cs-selftest` once with
+    `CSEC_OP_LIVE_ACCOUNTS=1` on such a machine; it is off by default so a
+    locked 1Password app cannot block `bin/ci`.

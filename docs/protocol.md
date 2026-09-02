@@ -72,7 +72,8 @@ The response advertises supported versions and features:
       "registered_session_roots",
       "credential_protocols",
       "inherited_file_descriptors",
-      "protected_regular_files"
+      "protected_regular_files",
+      "unattended_automation"
     ]
   }
 }
@@ -86,6 +87,16 @@ The response advertises supported versions and features:
 
 With both providers available it returns
 `{"version":2,"schemes":["csec","op"]}`.
+
+The response may also carry `providerStatus`: one bounded, value-free health line
+per provider that offers one, which `csec status` renders. It is optional, so a
+client that does not know the field simply ignores it.
+
+```json
+{"version":2,"schemes":["csec","op"],
+ "providerStatus":[{"label":"1Password",
+                    "detail":"2 accounts, 18 vaults indexed","healthy":true}]}
+```
 
 ## Access v2
 
@@ -529,3 +540,21 @@ do not. If application code assigns a returned value to `ENV`/`process.env`,
 launches a child with it, or writes it elsewhere, that disclosure is outside the
 bridge boundary; see
 [`threat-model.md`](threat-model.md#language-client-heap-delivery).
+
+## Persistent automation control protocol
+
+The v2 `configure_automation` request wraps a nonce-bound `AutomationRequest`
+with one of `enroll`, `list`, `begin_run`, `finish_run`, or `revoke`. Production
+csecd accepts it only from an authenticated product launcher. Responses carry
+only value-free job metadata, a bounded run authorization, or the next eligible
+time; resolved values never cross this control request.
+
+Enrollment stores canonical refs and a bounded command recipe separately from
+the automation-only Keychain materialization. `begin_run` creates a daemon-memory
+lease bound to the socket caller's PID/start time and returns the stored recipe.
+Later ordinary bridge `access` messages retain their complete v2 delivery plan.
+Before normal grant evaluation, csecd may match the plan's direct interpreter
+parent to that exact leased runner and return only a registered subset from the
+materialization. A shape that reaches the leased root but asks for another ref
+is denied rather than falling through to ordinary consent. See
+[`automation.md`](automation.md).

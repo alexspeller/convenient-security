@@ -62,7 +62,7 @@ public struct HostCheckMeta: Sendable {
             anchor: ReviewDisplay.sanitized(anchorOverride ?? anchor),
             remediation: remediation,
             remediationKey: status == .fail ? remediationKey : nil,
-            coverageNote: coverageNote.map(ReviewDisplay.sanitized)
+            coverageNote: coverageNote.map { ReviewDisplay.sanitized($0) }
         )
     }
 }

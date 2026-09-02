@@ -18,19 +18,19 @@ func sshActivationGuidanceIfNeeded() -> String {
 }
 
 func runSSH(_ arguments: [String]) -> Never {
-    guard let action = arguments.first else { usage() }
+    guard let action = arguments.first else { usage("ssh") }
     switch action {
     case "socket":
-        guard arguments.count == 1 else { usage() }
+        guard arguments.count == 1 else { usage("ssh") }
         FileHandle.standardOutput.write(Data("\(SSHAgentSocket.defaultPath())\n".utf8))
         exit(0)
     case "env":
-        guard arguments.count == 1 else { usage() }
+        guard arguments.count == 1 else { usage("ssh") }
         let path = SSHAgentSocket.defaultPath().replacingOccurrences(of: "'", with: "'\\''")
         FileHandle.standardOutput.write(Data("export SSH_AUTH_SOCK='\(path)'\n".utf8))
         exit(0)
     case "list":
-        guard arguments.count == 1 else { usage() }
+        guard arguments.count == 1 else { usage("ssh") }
         do {
             let keys = try makeAgentClient().listSSHKeys()
             if keys.isEmpty {
@@ -56,17 +56,17 @@ func runSSH(_ arguments: [String]) -> Never {
             switch arguments[index] {
             case "--label":
                 index += 1
-                guard index < arguments.count, label == nil else { usage() }
+                guard index < arguments.count, label == nil else { usage("ssh") }
                 label = arguments[index]
             case let token where token.hasPrefix("-"):
-                usage()
+                usage("ssh")
             default:
-                guard referenceArgument == nil else { usage() }
+                guard referenceArgument == nil else { usage("ssh") }
                 referenceArgument = arguments[index]
             }
             index += 1
         }
-        guard let referenceArgument else { usage() }
+        guard let referenceArgument else { usage("ssh") }
         do {
             let reference = try sshRegistrationReference(referenceArgument)
             let keys = try makeAgentClient().registerSSHKeys([
@@ -84,7 +84,7 @@ func runSSH(_ arguments: [String]) -> Never {
             sshFail(error.localizedDescription)
         }
     case "remove":
-        guard arguments.count == 2 else { usage() }
+        guard arguments.count == 2 else { usage("ssh") }
         let fingerprint = arguments[1]
         do {
             let before = try makeAgentClient().listSSHKeys()
@@ -98,13 +98,13 @@ func runSSH(_ arguments: [String]) -> Never {
             sshFail(error.localizedDescription)
         }
     case "status":
-        guard arguments.count == 1 else { usage() }
+        guard arguments.count == 1 else { usage("ssh") }
         FileHandle.standardError.write(Data(
             "csec ssh status: status is consolidated under `csec status`\n".utf8
         ))
         runStatus()
     default:
-        usage()
+        usage("ssh")
     }
 }
 

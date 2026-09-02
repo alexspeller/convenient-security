@@ -1,532 +1,341 @@
 import Foundation
 @preconcurrency import AppKit
 import ConvenientSecurity
-
 #if canImport(Darwin)
 import Darwin
 #endif
 
-private struct SetupImportRequest {
-    let destinationKey: String
-    let locator: LocalSecretLocator
-}
-
-private struct SetupCommandOptions {
-    var apply = false
-    var selectedAgents: [AICommandHookClient] = []
-    var skipAgents = false
-    var replaceCSECHook = false
-    var replaceSecret = false
-    var includeAuditPrompt = true
-    var projectDirectory = FileManager.default.currentDirectoryPath
-    var store: NativeStoreName?
-    var imports: [SetupImportRequest] = []
-}
+// `csec setup` — a guided, interactive onboarding flow. It assesses the resident
+// agent, Full Disk Access, and any detected coding agents, then for each
+// actionable item explains what it does, asks, and either applies it or walks the
+// user through it. Nothing changes without a per-step confirmation. It finishes
+// with the bounded security-audit prompt and an optional host audit.
+//
+// Guided-only: it requires an interactive terminal and otherwise fails closed
+// (mirroring `csec protect --env`). The former flag-driven batch model and its
+// secret-import surface are gone; the import *engine* is unchanged and still
+// reachable through `csec protect`.
 
 func runSetup(_ arguments: [String]) -> Never {
-    let options: SetupCommandOptions
-    do {
-        options = try parseSetupOptions(arguments)
-    } catch {
-        setupFailure(error.localizedDescription, status: 2)
+    guard isatty(STDIN_FILENO) == 1, isatty(STDERR_FILENO) == 1 else {
+        csecError("setup", "csec setup is an interactive guided flow; run it in a terminal.")
+        exit(2)
     }
+
+    let projectDirectory: String
+    do {
+        projectDirectory = try parseSetupOptions(arguments)
+    } catch {
+        csecError("setup", ReviewDisplay.sanitized(error.localizedDescription))
+        exit(2)
+    }
+
+    Prompt.title("Convenient Security setup")
+    Prompt.note("A guided walkthrough — nothing changes without your confirmation at each step.")
 
     let environment = ProcessInfo.processInfo.environment
     let homeDirectory = FileManager.default.homeDirectoryForCurrentUser.path
+
+    // --- Assessment (quiet, behind a spinner) ---
+    let agentClient = makeAgentClient()
+    var agentReachable = false
+    var providerSchemes: [String] = []
     let detections: [CodingAgentDetection]
     let discovery: LocalSecretDiscovery
     do {
-        detections = try CodingAgentSetup.detect(
-            homeDirectory: homeDirectory,
-            pathEnvironment: environment["PATH"]
-        )
-        discovery = try LocalSecretDiscoveryEngine.discover(
-            projectDirectory: options.projectDirectory,
-            environment: environment
-        )
-    } catch {
-        setupFailure(error.localizedDescription, status: 1)
-    }
-
-    let chosenDetections: [CodingAgentDetection]
-    if options.skipAgents {
-        chosenDetections = []
-    } else if options.selectedAgents.isEmpty {
-        chosenDetections = detections.filter(\.detected)
-    } else {
-        chosenDetections = options.selectedAgents.compactMap { selected in
-            detections.first { $0.client == selected }
+        (detections, discovery) = try withSpinner("Assessing this Mac and project…") {
+            let detections = try CodingAgentSetup.detect(
+                homeDirectory: homeDirectory, pathEnvironment: environment["PATH"])
+            let discovery = try LocalSecretDiscoveryEngine.discover(
+                projectDirectory: projectDirectory, environment: environment)
+            agentReachable = (try? agentClient.capabilities()) != nil
+            providerSchemes = agentReachable ? ((try? agentClient.schemes()) ?? []) : []
+            return (detections, discovery)
         }
-    }
-
-    var plans: [CodingAgentConfigurationPlan] = []
-    var planErrors: [String] = []
-    for detection in chosenDetections {
-        do {
-            plans.append(try CodingAgentSetup.plan(
-                detection: detection,
-                csecExecutablePath: currentExecutablePath(),
-                replaceExistingCSECHook: options.replaceCSECHook
-            ))
-        } catch {
-            planErrors.append(error.localizedDescription)
-        }
-    }
-
-    var agentReachable = false
-    var providerSchemes: [String] = []
-    var nativeStoreAvailable = false
-    let agentClient = makeAgentClient()
-    do {
-        let capabilities = try agentClient.capabilities()
-        agentReachable = true
-        nativeStoreAvailable = capabilities.features.contains(.nativeEncryptedStore)
-        providerSchemes = (try? agentClient.schemes()) ?? []
     } catch {
-        // Setup remains useful before the daemon is installed. Import will
-        // separately fail closed if it was explicitly requested.
-    }
-
-    let rootReachable: Bool
-    #if DEBUG
-    let rootTrust: RootHelperServerTrustPolicy = .allowUnverifiedForTesting
-    #else
-    let rootTrust: RootHelperServerTrustPolicy = .requireProductRootHelper
-    #endif
-    do {
-        try RootHelperClient(trustPolicy: rootTrust).health()
-        rootReachable = true
-    } catch {
-        rootReachable = false
-    }
-
-    let selectedImports: [(SetupImportRequest, LocalSecretCandidate)]
-    do {
-        selectedImports = try validateImportRequests(options.imports, discovery: discovery)
-    } catch {
-        setupFailure(error.localizedDescription, status: 2)
-    }
-
-    let launchAgentStatus = LaunchAgentService.status().description
-    let sipStatus = StartupSecurityReport.currentAgent().sipStatus
-    var auditPrompt: String?
-    if options.includeAuditPrompt {
-        do {
-            auditPrompt = try OnboardingAuditPrompt.generate(facts: OnboardingAuditFacts(
-                projectDirectory: options.projectDirectory,
-                launchAgentStatus: launchAgentStatus,
-                productAgentReachable: agentReachable,
-                providerSchemes: providerSchemes,
-                rootHelperReachable: rootReachable,
-                sipStatus: sipStatus,
-                codingAgentPlans: plans,
-                discovery: discovery
-            ))
-        } catch {
-            planErrors.append(error.localizedDescription)
-        }
-    }
-    printSetupReport(
-        options: options,
-        detections: detections,
-        chosenDetections: chosenDetections,
-        plans: plans,
-        planErrors: planErrors,
-        discovery: discovery,
-        selectedImports: selectedImports,
-        launchAgentStatus: launchAgentStatus,
-        agentReachable: agentReachable,
-        providerSchemes: providerSchemes,
-        nativeStoreAvailable: nativeStoreAvailable,
-        rootReachable: rootReachable,
-        sipStatus: sipStatus
-    )
-
-    requestFullDiskAccess()
-
-    if let auditPrompt {
-        print("\n# Bounded coding-agent security audit prompt\n")
-        FileHandle.standardOutput.write(Data(auditPrompt.utf8))
-    }
-
-    let blockedPlans = plans.filter { $0.action == .blocked }
-    guard planErrors.isEmpty, blockedPlans.isEmpty else {
-        FileHandle.standardError.write(Data(
-            "csec setup: blocked; resolve the reported configuration issue(s) before applying\n".utf8
-        ))
+        csecError("setup", ReviewDisplay.sanitized(error.localizedDescription))
         exit(1)
     }
 
-    guard options.apply else {
-        print("\ncsec setup: dry run complete; no files, stores, grants, or providers were changed.")
-        print("Re-run the same command with --apply after reviewing this plan.")
-        exit(0)
-    }
+    // --- Step 1: resident agent (csecd) ---
+    var launchStatus = LaunchAgentService.status()
+    stepResidentAgent(
+        launchStatus: &launchStatus, agentClient: agentClient,
+        agentReachable: &agentReachable, providerSchemes: &providerSchemes)
 
-    if !selectedImports.isEmpty, !nativeStoreAvailable {
-        setupFailure(
-            "selected imports require a reachable signed agent with the native encrypted store",
-            status: 1
-        )
+    // --- Step 2: Full Disk Access (report-only, no Touch ID; needs a reachable csecd) ---
+    var auditReport: HostAuditReport?
+    if agentReachable {
+        auditReport = withSpinner("Reading host posture…") { try? agentClient.hostAudit() }
     }
+    let fda = fdaState(from: auditReport)
+    stepFullDiskAccess(state: fda)
 
-    // Preflight the sensitive import before changing user configuration. The
-    // edit session is exact-caller and Touch-ID gated; it is cancelled on every
-    // failure path. Source values are never printed or placed in argv.
-    var pendingEdit: NativeStoreEditStart?
-    var pendingDocument: Data?
-    var selectedValues: [String: String] = [:]
-    defer {
-        if let pendingEdit {
-            agentClient.cancelNativeStoreEdit(sessionID: pendingEdit.sessionID)
-        }
-        selectedValues.removeAll(keepingCapacity: false)
-        if let count = pendingDocument?.count {
-            pendingDocument?.resetBytes(in: 0..<count)
-        }
-    }
+    // --- Step 3: coding-agent hooks ---
+    let configuredClients = stepCodingAgentHooks(detections: detections)
 
-    if !selectedImports.isEmpty {
-        guard let store = options.store else {
-            setupFailure("--store is required with --import", status: 2)
-        }
-        do {
-            for (request, candidate) in selectedImports {
-                selectedValues[request.destinationKey] = try LocalSecretDiscoveryEngine.load(
-                    candidate,
-                    projectDirectory: options.projectDirectory,
-                    environment: environment
-                )
-            }
-            let edit = try agentClient.beginNativeStoreEdit(
-                store: store.value,
-                mode: .onboardingImport
-            )
-            pendingEdit = edit
-            pendingDocument = try NativeStoreImport.merge(
-                existingDocument: edit.document,
-                selectedValues: selectedValues,
-                replaceExisting: options.replaceSecret
-            )
-        } catch {
-            setupFailure("import preflight failed: \(error.localizedDescription)", status: 1)
-        }
+    // --- Step 4: bounded audit prompt + optional host audit ---
+    let sipStatus = StartupSecurityReport.currentAgent().sipStatus
+    let rootReachable = setupRootHelperReachable()
+    let plans = detections.filter(\.detected).compactMap {
+        try? CodingAgentSetup.plan(detection: $0, csecExecutablePath: currentExecutablePath())
     }
+    stepAuditPromptAndAudit(
+        projectDirectory: projectDirectory, launchStatus: launchStatus,
+        agentReachable: agentReachable, providerSchemes: providerSchemes,
+        rootReachable: rootReachable, sipStatus: sipStatus, plans: plans, discovery: discovery)
 
-    var appliedConfigurations: [String] = []
-    do {
-        for plan in plans {
-            try CodingAgentSetup.apply(plan)
-            if plan.action == .create || plan.action == .merge {
-                appliedConfigurations.append(plan.path)
-            }
-        }
-    } catch {
-        let suffix = appliedConfigurations.isEmpty
-            ? "no agent configuration was changed"
-            : "already updated: \(appliedConfigurations.map(setupSafe).joined(separator: ", "))"
-        setupFailure("configuration apply failed (\(suffix)): \(error.localizedDescription)", status: 1)
-    }
-
-    var importResult: NativeStoreEditCommit?
-    if let edit = pendingEdit, let document = pendingDocument {
-        do {
-            importResult = try agentClient.commitNativeStoreEdit(
-                sessionID: edit.sessionID,
-                document: document
-            )
-            pendingEdit = nil
-        } catch {
-            let suffix = appliedConfigurations.isEmpty
-                ? "agent configuration was unchanged"
-                : "agent hook configuration was applied before this failure"
-            setupFailure("native-store import failed; \(suffix): \(error.localizedDescription)", status: 1)
-        }
-    }
-
-    print("\n# Applied")
-    if appliedConfigurations.isEmpty {
-        print("- coding-agent configuration: no change")
-    } else {
-        for path in appliedConfigurations {
-            print("- updated \(setupSafe(path)) by merging only the csec hook")
-        }
-    }
-    if let store = options.store, let importResult {
-        print(
-            "- native store \(setupSafe(store.value)): generation \(importResult.generation), "
-                + "\(selectedImports.count) selected credential(s) imported "
-                + "(\(importResult.secretCount) total keys)"
-        )
-        for (request, _) in selectedImports {
-            print("  - csec://\(setupSafe(store.value))/\(setupSafe(request.destinationKey))")
-        }
-        print("- original environment/dotenv sources were not modified or deleted")
-    }
-    if !appliedConfigurations.isEmpty {
-        print("- restart each coding agent, inspect its hook UI, and trust the exact new hook before relying on coverage")
-    }
-    print("csec setup: apply complete")
-    // Decision 1: setup always finishes with a host posture pass. Report-only so
-    // setup never triggers a second Touch-ID review; run `csec audit` to remediate.
-    print("\n---")
-    performHostAudit(scanFilesystem: false, reportOnly: true, json: false, quietWhenUnavailable: true)
+    // --- Recap ---
+    setupRecap(
+        launchStatus: launchStatus, agentReachable: agentReachable,
+        fda: fda, configuredClients: configuredClients)
     exit(0)
 }
 
-private func requestFullDiskAccess() {
-    print("\n## Full Disk Access")
-    print("- required by the resident csecd agent to audit macOS privacy grants")
-    print(
-        "- add or enable /Applications/ConvenientSecurity.app in "
-            + "System Settings → Privacy & Security → Full Disk Access"
-    )
+// MARK: - Step 1: resident agent
 
-    let interactive = isatty(STDIN_FILENO) == 1
-        || isatty(STDOUT_FILENO) == 1
-        || isatty(STDERR_FILENO) == 1
-    guard interactive else {
-        print("- System Settings was not opened because setup is not attached to a terminal")
+private func stepResidentAgent(
+    launchStatus: inout LaunchAgentStatus,
+    agentClient: AgentClient,
+    agentReachable: inout Bool,
+    providerSchemes: inout [String]
+) {
+    Prompt.step("1. Resident agent (csecd)")
+    if launchStatus == .enabled {
+        Prompt.success(agentReachable ? "csecd is installed and running." : "csecd is installed.")
+        return
+    }
+    if launchStatus == .requiresApproval {
+        Prompt.warn("csecd is registered but awaiting your approval in "
+            + "System Settings → General → Login Items. Approve it there, then re-run setup.")
         return
     }
 
-    guard let settingsURL = URL(
-        string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
-    ), NSWorkspace.shared.open(settingsURL) else {
-        print("- could not open System Settings; open the Full Disk Access pane manually")
+    Prompt.note("csecd is the resident agent that resolves secret references behind one Touch ID "
+        + "tap and runs the host posture audit. It runs as a per-user login-item LaunchAgent.")
+    guard Prompt.confirm("Install and start csecd now?") else {
+        Prompt.note("Skipped. Run `csec install` later, or re-run setup.")
         return
     }
-    print("- opened the Full Disk Access pane")
+
+    do {
+        launchStatus = try LaunchAgentService.install()
+        if launchStatus.needsApproval {
+            Prompt.warn("Approve “ConvenientSecurity” in System Settings → General → Login Items to let it start, then re-run setup.")
+            return
+        }
+        let reachable = withSpinner("Waiting for csecd to come up…") {
+            waitForAgentReachable(agentClient, timeout: 5)
+        }
+        agentReachable = reachable
+        if reachable {
+            providerSchemes = (try? agentClient.schemes()) ?? []
+            Prompt.success("csecd is installed and running.")
+        } else {
+            Prompt.warn("csecd was registered but is not answering yet; give it a moment, then `csec status`.")
+        }
+    } catch {
+        csecError("setup", "could not register csecd: \(ReviewDisplay.sanitized(error.localizedDescription))")
+        Prompt.note("csec must run from inside the installed .app bundle for install to work; "
+            + "run ./packaging/bin/build-and-install.sh, then re-run setup.")
+    }
 }
 
-private func parseSetupOptions(_ arguments: [String]) throws -> SetupCommandOptions {
-    var options = SetupCommandOptions()
+// MARK: - Step 2: Full Disk Access
+
+private func stepFullDiskAccess(state: FDAState) {
+    Prompt.step("2. Full Disk Access")
+    switch state {
+    case .granted:
+        Prompt.success("csecd already has Full Disk Access.")
+    case .unknown:
+        Prompt.warn("csecd must be installed and running before Full Disk Access can be checked. "
+            + "Complete step 1, then re-run setup.")
+    case .missing:
+        Prompt.note("csecd needs Full Disk Access to audit the Mac's privacy grants — which apps hold "
+            + "Full Disk Access, Accessibility, Screen Recording, Input Monitoring, and the other "
+            + "high-value TCC permissions a same-user attacker would abuse. Without it those checks "
+            + "report \"could not verify\" instead of a real result.")
+        guard Prompt.confirm("Open the Full Disk Access settings pane now?") else {
+            Prompt.note("Skipped. Add ConvenientSecurity under "
+                + "System Settings → Privacy & Security → Full Disk Access later.")
+            return
+        }
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"),
+            NSWorkspace.shared.open(url) else {
+            Prompt.warn("Could not open System Settings; open the Full Disk Access pane manually.")
+            return
+        }
+        Prompt.note("In the pane that opened: add or enable ConvenientSecurity in the Full Disk "
+            + "Access list. csecd must restart to pick up the new grant — toggling it there, or "
+            + "`csec doctor`, will restart it.")
+    }
+}
+
+// MARK: - Step 3: coding-agent hooks
+
+private func stepCodingAgentHooks(detections: [CodingAgentDetection]) -> [String] {
+    Prompt.step("3. Coding-agent hooks")
+    let detected = detections.filter(\.detected)
+    guard !detected.isEmpty else {
+        Prompt.note("No supported coding agent (Claude Code or Codex) was detected; nothing to configure.")
+        return []
+    }
+
+    var configured: [String] = []
+    for detection in detected {
+        let client = detection.client.rawValue
+        let plan: CodingAgentConfigurationPlan
+        do {
+            plan = try CodingAgentSetup.plan(
+                detection: detection, csecExecutablePath: currentExecutablePath())
+        } catch {
+            Prompt.warn("\(client): cannot plan a hook — \(ReviewDisplay.sanitized(error.localizedDescription))")
+            continue
+        }
+
+        switch plan.action {
+        case .unchanged:
+            Prompt.success("\(client): the exact fail-closed csec hook is already configured.")
+        case .create, .merge:
+            showHookFragment(for: detection.client)
+            if Prompt.confirm("Configure the \(client) hook (merges only the csec hook)?") {
+                if applyHookPlan(plan, client: client) { configured.append(client) }
+            } else {
+                Prompt.note("\(client): left unchanged.")
+            }
+        case .blocked:
+            // Offer replacement only when a replacement plan would cleanly merge —
+            // an older, duplicate, or misplaced csec hook. A genuine policy block
+            // (Claude's disableAllHooks) or an unsafe/invalid config only reports.
+            if let replacement = try? CodingAgentSetup.plan(
+                detection: detection, csecExecutablePath: currentExecutablePath(),
+                replaceExistingCSECHook: true), replacement.action == .merge {
+                Prompt.warn("\(client): \(ReviewDisplay.sanitized(plan.detail))")
+                showHookFragment(for: detection.client)
+                if Prompt.confirm("Replace the existing csec hook in \(client)?") {
+                    if applyHookPlan(replacement, client: client) { configured.append(client) }
+                } else {
+                    Prompt.note("\(client): left unchanged.")
+                }
+            } else {
+                Prompt.warn("\(client): \(ReviewDisplay.sanitized(plan.detail))")
+            }
+        }
+    }
+    return configured
+}
+
+/// Show the exact value-free hook fragment csec would merge. Bidi is neutralized;
+/// newlines and other formatting are preserved so the JSON reads normally.
+private func showHookFragment(for client: AICommandHookClient) {
+    guard let data = try? AICommandHook.hookConfiguration(
+        client: client, csecExecutablePath: currentExecutablePath()),
+        let fragment = String(data: data, encoding: .utf8) else { return }
+    Prompt.note("The exact value-free fragment csec will merge:")
+    Prompt.note(ReviewDisplay.sanitized(fragment, allowNewlines: true, allowOtherControls: true))
+}
+
+private func applyHookPlan(_ plan: CodingAgentConfigurationPlan, client: String) -> Bool {
+    do {
+        try CodingAgentSetup.apply(plan)
+        Prompt.success("\(client): hook configured — restart \(client) and trust the exact hook in "
+            + "its hook UI before relying on coverage.")
+        return true
+    } catch {
+        csecError("setup", "\(client): could not update the hook — \(ReviewDisplay.sanitized(error.localizedDescription))")
+        return false
+    }
+}
+
+// MARK: - Step 4: audit prompt + host audit
+
+private func stepAuditPromptAndAudit(
+    projectDirectory: String,
+    launchStatus: LaunchAgentStatus,
+    agentReachable: Bool,
+    providerSchemes: [String],
+    rootReachable: Bool,
+    sipStatus: SIPStatus,
+    plans: [CodingAgentConfigurationPlan],
+    discovery: LocalSecretDiscovery
+) {
+    Prompt.step("4. Security audit")
+    let auditPrompt = try? OnboardingAuditPrompt.generate(facts: OnboardingAuditFacts(
+        projectDirectory: projectDirectory,
+        launchAgentStatus: launchStatus.description,
+        productAgentReachable: agentReachable,
+        providerSchemes: providerSchemes,
+        rootHelperReachable: rootReachable,
+        sipStatus: sipStatus,
+        codingAgentPlans: plans,
+        discovery: discovery))
+    if let auditPrompt {
+        if Prompt.confirm("Show the bounded security-audit prompt to paste into a coding agent?") {
+            // Copyable data → stdout, so `csec setup | pbcopy`-style capture works
+            // and the prompt is not tangled with the guided narrative on stderr.
+            FileHandle.standardOutput.write(Data(auditPrompt.utf8))
+        }
+    }
+
+    guard agentReachable else {
+        Prompt.note("Skipping the host audit — csecd is not reachable yet. Run `csec audit` once it is.")
+        return
+    }
+    if Prompt.confirm("Run csec audit now to review host posture?") {
+        performHostAudit(scanFilesystem: false, reportOnly: false, json: false)
+    }
+}
+
+// MARK: - Recap
+
+private func setupRecap(
+    launchStatus: LaunchAgentStatus, agentReachable: Bool, fda: FDAState, configuredClients: [String]
+) {
+    Prompt.step("Summary")
+    if agentReachable {
+        Prompt.success("csecd reachable")
+    } else if launchStatus == .requiresApproval {
+        Prompt.warn("csecd awaiting approval in Login Items")
+    } else {
+        Prompt.warn("csecd not running yet")
+    }
+    switch fda {
+    case .granted: Prompt.success("Full Disk Access granted")
+    case .missing: Prompt.warn("Full Disk Access not yet granted")
+    case .unknown: Prompt.note("Full Disk Access not checked (csecd unavailable)")
+    }
+    if configuredClients.isEmpty {
+        Prompt.note("Coding-agent hooks: no change")
+    } else {
+        Prompt.success("Coding-agent hooks configured: \(configuredClients.joined(separator: ", "))")
+    }
+    Prompt.note("Next: `csec status` to review everything, `csec audit` to harden the host.")
+}
+
+// MARK: - Options + helpers
+
+private func parseSetupOptions(_ arguments: [String]) throws -> String {
+    var projectDirectory = FileManager.default.currentDirectoryPath
     var sawProject = false
-    var sawStore = false
     var index = 0
     while index < arguments.count {
         switch arguments[index] {
-        case "--apply":
-            guard !options.apply else { throw SetupOnboardingError.configurationConflict("duplicate --apply") }
-            options.apply = true
-        case "--agent":
-            index += 1
-            guard index < arguments.count,
-                  let client = AICommandHookClient(rawValue: arguments[index]),
-                  !options.selectedAgents.contains(where: { $0 == client }) else {
-                throw SetupOnboardingError.configurationConflict(
-                    "--agent must be a unique claude or codex selection"
-                )
-            }
-            options.selectedAgents.append(client)
-        case "--skip-agents":
-            options.skipAgents = true
-        case "--replace-csec-hook":
-            options.replaceCSECHook = true
-        case "--replace-secret":
-            options.replaceSecret = true
-        case "--no-audit-prompt":
-            options.includeAuditPrompt = false
         case "--project":
             index += 1
-            guard !sawProject,
-                  index < arguments.count,
-                  !arguments[index].isEmpty else {
+            guard !sawProject, index < arguments.count, !arguments[index].isEmpty else {
                 throw SetupOnboardingError.invalidProjectDirectory
             }
             sawProject = true
-            options.projectDirectory = absoluteSetupPath(arguments[index])
-        case "--store":
-            index += 1
-            guard !sawStore, index < arguments.count else {
-                throw SetupOnboardingError.configurationConflict("--store requires a native store name")
-            }
-            sawStore = true
-            options.store = try NativeStoreName(arguments[index])
-        case "--import":
-            index += 1
-            guard index < arguments.count else {
-                throw SetupOnboardingError.configurationConflict("--import requires DEST=env:NAME or DEST=dotenv:PATH:NAME")
-            }
-            options.imports.append(try parseImportRequest(arguments[index]))
+            projectDirectory = absoluteSetupPath(arguments[index])
         default:
             throw SetupOnboardingError.configurationConflict(
-                "unknown setup option: \(setupSafe(arguments[index]))"
-            )
+                "unknown setup option: \(ReviewDisplay.sanitized(arguments[index]))")
         }
         index += 1
     }
-    guard !(options.skipAgents && !options.selectedAgents.isEmpty) else {
-        throw SetupOnboardingError.configurationConflict(
-            "--skip-agents cannot be combined with --agent"
-        )
-    }
-    guard !options.replaceSecret || !options.imports.isEmpty else {
-        throw SetupOnboardingError.configurationConflict(
-            "--replace-secret is meaningful only with --import"
-        )
-    }
-    guard options.imports.isEmpty == (options.store == nil) else {
-        throw SetupOnboardingError.configurationConflict(
-            "--store and --import must be supplied together"
-        )
-    }
-    let destinations = options.imports.map(\.destinationKey)
-    guard Set(destinations).count == destinations.count else {
-        throw SetupOnboardingError.configurationConflict(
-            "each --import destination key must be unique"
-        )
-    }
-    return options
-}
-
-private func parseImportRequest(_ value: String) throws -> SetupImportRequest {
-    guard let equals = value.firstIndex(of: "=") else {
-        throw SetupOnboardingError.invalidImportSource(setupSafe(value))
-    }
-    let destination = String(value[..<equals])
-    guard NativeStoreDocument.isValidKey(destination) else {
-        throw SetupOnboardingError.invalidImportSource(setupSafe(value))
-    }
-    let source = String(value[value.index(after: equals)...])
-    let locator: LocalSecretLocator
-    if source.hasPrefix("env:") {
-        let name = String(source.dropFirst("env:".count))
-        guard !name.isEmpty else {
-            throw SetupOnboardingError.invalidImportSource(setupSafe(source))
-        }
-        locator = .environment(name: name)
-    } else if source.hasPrefix("dotenv:") {
-        let body = String(source.dropFirst("dotenv:".count))
-        guard let separator = body.lastIndex(of: ":") else {
-            throw SetupOnboardingError.invalidImportSource(setupSafe(source))
-        }
-        let path = String(body[..<separator])
-        let name = String(body[body.index(after: separator)...])
-        guard !path.isEmpty, !name.isEmpty else {
-            throw SetupOnboardingError.invalidImportSource(setupSafe(source))
-        }
-        locator = .dotenv(relativePath: path, name: name)
-    } else {
-        throw SetupOnboardingError.invalidImportSource(setupSafe(source))
-    }
-    return SetupImportRequest(destinationKey: destination, locator: locator)
-}
-
-private func validateImportRequests(
-    _ requests: [SetupImportRequest],
-    discovery: LocalSecretDiscovery
-) throws -> [(SetupImportRequest, LocalSecretCandidate)] {
-    let candidates = Dictionary(
-        discovery.candidates.map { ($0.locator.identifier, $0) },
-        uniquingKeysWith: { first, _ in first }
-    )
-    return try requests.map { request in
-        guard let candidate = candidates[request.locator.identifier],
-              candidate.kind == .plaintextCandidate else {
-            throw SetupOnboardingError.invalidImportSource(request.locator.identifier)
-        }
-        return (request, candidate)
-    }
-}
-
-private func printSetupReport(
-    options: SetupCommandOptions,
-    detections: [CodingAgentDetection],
-    chosenDetections: [CodingAgentDetection],
-    plans: [CodingAgentConfigurationPlan],
-    planErrors: [String],
-    discovery: LocalSecretDiscovery,
-    selectedImports: [(SetupImportRequest, LocalSecretCandidate)],
-    launchAgentStatus: String,
-    agentReachable: Bool,
-    providerSchemes: [String],
-    nativeStoreAvailable: Bool,
-    rootReachable: Bool,
-    sipStatus: SIPStatus
-) {
-    print("# Convenient Security setup — \(options.apply ? "APPLY" : "DRY RUN")")
-    print("project: \(setupSafe(options.projectDirectory))")
-    print("SIP: \(sipStatus.rawValue)")
-    print("csecd LaunchAgent: \(setupSafe(launchAgentStatus))")
-    print("authenticated agent: \(agentReachable ? "reachable" : "unavailable")")
-    let displayedSchemes = providerSchemes.sorted().map(setupSafe).joined(separator: ", ")
-    print("provider schemes: \(displayedSchemes.isEmpty ? "none reported" : displayedSchemes)")
-    print("native encrypted import: \(nativeStoreAvailable ? "available" : "unavailable")")
-    print("authenticated root helper: \(rootReachable ? "reachable" : "unavailable")")
-
-    print("\n## Coding agents")
-    for detection in detections {
-        let executable = detection.executablePath.map(setupSafe) ?? "not found"
-        let selected = chosenDetections.contains { $0.client == detection.client }
-        print(
-            "- \(detection.client.rawValue): \(detection.detected ? "detected" : "not detected"); "
-                + "executable \(executable); config \(setupSafe(detection.configurationPath)); "
-                + "\(selected ? "selected" : "not selected")"
-        )
-    }
-    if options.skipAgents {
-        print("- configuration intentionally skipped by --skip-agents")
-    } else if chosenDetections.isEmpty {
-        print("- no supported coding agent was auto-detected; use --agent claude or --agent codex to select one explicitly")
-    }
-    for plan in plans {
-        print("- plan \(plan.client.rawValue): \(plan.action.rawValue) — \(setupSafe(plan.detail))")
-    }
-    for error in planErrors {
-        print("- BLOCKED: \(setupSafe(error))")
-    }
-    if !plans.isEmpty {
-        print("- setup never approves hook trust; restart the client and review the exact hook in its hook UI")
-        print("\n### Exact managed fragments")
-        print("Only these value-free fragments are merged; the complete user configuration is never printed.")
-        for plan in plans {
-            print("\n\(plan.client.rawValue):")
-            if let data = try? AICommandHook.hookConfiguration(
-                client: plan.client,
-                csecExecutablePath: currentExecutablePath()
-            ), let fragment = String(data: data, encoding: .utf8) {
-                print(setupDocumentSafe(fragment), terminator: fragment.hasSuffix("\n") ? "" : "\n")
-            }
-        }
-    }
-
-    print("\n## Value-free local source review")
-    for source in discovery.sources {
-        print(
-            "- \(setupSafe(source.source)): \(setupSafe(source.protection)); "
-                + "\(source.candidateCount) candidate(s), \(source.unsupportedEntryCount) unsupported entry/entries"
-        )
-    }
-    if discovery.candidates.isEmpty {
-        print("- no supported references or secret-named plaintext candidates found within the bounded scan")
-    } else {
-        for candidate in discovery.candidates {
-            var line = "- \(candidate.kind.rawValue): \(setupSafe(candidate.locator.identifier))"
-            if let reference = candidate.reference {
-                line += " -> \(setupSafe(reference))"
-            }
-            print(line)
-        }
-    }
-    for warning in discovery.warnings {
-        print("- warning: \(setupSafe(warning))")
-    }
-
-    print("\n## Explicit import plan")
-    if selectedImports.isEmpty {
-        print("- none; setup will never import every discovered candidate automatically")
-        print("- select one with --store STORE --import DEST=env:NAME or --import DEST=dotenv:PATH:NAME")
-    } else if let store = options.store {
-        for (request, _) in selectedImports {
-            print(
-                "- \(setupSafe(request.locator.identifier)) -> "
-                    + "csec://\(setupSafe(store.value))/\(setupSafe(request.destinationKey))"
-                    + (options.replaceSecret ? " (explicit overwrite allowed)" : " (existing keys protected)")
-            )
-        }
-        print("- imports do not resolve references and do not remove, rewrite, or unset the original source")
-    }
+    return projectDirectory
 }
 
 private func absoluteSetupPath(_ value: String) -> String {
@@ -537,34 +346,55 @@ private func absoluteSetupPath(_ value: String) -> String {
     return url.standardizedFileURL.path
 }
 
-private func setupSafe(_ value: String) -> String {
-    let bidiControls: Set<UInt32> = [
-        0x061c, 0x200e, 0x200f,
-        0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
-        0x2066, 0x2067, 0x2068, 0x2069,
-    ]
-    return value.unicodeScalars.map { scalar in
-        if CharacterSet.controlCharacters.contains(scalar)
-            || CharacterSet.newlines.contains(scalar)
-            || bidiControls.contains(scalar.value) {
-            return "�"
+private func setupRootHelperReachable() -> Bool {
+    #if DEBUG
+    let trust: RootHelperServerTrustPolicy = .allowUnverifiedForTesting
+    #else
+    let trust: RootHelperServerTrustPolicy = .requireProductRootHelper
+    #endif
+    do {
+        try RootHelperClient(trustPolicy: trust).health()
+        return true
+    } catch {
+        return false
+    }
+}
+
+private func waitForAgentReachable(_ client: AgentClient, timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if (try? client.capabilities()) != nil { return true }
+        usleep(250_000)
+    } while Date() < deadline
+    return (try? client.capabilities()) != nil
+}
+
+/// Run `work` on the calling thread while an indeterminate spinner animates on a
+/// helper thread. When stderr is not a terminal, run silently.
+private func withSpinner<T>(_ label: String, _ work: () throws -> T) rethrows -> T {
+    guard isatty(STDERR_FILENO) == 1 else { return try work() }
+    let stop = SetupSpinnerFlag()
+    let finished = DispatchSemaphore(value: 0)
+    Thread.detachNewThread {
+        var spinner = IndeterminateSpinner(label: label)
+        while !stop.value {
+            spinner.tick()
+            usleep(90_000)
         }
-        return String(scalar)
-    }.joined()
+        spinner.stop()
+        finished.signal()
+    }
+    defer {
+        stop.set()
+        finished.wait()
+    }
+    return try work()
 }
 
-private func setupDocumentSafe(_ value: String) -> String {
-    let bidiControls: Set<UInt32> = [
-        0x061c, 0x200e, 0x200f,
-        0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
-        0x2066, 0x2067, 0x2068, 0x2069,
-    ]
-    return value.unicodeScalars.map { scalar in
-        bidiControls.contains(scalar.value) ? "�" : String(scalar)
-    }.joined()
-}
-
-private func setupFailure(_ message: String, status: Int32) -> Never {
-    FileHandle.standardError.write(Data("csec setup: \(setupSafe(message))\n".utf8))
-    exit(status)
+/// A tiny lock-guarded flag shared with the spinner helper thread.
+private final class SetupSpinnerFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+    var value: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+    func set() { lock.lock(); flag = true; lock.unlock() }
 }

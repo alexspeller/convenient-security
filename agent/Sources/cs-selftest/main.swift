@@ -104,6 +104,16 @@ actor FakeOnePasswordCommandRunner {
     private var recordedInvocations: [Invocation] = []
     private var readStatus: Int32 = 0
     private var readError = Data()
+    /// Synthetic `op account list` output: user id -> sign-in URL.
+    private var accounts: [(userID: String, url: String)] = [("synthetic-user", "synthetic.1password.com")]
+    /// Synthetic `op vault list` output per account user id.
+    private var vaults: [String: [(id: String, name: String)]] =
+        ["synthetic-user": [(id: "synthetic-vault-id", name: "synthetic")]]
+    /// Accounts whose `op vault list` fails, i.e. authorization has lapsed.
+    private var unauthorizedAccounts: Set<String> = []
+    /// Synthetic `op item list` output per "userID/vaultID".
+    private var items: [String: [(id: String, title: String)]] = [:]
+    private var defaultAccountID: String?
     private var shouldBlockNextInvocation = false
     private var blocked = false
     private var releaseContinuation: CheckedContinuation<Void, Never>?
@@ -135,6 +145,36 @@ actor FakeOnePasswordCommandRunner {
         readError = stderr
     }
 
+    /// Describe the signed-in accounts, their vaults, and (optionally) the items
+    /// in each vault, exactly as the three metadata-only `op` listings would.
+    func setAccounts(
+        _ accounts: [(userID: String, url: String)],
+        vaults: [String: [(id: String, name: String)]],
+        items: [String: [(id: String, title: String)]] = [:],
+        unauthorized: Set<String> = [],
+        defaultAccountID: String? = nil
+    ) {
+        self.accounts = accounts
+        self.vaults = vaults
+        self.items = items
+        self.unauthorizedAccounts = unauthorized
+        self.defaultAccountID = defaultAccountID
+    }
+
+    func resetInvocations() {
+        recordedInvocations = []
+    }
+
+    private func flag(_ name: String, in arguments: [String]) -> String? {
+        guard let index = arguments.firstIndex(of: name), index + 1 < arguments.count
+        else { return nil }
+        return arguments[index + 1]
+    }
+
+    private func json(_ object: Any) -> Data {
+        (try? JSONSerialization.data(withJSONObject: object)) ?? Data("[]".utf8)
+    }
+
     func invocations() -> [Invocation] {
         recordedInvocations
     }
@@ -162,10 +202,53 @@ actor FakeOnePasswordCommandRunner {
             blocked = false
         }
 
-        if arguments.first == "whoami" {
+        if arguments.first == "account", arguments.dropFirst().first == "list" {
             return OnePasswordCLI.Result(
                 status: 0,
-                stdout: Data("{}".utf8),
+                stdout: json(accounts.map { account in
+                    [
+                        "url": account.url,
+                        "email": "synthetic@example.invalid",
+                        "user_uuid": account.userID,
+                        "account_uuid": "account-\(account.userID)",
+                    ]
+                }),
+                stderr: Data()
+            )
+        }
+        if arguments.first == "account", arguments.dropFirst().first == "get" {
+            guard let defaultAccountID else {
+                return OnePasswordCLI.Result(status: 1, stdout: Data(), stderr: Data())
+            }
+            return OnePasswordCLI.Result(
+                status: 0,
+                stdout: json(["id": defaultAccountID]),
+                stderr: Data()
+            )
+        }
+        if arguments.first == "vault", arguments.dropFirst().first == "list" {
+            let account = flag("--account", in: arguments) ?? ""
+            guard !unauthorizedAccounts.contains(account) else {
+                return OnePasswordCLI.Result(
+                    status: 1,
+                    stdout: Data(),
+                    stderr: Data("account is not signed in".utf8)
+                )
+            }
+            return OnePasswordCLI.Result(
+                status: 0,
+                stdout: json((vaults[account] ?? []).map { ["id": $0.id, "name": $0.name] }),
+                stderr: Data()
+            )
+        }
+        if arguments.first == "item", arguments.dropFirst().first == "list" {
+            let account = flag("--account", in: arguments) ?? ""
+            let vault = flag("--vault", in: arguments) ?? ""
+            return OnePasswordCLI.Result(
+                status: 0,
+                stdout: json((items["\(account)/\(vault)"] ?? []).map {
+                    ["id": $0.id, "title": $0.title]
+                }),
                 stderr: Data()
             )
         }
@@ -2457,6 +2540,15 @@ check(bidiGroup.title == "Item"
       "grouped reference components neutralize bidi and control characters")
 check(ReviewDisplay.sanitized("a\u{202e}b\nc") == "a�b�c",
       "sanitized neutralizes bidi overrides and newlines")
+// The three modes that replaced the former sanitizer copies. Bidi overrides are
+// always neutralized; the two flags gate newlines and other control characters.
+check(ReviewDisplay.sanitized("a\u{202e}b\nc\td") == "a�b�c�d",
+      "default mode neutralizes bidi, newlines, and other controls")
+check(ReviewDisplay.sanitized("a\u{202e}b\nc\td", allowNewlines: true) == "a�b\nc�d",
+      "allowNewlines keeps newlines but still neutralizes bidi and other controls")
+check(ReviewDisplay.sanitized("a\u{202e}b\nc\td", allowNewlines: true, allowOtherControls: true)
+        == "a�b\nc\td",
+      "allowNewlines+allowOtherControls neutralizes only bidi overrides")
 
 check(ReviewDisplay.duration(seconds: 45) == "45 seconds"
       && ReviewDisplay.duration(seconds: 300) == "5 minutes"
@@ -2546,18 +2638,28 @@ do {
     try await firstAuthentication.value
     try await concurrentAuthentication.value
     let invocations = await fakeOnePasswordRunner.invocations()
+    // The probe is the account-index build. `op whoami` cannot serve here: it
+    // reports an `op signin` session and fails under desktop-app authorization,
+    // while `op vault list` succeeds exactly when an account is authorized.
     check(invocations == [
         .init(
             path: "/synthetic/op",
-            arguments: ["whoami", "--format=json"],
+            arguments: ["account", "list", "--format=json"],
             timeout: 7
-        )
-    ], "concurrent authentication shares one bounded whoami probe")
+        ),
+        .init(
+            path: "/synthetic/op",
+            arguments: ["vault", "list", "--account", "synthetic-user", "--format=json"],
+            timeout: 7
+        ),
+    ], "concurrent authentication shares one bounded account-index probe")
+    check(!invocations.contains { $0.arguments.first == "whoami" },
+          "the connection probe never uses op whoami")
     check(await proactiveProvider.isAvailable(),
           "a successful metadata probe marks 1Password immediately available")
 
     try await proactiveProvider.authenticate()
-    check(await fakeOnePasswordRunner.invocations().count == 1,
+    check(await fakeOnePasswordRunner.invocations().count == 2,
           "fresh authentication is idempotent and does not spawn another CLI")
 
     let resolved = try await proactiveProvider.resolve(
@@ -2566,6 +2668,9 @@ do {
     )
     check(resolved.value == Data("synthetic-provider-value".utf8),
           "an authenticated provider resolves through the existing op read path")
+    check(await fakeOnePasswordRunner.invocations().last?.arguments == [
+        "read", "--account", "synthetic-user", "--no-newline", "op://synthetic/item/field",
+    ], "resolution names the account that owns the vault")
     check(await fakeOnePasswordRunner.invocations().last?.timeout == 11,
           "secret resolution has its own bounded CLI deadline")
 } catch {
@@ -2592,10 +2697,12 @@ do {
         try SecretRef("op://synthetic/item/other-field"),
         unlock: nil
     )
-    let suffix = Array((await fakeOnePasswordRunner.invocations()).suffix(2))
+    let suffix = Array((await fakeOnePasswordRunner.invocations()).suffix(3))
     check(suffix.map(\.arguments) == [
-        ["whoami", "--format=json"],
-        ["read", "--no-newline", "op://synthetic/item/other-field"],
+        ["account", "list", "--format=json"],
+        ["vault", "list", "--account", "synthetic-user", "--format=json"],
+        ["read", "--account", "synthetic-user", "--no-newline",
+         "op://synthetic/item/other-field"],
     ], "the next real request reconnects immediately after a failed read")
 } catch {
     check(false, "a real request reconnects after provider failure (\(error))")
@@ -2621,7 +2728,7 @@ do {
     try await hotInstallProvider.authenticate()
     let hotInstallStatus = await hotInstallProvider.connectionStatus()
     let hotInstallInvocationCount = await hotInstallRunner.invocations().count
-    check(hotInstallStatus == .connected && hotInstallInvocationCount == 1,
+    check(hotInstallStatus == .connected && hotInstallInvocationCount == 2,
           "the same provider notices a CLI installed after daemon launch")
 } catch {
     check(false, "a newly installed CLI can connect without restarting csecd (\(error))")
@@ -2646,10 +2753,13 @@ let heartbeatProvider = OnePasswordProvider(
 )
 await heartbeatProvider.maintainConnection()
 let heartbeatInvocations = await heartbeatRunner.invocations()
-check(heartbeatInvocations.count == 2
-      && heartbeatInvocations.allSatisfy {
-          $0.arguments == ["whoami", "--format=json"] && $0.timeout == 7
-      }, "connection maintenance probes immediately and again after the heartbeat")
+check(heartbeatInvocations.map(\.arguments) == [
+    ["account", "list", "--format=json"],
+    ["vault", "list", "--account", "synthetic-user", "--format=json"],
+    ["account", "list", "--format=json"],
+    ["vault", "list", "--account", "synthetic-user", "--format=json"],
+] && heartbeatInvocations.allSatisfy { $0.timeout == 7 },
+      "connection maintenance probes immediately and again after the heartbeat")
 check(await heartbeatSleeper.intervals() == [8, 8],
       "successful maintenance uses the configured sub-expiry heartbeat")
 
@@ -3614,6 +3724,36 @@ secretDestinationSpecTests()
 onePasswordItemWriteTests()
 await remoteApprovalTests()
 await sshProtectionTests()
+await automationTests()
+cliHelpTests()
+onePasswordAccountIndexTests()
+await onePasswordProviderAccountTests()
+onePasswordReviewNoteTests()
+onePasswordLiveAccountTests()
+statusRendererTests()
+
+print("\n# fdaState (Full Disk Access derived from HA-D01)")
+do {
+    func synthFinding(_ status: FindingStatus) -> HostFinding {
+        HostFinding(
+            id: "HA-D01", title: "Full Disk Access grantees reviewed",
+            severity: .high, tier: .fullDiskAccess, status: status, onThesis: true,
+            evidence: "", anchor: "", remediation: .advise)
+    }
+    func synthReport(_ findings: [HostFinding]) -> HostAuditReport {
+        HostAuditReport(findings: findings, verdict: "synthetic")
+    }
+    check(fdaState(from: nil) == .unknown, "fdaState: a nil report (csecd unreachable) is unknown")
+    check(fdaState(from: synthReport([])) == .unknown, "fdaState: a report without HA-D01 is unknown")
+    check(fdaState(from: synthReport([synthFinding(.unknown)])) == .missing,
+          "fdaState: HA-D01 unknown (csec lacks FDA) means missing")
+    check(fdaState(from: synthReport([synthFinding(.pass)])) == .granted,
+          "fdaState: HA-D01 pass means FDA granted")
+    check(fdaState(from: synthReport([synthFinding(.expectedSelf)])) == .granted,
+          "fdaState: HA-D01 expected-self means FDA granted")
+    check(fdaState(from: synthReport([synthFinding(.fail)])) == .granted,
+          "fdaState: HA-D01 fail means FDA granted")
+}
 
 if failures == 0 {
     print("\nAll checks passed.")

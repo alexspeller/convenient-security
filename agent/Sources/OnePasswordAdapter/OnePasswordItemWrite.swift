@@ -86,15 +86,31 @@ public enum OnePasswordItemWrite {
 
     // MARK: - argv builders (metadata only, unit-tested to stay value-free)
 
-    public static func getItemArguments(title: String, vault: String) -> [String] {
-        ["item", "get", title, "--vault", vault, "--format", "json"]
+    /// A vault name is only unique within one account, so every write names the
+    /// account explicitly. Without it `op` picks its own current default, which
+    /// can silently create the item in the wrong account.
+    private static func accountArguments(_ account: OnePasswordAccount?) -> [String] {
+        guard let account else { return [] }
+        return ["--account", account.userID]
     }
 
-    public static func createArguments(vault: String) -> [String] {
-        ["item", "create", "--vault", vault, "--format", "json", "-"]
+    public static func getItemArguments(
+        title: String, vault: String, account: OnePasswordAccount? = nil
+    ) -> [String] {
+        ["item", "get", title, "--vault", vault]
+            + accountArguments(account) + ["--format", "json"]
     }
 
-    public static func editArguments(itemID: String) -> [String] {
-        ["item", "edit", itemID, "--format", "json"]
+    public static func createArguments(
+        vault: String, account: OnePasswordAccount? = nil
+    ) -> [String] {
+        ["item", "create", "--vault", vault]
+            + accountArguments(account) + ["--format", "json", "-"]
+    }
+
+    public static func editArguments(
+        itemID: String, account: OnePasswordAccount? = nil
+    ) -> [String] {
+        ["item", "edit", itemID] + accountArguments(account) + ["--format", "json"]
     }
 }

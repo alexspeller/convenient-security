@@ -74,11 +74,21 @@ rest and in use — as small as macOS allows.
   installed, the resident agent requests desktop-app access on launch and keeps
   that access active with metadata-only checks. It never prefetches a secret;
   app lock and 1Password's maximum session lifetime still require fresh approval.
+- **More than one 1Password account works.** An `op://` reference names no
+  account, so `op` on its own resolves it against whichever account it last
+  recorded. csec finds the account that actually owns the vault and reads from
+  exactly that one. When a vault name is not unique, the approval window names
+  the account the value will come from and says so before you touch the sensor.
 - **Opt-in iPhone approval.** A paired iPhone can mirror and Face-ID-approve the
   exact same short-lived, value-free 1Password prompt while the local Touch ID
   window remains available; the first signed decision wins. The source path is
   implemented, with its CloudKit provisioning and physical-device release gate
   tracked in [`docs/remote-approval.md`](docs/remote-approval.md).
+- **Explicit unattended automation.** When cron or launchd cannot wait for
+  Touch ID, one local review can register an exact command and exact references
+  until revoked. This intentionally trusts mutable scripts and dependencies;
+  ordinary bounded grants remain unchanged. See
+  [`docs/automation.md`](docs/automation.md).
 - **Encrypted at rest, gated by code identity.** The optional cache and the
   native store keys live in a Secure-Enclave-backed Keychain group that only the
   signed agent can open — the same code-identity model 1Password itself relies on.
@@ -108,6 +118,9 @@ Security **cannot** protect a secret from:
 - **root** or the Apple platform itself;
 - **a consumer you deliberately authorized** — once your Rails app or your shell
   holds a plaintext value, it can log it, assign it to `ENV`, or send it anywhere;
+- **a mutable unattended job you explicitly enrolled** — anything that can edit
+  its script, dependencies, arguments' inputs, or working-directory contents can
+  obtain every reference registered to that job on its next run;
 - **a pipe reader or ordinary redirection file you explicitly approve** — Unix
   does not identify a pipeline's sibling reader to `csec`, and an ordinary file
   can be read later, copied, synchronized, or backed up outside csec's control;
@@ -448,6 +461,43 @@ const token = secrets['csec://development/LOCAL_API_TOKEN'];
 
 See the [Ruby](clients/ruby/README.md) and [Node.js](clients/node/README.md)
 client guides for their delivery guarantees, startup patterns, and error APIs.
+
+### Run a mutable script from cron or launchd
+
+Ordinary grants die with their process root, so cron cannot reuse yesterday's
+approval. For jobs where unattended execution matters more than script
+integrity, register one exact command and reference set:
+
+```sh
+/Library/Application\ Support/ConvenientSecurity/bin/csec automation add youtube-reminders \
+  --ref 'op://Personal/YouTube/client_secret' \
+  --ref 'csec://mailai/refresh_token' \
+  --every 3600 \
+  --max-runtime 300 \
+  --cwd "$HOME/projects/mailai" \
+  -- /opt/homebrew/bin/node dist/youtube-reminders.js
+```
+
+The attended review states the exception plainly and Touch ID materializes
+device-only copies for those refs. Cron or launchd then invokes only:
+
+```sh
+/Library/Application\ Support/ConvenientSecurity/bin/csec automation run youtube-reminders
+```
+
+Do not schedule `node dist/youtube-reminders.js` directly: the unattended lease
+exists only while signed csec directly supervises the stored command. The runner
+uses the stored argv and cwd, strips loader and interpreter injection variables,
+enforces the maximum runtime, and sends output through the resident redactor.
+The script, dependency graph, ordinary inputs, and remaining environment are
+deliberately mutable and therefore trusted. Re-run `automation add` with the
+same name after a provider value or interpreter changes; inspect with
+`automation list` and remove with `automation revoke NAME`. See
+[`docs/automation.md`](docs/automation.md) for the complete boundary.
+
+Do not put literal secrets in the reason or command arguments; those are stored
+and displayed as metadata. A same-user process can also trigger a registered job
+and supply its ordinary environment, which is part of this explicit trade.
 
 ## Native encrypted files
 

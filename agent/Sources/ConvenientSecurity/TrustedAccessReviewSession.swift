@@ -34,6 +34,7 @@
     private var authenticationView: LAAuthenticationView!
     private var statusLabel: NSTextField!
     private var denyButton: NSButton!
+    private var automationDetailsView: NSView?
 
     private init(review: AccessPolicyReview) {
       self.review = review
@@ -124,9 +125,12 @@
 
       root.addArrangedSubview(makeHeader())
 
-      if let warning = DeliveryReviewCopy.warning(for: review) {
+      if review.automation != nil {
+        root.addArrangedSubview(Self.makeAutomationWarning(width: Self.innerWidth))
+      } else if let warning = DeliveryReviewCopy.warning(for: review) {
         let tint: NSColor =
-          review.plan.recipientAssurance == .ordinaryPersistentFile ? .systemRed : .systemOrange
+          review.plan.recipientAssurance == .ordinaryPersistentFile
+            ? .systemRed : .systemOrange
         root.addArrangedSubview(
           Self.makeBanner(text: warning, tint: tint, width: Self.innerWidth))
       }
@@ -136,19 +140,27 @@
       let credentialCards = makeCredentialCards(width: Self.innerWidth)
       root.addArrangedSubview(credentialCards)
 
-      root.addArrangedSubview(Self.makeSectionLabel("Request"))
+      root.addArrangedSubview(Self.makeSectionLabel(
+        review.automation == nil ? "Request" : "Persistent automation job"
+      ))
       root.setCustomSpacing(6, after: root.arrangedSubviews.last!)
-      root.addArrangedSubview(makeDetailsGrid())
+      if let automation = review.automation {
+        root.addArrangedSubview(makeAutomationSummary(automation, width: Self.innerWidth))
+      } else {
+        root.addArrangedSubview(makeDetailsGrid())
+      }
 
-      let footnote = NSTextField(
-        wrappingLabelWithString:
-          "Touch ID authorizes this exact release. No secret values are shown in this window."
-      )
-      footnote.font = .systemFont(ofSize: 11)
-      footnote.textColor = .tertiaryLabelColor
-      footnote.maximumNumberOfLines = 3
-      footnote.preferredMaxLayoutWidth = Self.innerWidth
-      root.addArrangedSubview(footnote)
+      if review.automation == nil {
+        let footnote = NSTextField(
+          wrappingLabelWithString:
+            "Touch ID authorizes this exact release. No secret values are shown in this window."
+        )
+        footnote.font = .systemFont(ofSize: 11)
+        footnote.textColor = .tertiaryLabelColor
+        footnote.maximumNumberOfLines = 3
+        footnote.preferredMaxLayoutWidth = Self.innerWidth
+        root.addArrangedSubview(footnote)
+      }
 
       let separator = NSBox()
       separator.boxType = .separator
@@ -187,7 +199,9 @@
         icon.heightAnchor.constraint(equalToConstant: 44),
       ])
 
-      let title = NSTextField(labelWithString: "Secret Access Requested")
+      let title = NSTextField(labelWithString:
+        review.automation == nil ? "Secret Access Requested" : "Enable Unattended Automation"
+      )
       title.font = .systemFont(ofSize: 19, weight: .semibold)
 
       let purpose = NSTextField(
@@ -234,6 +248,49 @@
       label.preferredMaxLayoutWidth = width - 60
 
       let content = NSStackView(views: [icon, label])
+      content.orientation = .horizontal
+      content.alignment = .top
+      content.spacing = 10
+
+      return Self.card(
+        wrapping: content,
+        fill: tint.withAlphaComponent(0.09),
+        border: tint.withAlphaComponent(0.35),
+        width: width
+      )
+    }
+
+    private static func makeAutomationWarning(width: CGFloat) -> NSView {
+      let tint = NSColor.systemRed
+
+      let icon = NSImageView()
+      icon.image = NSImage(
+        systemSymbolName: "exclamationmark.triangle.fill",
+        accessibilityDescription: "Warning"
+      )
+      icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+      icon.contentTintColor = tint
+      icon.setContentHuggingPriority(.required, for: .horizontal)
+      icon.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+      let title = NSTextField(labelWithString: DeliveryReviewCopy.automationWarningTitle)
+      title.font = .systemFont(ofSize: 12, weight: .semibold)
+      title.textColor = tint
+
+      let explanation = NSTextField(
+        wrappingLabelWithString: DeliveryReviewCopy.automationWarningExplanation
+      )
+      explanation.font = .systemFont(ofSize: 12)
+      explanation.textColor = .labelColor
+      explanation.maximumNumberOfLines = 6
+      explanation.preferredMaxLayoutWidth = width - 60
+
+      let copy = NSStackView(views: [title, explanation])
+      copy.orientation = .vertical
+      copy.alignment = .leading
+      copy.spacing = 3
+
+      let content = NSStackView(views: [icon, copy])
       content.orientation = .horizontal
       content.alignment = .top
       content.spacing = 10
@@ -357,7 +414,7 @@
       stack.alignment = .leading
       stack.spacing = 7
 
-      let group = ReviewDisplay.referenceGroup(for: credential.references)
+      let group = ReviewDisplay.referenceGroup(for: credential)
 
       let keyIcon = NSImageView()
       keyIcon.image = NSImage(systemSymbolName: "key.fill", accessibilityDescription: nil)
@@ -414,6 +471,42 @@
         stack.addArrangedSubview(row)
       }
 
+      // Where the value will actually come from. For a reference that names no
+      // account (`op://vault/item/field` never does), this is the only place the
+      // chosen source is stated before Touch ID authorizes it.
+      for note in group.notes {
+        let row = NSTextField(wrappingLabelWithString: note)
+        row.font = .systemFont(ofSize: 12)
+        row.textColor = .secondaryLabelColor
+        row.maximumNumberOfLines = 3
+        row.preferredMaxLayoutWidth = innerWidth
+        stack.addArrangedSubview(row)
+      }
+      for warning in group.warnings {
+        let icon = NSImageView()
+        icon.image = NSImage(
+          systemSymbolName: "exclamationmark.triangle.fill",
+          accessibilityDescription: "Warning"
+        )
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        icon.contentTintColor = .systemOrange
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        icon.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let label = NSTextField(wrappingLabelWithString: warning)
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.textColor = .systemOrange
+        label.maximumNumberOfLines = 6
+        label.preferredMaxLayoutWidth = innerWidth - 22
+
+        let row = NSStackView(views: [icon, label])
+        row.orientation = .horizontal
+        row.alignment = .top
+        row.spacing = 6
+        stack.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalToConstant: innerWidth).isActive = true
+      }
+
       return Self.card(
         wrapping: stack,
         fill: NSColor.labelColor.withAlphaComponent(0.045),
@@ -437,6 +530,201 @@
     }
 
     // MARK: - Request details
+
+    private func makeAutomationSummary(
+      _ automation: AutomationReviewDetails,
+      width: CGFloat
+    ) -> NSView {
+      let job = automation.job
+      let innerWidth = width - 24
+
+      let title = NSTextField(labelWithString: Self.safe(job.name))
+      title.font = .systemFont(ofSize: 14, weight: .semibold)
+      title.lineBreakMode = .byTruncatingTail
+
+      let spacer = NSView()
+      spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+      let authorization = Self.statusPill("UNTIL REVOKED", tint: .systemRed)
+      let header = NSStackView(views: [title, spacer, authorization])
+      header.orientation = .horizontal
+      header.alignment = .centerY
+      header.spacing = 8
+      header.widthAnchor.constraint(equalToConstant: innerWidth).isActive = true
+
+      let interval = job.minimumIntervalSeconds == 0
+        ? "Every trigger allowed"
+        : "At most once every \(ReviewDisplay.duration(seconds: job.minimumIntervalSeconds))"
+      let runtime = "\(ReviewDisplay.duration(seconds: job.maximumRuntimeSeconds)) max per run"
+      let summary = NSTextField(
+        wrappingLabelWithString: "Mutable interpreted command  ·  \(interval)  ·  \(runtime)"
+      )
+      summary.font = .systemFont(ofSize: 12)
+      summary.textColor = .secondaryLabelColor
+      summary.maximumNumberOfLines = 3
+      summary.preferredMaxLayoutWidth = innerWidth
+
+      let disclosure = NSButton(
+        title: "Show command and security details",
+        target: self,
+        action: #selector(toggleAutomationDetails(_:))
+      )
+      disclosure.bezelStyle = .inline
+      disclosure.controlSize = .small
+      disclosure.font = .systemFont(ofSize: 12)
+      disclosure.image = NSImage(
+        systemSymbolName: "chevron.right",
+        accessibilityDescription: nil
+      )
+      disclosure.imagePosition = .imageLeading
+
+      let details = makeAutomationDetails(job, width: innerWidth)
+      details.isHidden = true
+      automationDetailsView = details
+
+      let stack = NSStackView(views: [header, summary, disclosure, details])
+      stack.orientation = .vertical
+      stack.alignment = .leading
+      stack.spacing = 7
+
+      return Self.card(
+        wrapping: stack,
+        fill: NSColor.labelColor.withAlphaComponent(0.045),
+        border: NSColor.separatorColor,
+        width: width
+      )
+    }
+
+    private func makeAutomationDetails(_ job: AutomationJob, width: CGFloat) -> NSView {
+      let separator = NSBox()
+      separator.boxType = .separator
+      separator.widthAnchor.constraint(equalToConstant: width).isActive = true
+
+      let commandLabel = Self.automationDetailLabel("Exact command")
+      let command = Self.commandTextView(Self.safe(job.command.displayCommand), width: width)
+
+      let workingDirectory = Self.automationDetail(
+        label: "Working directory",
+        value: Self.safe(job.command.workingDirectory),
+        width: width,
+        monospaced: true
+      )
+      let interpreter = Self.automationDetail(
+        label: "Interpreter",
+        value: "\(Self.safe(job.command.executable.canonicalPath))  ·  explicitly unverified",
+        width: width,
+        monospaced: true
+      )
+      let environment = Self.automationDetail(
+        label: "Environment",
+        value: "Sanitized trigger environment; not integrity-protected",
+        width: width
+      )
+
+      let stack = NSStackView(
+        views: [separator, commandLabel, command, workingDirectory, interpreter, environment]
+      )
+      stack.orientation = .vertical
+      stack.alignment = .leading
+      stack.spacing = 7
+      stack.setCustomSpacing(9, after: command)
+      stack.widthAnchor.constraint(equalToConstant: width).isActive = true
+      return stack
+    }
+
+    private static func automationDetail(
+      label: String,
+      value: String,
+      width: CGFloat,
+      monospaced: Bool = false
+    ) -> NSView {
+      let heading = automationDetailLabel(label)
+      let copy = NSTextField(wrappingLabelWithString: value)
+      copy.font = monospaced
+        ? .monospacedSystemFont(ofSize: 11.5, weight: .regular)
+        : .systemFont(ofSize: 12)
+      copy.textColor = .labelColor
+      copy.maximumNumberOfLines = 5
+      copy.preferredMaxLayoutWidth = width
+      copy.toolTip = value
+
+      let stack = NSStackView(views: [heading, copy])
+      stack.orientation = .vertical
+      stack.alignment = .leading
+      stack.spacing = 2
+      stack.widthAnchor.constraint(equalToConstant: width).isActive = true
+      return stack
+    }
+
+    private static func automationDetailLabel(_ text: String) -> NSTextField {
+      let label = NSTextField(labelWithString: text.uppercased())
+      label.font = .systemFont(ofSize: 10, weight: .semibold)
+      label.textColor = .secondaryLabelColor
+      return label
+    }
+
+    private static func commandTextView(_ command: String, width: CGFloat) -> NSView {
+      let text = NSTextView()
+      text.string = command
+      text.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular)
+      text.textColor = .labelColor
+      text.drawsBackground = false
+      text.isEditable = false
+      text.isSelectable = true
+      text.isRichText = false
+      text.textContainerInset = NSSize(width: 7, height: 6)
+      text.textContainer?.lineFragmentPadding = 0
+      text.textContainer?.widthTracksTextView = true
+      text.isHorizontallyResizable = false
+      text.isVerticallyResizable = true
+      text.autoresizingMask = [.width]
+
+      let scroll = NSScrollView()
+      scroll.borderType = .lineBorder
+      scroll.drawsBackground = false
+      scroll.hasVerticalScroller = true
+      scroll.autohidesScrollers = true
+      scroll.documentView = text
+      NSLayoutConstraint.activate([
+        scroll.widthAnchor.constraint(equalToConstant: width),
+        scroll.heightAnchor.constraint(equalToConstant: 88),
+      ])
+      return scroll
+    }
+
+    private static func statusPill(_ text: String, tint: NSColor) -> NSView {
+      let label = NSTextField(labelWithString: text)
+      label.font = .systemFont(ofSize: 9.5, weight: .bold)
+      label.textColor = tint
+      return paddedBox(
+        content: label,
+        cornerRadius: 5,
+        fill: tint.withAlphaComponent(0.10),
+        border: tint.withAlphaComponent(0.22),
+        horizontalPadding: 7,
+        verticalPadding: 3
+      )
+    }
+
+    @objc private func toggleAutomationDetails(_ sender: NSButton) {
+      guard let details = automationDetailsView, let contentView = window.contentView else {
+        return
+      }
+      let expanding = details.isHidden
+      details.isHidden = !expanding
+      sender.title = expanding
+        ? "Hide command and security details"
+        : "Show command and security details"
+      sender.image = NSImage(
+        systemSymbolName: expanding ? "chevron.down" : "chevron.right",
+        accessibilityDescription: nil
+      )
+
+      let previousTop = window.frame.maxY
+      contentView.layoutSubtreeIfNeeded()
+      window.setContentSize(contentView.fittingSize)
+      window.setFrameOrigin(NSPoint(x: window.frame.minX, y: previousTop - window.frame.height))
+    }
 
     private func makeDetailsGrid() -> NSView {
       let plan = review.plan
@@ -522,27 +810,41 @@
     // MARK: - Authentication area and footer
 
     private func makeAuthenticationArea() -> NSView {
-      authenticationView = LAAuthenticationView(context: context, controlSize: .large)
+      authenticationView = LAAuthenticationView(context: context, controlSize: .small)
       authenticationView.setContentHuggingPriority(.required, for: .horizontal)
       authenticationView.setContentCompressionResistancePriority(.required, for: .horizontal)
 
       statusLabel = NSTextField(
-        wrappingLabelWithString: biometricsAvailable
-          ? "Touch ID is active. Touch the sensor to release the value, or Deny."
-          : "Touch ID is unavailable, so this request cannot be authorized."
+        wrappingLabelWithString: authenticationStatusText()
       )
-      statusLabel.font = .systemFont(ofSize: 12)
+      statusLabel.font = .systemFont(ofSize: 13)
       statusLabel.textColor = biometricsAvailable ? .secondaryLabelColor : .systemRed
-      statusLabel.alignment = .center
+      statusLabel.alignment = .left
       statusLabel.maximumNumberOfLines = 3
-      statusLabel.preferredMaxLayoutWidth = Self.innerWidth - 80
+      statusLabel.preferredMaxLayoutWidth = Self.innerWidth - 110
 
       let area = NSStackView(views: [authenticationView, statusLabel])
-      area.orientation = .vertical
-      area.alignment = .centerX
-      area.spacing = 8
-      area.widthAnchor.constraint(equalToConstant: Self.innerWidth).isActive = true
-      return area
+      area.orientation = .horizontal
+      area.alignment = .centerY
+      area.spacing = 14
+      return Self.paddedBox(
+        content: area,
+        cornerRadius: 9,
+        fill: NSColor.controlAccentColor.withAlphaComponent(0.06),
+        border: nil,
+        horizontalPadding: 14,
+        verticalPadding: 10,
+        width: Self.innerWidth
+      )
+    }
+
+    private func authenticationStatusText() -> String {
+      guard biometricsAvailable else {
+        return "Touch ID is unavailable, so this request cannot be authorized."
+      }
+      return review.automation == nil
+        ? "Touch ID is ready. Touch the sensor to release the requested value."
+        : "Touch ID is ready. Touch the sensor to enable this job until you revoke it."
     }
 
     private func makeFooter() -> NSView {
@@ -584,8 +886,7 @@
       state = .authenticating
       denyButton.title = "Cancel"
       statusLabel.textColor = .secondaryLabelColor
-      statusLabel.stringValue =
-        "Touch ID is active. Touch the sensor to authorize, or Deny."
+      statusLabel.stringValue = authenticationStatusText()
 
       context.evaluatePolicy(
         .deviceOwnerAuthenticationWithBiometrics,
@@ -650,6 +951,9 @@
     }
 
     private static func initialAuthenticationReason(_ review: AccessPolicyReview) -> String {
+      if let automation = review.automation {
+        return "Allow unattended job \(safe(automation.job.name)) to use the displayed references until revoked"
+      }
       let plan = review.plan
       let policySummary =
         "delivery \(plan.mechanism.rawValue); scope \(plan.descendantScope.rawValue); "

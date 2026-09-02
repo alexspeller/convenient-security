@@ -45,7 +45,8 @@ public struct MirroredPolicyReview: PolicyReviewProvider {
         // desktop connection can resolve without unlocking a cold csec Keychain
         // cache or native-store key. Mixed/native requests stay local.
         let references = review.credentials.flatMap(\.references)
-        guard !references.isEmpty,
+        guard review.automation == nil,
+              !references.isEmpty,
               references.allSatisfy({ $0.scheme == "op" }),
               let frozen = try? RemoteApprovalReview(accessPolicyReview: review) else {
             return await local.reviewAccess(review)
@@ -121,10 +122,18 @@ public extension RemoteApprovalReview {
     /// this presentation to the agent's immutable authorization transaction.
     init(accessPolicyReview review: AccessPolicyReview) throws {
         let groups = review.credentials.map { credential -> Credential in
-            let group = ReviewDisplay.referenceGroup(for: credential.references)
+            let group = ReviewDisplay.referenceGroup(for: credential)
+            // The phone renders a fixed set of fields, so provider context joins
+            // the subtitle rather than adding a wire field. The strings are the
+            // same bounded, sanitized ones the Mac window shows, so both
+            // surfaces describe the same resolution.
+            let subtitle = ReviewDisplay.bounded(
+                ([group.subtitle].compactMap { $0 } + group.noteLines).joined(separator: " · "),
+                maxBytes: 1_024
+            )
             return Credential(
                 title: group.title,
-                subtitle: group.subtitle,
+                subtitle: subtitle.isEmpty ? nil : subtitle,
                 fields: group.fields,
                 rawReferences: group.rawReferences
             )

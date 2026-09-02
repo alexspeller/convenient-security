@@ -239,6 +239,13 @@ let sshSigningService = SSHSigningService(
     policyReview: policyReview,
     allowUnverifiedCallersForTesting: true
 )
+let automationService = AutomationService(
+    resolver: resolver,
+    grantStore: InMemoryAutomationGrantStore(),
+    materializationStore: InMemoryAutomationMaterializationStore(),
+    consent: consent,
+    policyReview: policyReview
+)
 let agent = Agent(
     resolver: resolver,
     grants: grants,
@@ -246,7 +253,9 @@ let agent = Agent(
     policyReview: policyReview,
     nativeStore: nativeProvider,
     sshSigningService: sshSigningService,
-    allowUnverifiedPlansForTesting: true
+    automationService: automationService,
+    allowUnverifiedPlansForTesting: true,
+    allowUnverifiedAutomationCallersForTesting: true
 )
 
 let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedForTesting) { request, caller in
@@ -273,6 +282,8 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
         )
     case let .configureSSH(request):
         return await agent.configureSSH(request: request, caller: caller)
+    case let .configureAutomation(request):
+        return await agent.configureAutomation(request: request, caller: caller)
     case let .beginSession(begin):
         return await agent.beginSession(request: begin, caller: caller)
     case let .beginOutputRedaction(begin):
@@ -464,8 +475,9 @@ do {
           && capabilities.features.contains(.registeredSessionRoots)
           && capabilities.features.contains(.credentialProtocols)
           && capabilities.features.contains(.inheritedFileDescriptors)
-          && capabilities.features.contains(.protectedRegularFiles),
-          "agent advertises delivery, redaction, native-store, and secure-file capabilities")
+          && capabilities.features.contains(.protectedRegularFiles)
+          && capabilities.features.contains(.unattendedAutomation),
+          "agent advertises delivery, redaction, storage, and automation capabilities")
 } catch {
     check(false, "protocol capability negotiation succeeds (\(error))")
 }
@@ -1053,20 +1065,29 @@ check(FileManager.default.fileExists(atPath: rootSocketPath), "synthetic root-he
 let completeStatus = runCsec(
     ["status"], extraEnv: ["SSH_AUTH_SOCK": sshSocketPath]
 )
+// The status block renders as a colored, glyphed report (StatusRenderer): each
+// row is `● <label>:  <value>` with an overall verdict badge. Assert on the
+// value substrings and the healthy badge; exit 0 already proves every component
+// (agent, provider, SSH, root) is healthy via CompleteStatus.healthy.
 check(completeStatus.status == 0
-      && completeStatus.out.contains("Agent control channel: reachable and authenticated")
-      && completeStatus.out.contains("Providers: csec, op")
-      && completeStatus.out.contains("SSH agent: ready")
-      && completeStatus.out.contains("Protected SSH keys: 0")
-      && completeStatus.out.contains("Root helper: reachable and authenticated"),
+      && completeStatus.out.contains("healthy")
+      && completeStatus.out.contains("Agent control channel:")
+      && completeStatus.out.contains("reachable and authenticated")
+      && completeStatus.out.contains("csec, op")
+      && completeStatus.out.contains("SSH agent:")
+      && completeStatus.out.contains("ready")
+      && completeStatus.out.contains("Root helper:"),
       "csec status consolidates authenticated agent, provider, SSH, and root health")
 
 let doctorCheck = runCsec(
     ["doctor", "--check"], extraEnv: ["SSH_AUTH_SOCK": sshSocketPath]
 )
+// The doctor narrative is now a styled note on stderr; the status block (with the
+// healthy badge) is the stdout report.
 check(doctorCheck.status == 0
-      && doctorCheck.out.contains("csec doctor: checking the complete installation")
-      && doctorCheck.out.contains("SSH agent: ready"),
+      && doctorCheck.err.contains("checking the complete installation")
+      && doctorCheck.out.contains("healthy")
+      && doctorCheck.out.contains("ready"),
       "csec doctor --check performs a healthy read-only diagnosis")
 
 let legacySSHStatus = runCsec(
@@ -1123,11 +1144,105 @@ func runCsec(
     )
 }
 
+func jsonStringLiteral(_ value: String) -> String {
+    guard let encoded = try? JSONEncoder().encode(value) else { return "\"\"" }
+    return String(decoding: encoded, as: UTF8.self)
+}
+
 let rootStatus = runCsec(["root-status"], extraEnv: [:])
 check(rootStatus.status == 0
       && rootStatus.out == "csec: authenticated root helper reachable\n"
       && rootStatus.err.isEmpty,
       "root-status verifies the authenticated root-helper protocol endpoint")
+
+// Persistent automation end to end: enroll through the authenticated control
+// protocol, launch Node as the runner's exact child, fetch through the real
+// private bridge, and prove revocation removes the registration. Every value is
+// synthetic and the materialization stores are process-local test doubles.
+do {
+    let emptyAutomation = runCsec(["automation", "list"], extraEnv: [:])
+    check(emptyAutomation.status == 0
+          && emptyAutomation.out.contains("no unattended automation jobs"),
+          "automation control protocol lists an empty catalog")
+
+    let node = try ExecutableInspection.plannedExecutable(command: "node").canonicalPath
+    var repositoryURL = URL(fileURLWithPath: #filePath)
+    for _ in 0..<4 { repositoryURL.deleteLastPathComponent() }
+    let moduleURL = repositoryURL
+        .appendingPathComponent("clients/node/dist/esm/index.js")
+        .absoluteURL.absoluteString
+    let scriptURL = URL(fileURLWithPath: e2eWorkingDirectory)
+        .appendingPathComponent("automation-node-e2e.mjs")
+    let automationReference = "op://demo/api/key"
+    let script = """
+    import { access } from \(jsonStringLiteral(moduleURL));
+    const reference = \(jsonStringLiteral(automationReference));
+    const values = await access([reference], {
+      reason: 'Synthetic unattended Node e2e',
+      ttl: 30,
+      bridgePath: \(jsonStringLiteral(csecURL.path)),
+      testSocketPath: \(jsonStringLiteral(socketPath)),
+    });
+    if (values[reference] !== 'sk-demo-123') process.exit(3);
+    process.stdout.write('automation-node-ok\\n');
+    """
+    try Data(script.utf8).write(to: scriptURL, options: .atomic)
+
+    let jobName = "node-e2e"
+    let enrolled = runCsec([
+        "automation", "add", jobName,
+        "--ref", automationReference,
+        "--reason", "Synthetic unattended Node e2e",
+        "--max-runtime", "30",
+        "--cwd", e2eWorkingDirectory,
+        "--", node, scriptURL.path,
+    ], extraEnv: [:])
+    check(enrolled.status == 0
+          && enrolled.out.contains("enrolled unattended automation job \(jobName)"),
+          "automation enrollment materializes a synthetic reference over the real socket")
+
+    let listedAutomation = runCsec(["automation", "list"], extraEnv: [:])
+    check(listedAutomation.status == 0
+          && listedAutomation.out.contains(jobName)
+          && listedAutomation.out.contains(node)
+          && listedAutomation.out.contains(automationReference),
+          "automation list returns the persistent value-free command recipe")
+
+    let automationRun = runCsec(["automation", "run", jobName], extraEnv: [:])
+    check(automationRun.status == 0
+          && automationRun.out == "automation-node-ok\n"
+          && automationRun.err.isEmpty,
+          "automation runs Node as the exact child and authorizes its real language bridge "
+            + "(status \(automationRun.status), out \(automationRun.out.debugDescription), "
+            + "err \(automationRun.err.debugDescription))")
+
+    let revoked = runCsec(["automation", "revoke", jobName], extraEnv: [:])
+    let afterRevoke = runCsec(["automation", "list"], extraEnv: [:])
+    check(revoked.status == 0
+          && afterRevoke.status == 0
+          && afterRevoke.out.contains("no unattended automation jobs"),
+          "automation revoke removes the persistent grant and materialization")
+
+    let timeoutJobName = "timeout-e2e"
+    let enrolledTimeout = runCsec([
+        "automation", "add", timeoutJobName,
+        "--ref", automationReference,
+        "--max-runtime", "2",
+        "--cwd", e2eWorkingDirectory,
+        "--", "/bin/sleep", "10",
+    ], extraEnv: [:])
+    let timedOut = runCsec(["automation", "run", timeoutJobName], extraEnv: [:])
+    let revokedTimeout = runCsec(
+        ["automation", "revoke", timeoutJobName], extraEnv: [:]
+    )
+    check(enrolledTimeout.status == 0
+          && timedOut.status == 124
+          && timedOut.err.contains("exceeded its registered maximum runtime")
+          && revokedTimeout.status == 0,
+          "automation enforces its registered runtime and reports timeout status 124")
+} catch {
+    check(false, "unattended Node automation end-to-end checks run (\(error))")
+}
 
 // `csec protect` end to end: run the real launcher in a throwaway project dir and
 // confirm it imports the plaintext into the encrypted store, writes a valid
@@ -2213,78 +2328,18 @@ if FileManager.default.isExecutableFile(atPath: csecURL.path) {
           && !exitedParentGet.err.contains(mutationValue),
           "replaced or exited parent fails closed before resolution or plaintext output")
 
-    do {
-        let setupFixture = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("csec setup fixture \(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: setupFixture,
-            withIntermediateDirectories: false,
-            attributes: [.posixPermissions: 0o700]
-        )
-        defer { try? FileManager.default.removeItem(at: setupFixture) }
-        let dotenvURL = setupFixture.appendingPathComponent(".env.local")
-        let firstMarker = "onboarding-import-synthetic-value"
-        try Data("LEGACY_TOKEN='\(firstMarker)'\n".utf8).write(to: dotenvURL)
-        let setupArguments = [
-            "setup", "--skip-agents", "--project", setupFixture.path,
-            "--store", "onboarding_e2e",
-            "--import", "IMPORTED_TOKEN=dotenv:.env.local:LEGACY_TOKEN",
-            "--no-audit-prompt",
-        ]
-
-        let dryRun = runCsec(setupArguments, extraEnv: [:])
-        let dryRunStoreRecord = await nativeKeyBackend.record(for: "onboarding_e2e")
-        check(dryRun.status == 0
-              && dryRun.out.contains("DRY RUN")
-              && dryRun.out.contains("plaintext-candidate: dotenv:.env.local:LEGACY_TOKEN")
-              && dryRun.out.contains("no files, stores, grants, or providers were changed")
-              && !dryRun.out.contains(firstMarker)
-              && !dryRun.err.contains(firstMarker)
-              && dryRunStoreRecord == nil,
-              "setup dry run reviews the selected dotenv credential without values or mutations")
-
-        let applied = runCsec(setupArguments + ["--apply"], extraEnv: [:])
-        let importedValues = try client.access(
-            references: ["csec://onboarding_e2e/IMPORTED_TOKEN"],
-            reason: "onboarding import e2e",
-            ttlSeconds: 300
-        )
-        let originalSource = try Data(contentsOf: dotenvURL)
-        check(applied.status == 0
-              && applied.out.contains("csec setup: apply complete")
-              && applied.out.contains("original environment/dotenv sources were not modified")
-              && !applied.out.contains(firstMarker)
-              && !applied.err.contains(firstMarker)
-              && importedValues["csec://onboarding_e2e/IMPORTED_TOKEN"] == Data(firstMarker.utf8)
-              && String(data: originalSource, encoding: .utf8)?.contains(firstMarker) == true,
-              "setup imports only the explicitly selected value through the authenticated native-store protocol")
-
-        let protectedExisting = runCsec(setupArguments + ["--apply"], extraEnv: [:])
-        check(protectedExisting.status == 1
-              && protectedExisting.err.contains("would overwrite existing native-store key")
-              && !protectedExisting.out.contains(firstMarker)
-              && !protectedExisting.err.contains(firstMarker),
-              "repeated setup protects an existing native-store key unless replacement is explicit")
-
-        let secondMarker = "onboarding-import-replacement-value"
-        try Data("LEGACY_TOKEN='\(secondMarker)'\n".utf8).write(to: dotenvURL)
-        let replaced = runCsec(
-            setupArguments + ["--replace-secret", "--apply"],
-            extraEnv: [:]
-        )
-        let replacedValues = try client.access(
-            references: ["csec://onboarding_e2e/IMPORTED_TOKEN"],
-            reason: "onboarding replacement e2e",
-            ttlSeconds: 300
-        )
-        check(replaced.status == 0
-              && !replaced.out.contains(secondMarker)
-              && !replaced.err.contains(secondMarker)
-              && replacedValues["csec://onboarding_e2e/IMPORTED_TOKEN"] == Data(secondMarker.utf8),
-              "--replace-secret explicitly updates only the selected native-store key")
-    } catch {
-        check(false, "setup CLI import checks succeed (\(error))")
-    }
+    // `csec setup` is now a guided, interactive-only flow. The former flag-driven
+    // batch/import surface (--skip-agents/--store/--import/--dry-run/--apply/
+    // --replace-secret/--no-audit-prompt) was removed by design; the import engine
+    // it used is still covered by cs-selftest (EnvImportTests + the SetupOnboarding
+    // block). Here we prove the guided fail-closed gate: run under a piped stderr
+    // (not a terminal), setup must refuse with exit 2 and change nothing.
+    let guidedSetup = runCsec(
+        ["setup", "--project", NSTemporaryDirectory()], extraEnv: [:])
+    check(guidedSetup.status == 2
+          && guidedSetup.err.contains("interactive guided flow")
+          && guidedSetup.out.isEmpty,
+          "csec setup refuses to run without an interactive terminal")
 
     do {
         let fixtureDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)

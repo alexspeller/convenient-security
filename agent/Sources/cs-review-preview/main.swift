@@ -9,7 +9,9 @@ import Foundation
 // while the window is up; the process exits without ever approving anything.
 //
 // Usage: cs-review-preview <scenario> <output.png> [light|dark]
-//   scenarios: basic | warning | unknown | file | mixed
+//   scenarios: basic | warning | unknown | file | mixed | automation
+//              account | ambiguous-account
+//   CSEC_PREVIEW_EXPAND=1 opens progressive-disclosure details before capture.
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data("cs-review-preview: \(message)\n".utf8))
@@ -17,7 +19,7 @@ func fail(_ message: String) -> Never {
 }
 
 guard (3...4).contains(CommandLine.arguments.count) else {
-    fail("usage: cs-review-preview <basic|warning|unknown|file|mixed> <output.png> [light|dark]")
+    fail("usage: cs-review-preview <basic|warning|unknown|file|mixed|automation|account|ambiguous-account> <output.png> [light|dark]")
 }
 let scenario = CommandLine.arguments[1]
 let outputPath = CommandLine.arguments[2]
@@ -46,9 +48,24 @@ let nodeExecutable = PlannedExecutable(
     assurance: .unverified
 )
 
-func credential(references: [SecretRef] = slackReferences) -> PolicyReviewCredential {
-    PolicyReviewCredential(references: references)
+func credential(
+    references: [SecretRef] = slackReferences,
+    notes: [ProviderReviewNote] = []
+) -> PolicyReviewCredential {
+    PolicyReviewCredential(references: references, providerNotes: notes)
 }
+
+/// An `op://` reference names no account, so the window is where the account it
+/// resolves from becomes visible — and where an ambiguous vault name is called
+/// out before Touch ID rather than after.
+let accountNote = ProviderReviewNote(label: "account", detail: "acme.1password.eu")
+let ambiguityWarning = ProviderReviewNote(
+    label: "",
+    detail: "More than one signed-in account has a vault named “Employee”"
+        + " (also my.1password.com). This value will come from acme.1password.eu."
+        + " To name one account exactly, use the vault's unique id in the reference.",
+    isWarning: true
+)
 
 let review: AccessPolicyReview
 switch scenario {
@@ -140,6 +157,87 @@ case "mixed":
             ])
         ]
     )
+case "automation":
+    let reference = ref("csec://projects-mailai/OPENROUTER_API_KEY")
+    let inlineScript = #"""
+    const { access } = await import("convenient-security"); const ref = "csec://projects-mailai/OPENROUTER_API_KEY"; const values = await access([ref], { reason: "Verify unattended MAILAI csec access without network use", ttl: 30 }); if (typeof values[ref] !== "string" || values[ref].length === 0) throw new Error("missing automation value"); process.stdout.write("mailai-csec-automation-ok\n");
+    """#
+    let commandLine = [
+        nodeExecutable.canonicalPath,
+        "--input-type=module",
+        "-e",
+        inlineScript,
+    ]
+    guard let commandDigest = try? ExecutableInspection.commandDigest(commandLine) else {
+        fail("could not digest the automation fixture command")
+    }
+    let command = AutomationCommand(
+        executable: nodeExecutable,
+        commandLine: commandLine,
+        workingDirectory: "/Users/dev/projects/mailai",
+        commandDigest: commandDigest
+    )
+    let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+    let job = AutomationJob(
+        id: "00000000-0000-0000-0000-000000000001",
+        revision: "00000000-0000-0000-0000-000000000002",
+        name: "mailai-csec-smoke",
+        reason: "Verify unattended MAILAI csec access without network use",
+        references: [reference.uri],
+        command: command,
+        minimumIntervalSeconds: 0,
+        maximumRuntimeSeconds: 30,
+        consumerTrust: .mutableInterpreted,
+        createdAt: timestamp,
+        updatedAt: timestamp
+    )
+    guard job.isWellFormed else { fail("automation fixture is not well formed") }
+    review = AccessPolicyReview(
+        caller: caller,
+        reason: job.reason,
+        plan: DeliveryPlan(
+            mechanism: .directHeap,
+            executable: nodeExecutable,
+            root: .caller,
+            descendantScope: .subtree,
+            destination: .localDevelopment,
+            requestedTTLSeconds: job.maximumRuntimeSeconds,
+            operationContext: job.reason,
+            commandDigest: command.commandDigest
+        ),
+        credentials: [credential(references: [reference])],
+        automation: AutomationReviewDetails(job: job)
+    )
+case "account":
+    review = AccessPolicyReview(
+        caller: caller,
+        reason: "yarn slack — read unread Slack messages",
+        plan: DeliveryPlan(
+            mechanism: .directHeap,
+            executable: nodeExecutable,
+            root: .directParent(pid: 51759, startTime: 999_998),
+            descendantScope: .subtree,
+            destination: .localDevelopment,
+            requestedTTLSeconds: 3600,
+            operationContext: "yarn slack"
+        ),
+        credentials: [credential(notes: [accountNote])]
+    )
+case "ambiguous-account":
+    review = AccessPolicyReview(
+        caller: caller,
+        reason: "yarn slack — read unread Slack messages",
+        plan: DeliveryPlan(
+            mechanism: .directHeap,
+            executable: nodeExecutable,
+            root: .directParent(pid: 51759, startTime: 999_998),
+            descendantScope: .subtree,
+            destination: .localDevelopment,
+            requestedTTLSeconds: 3600,
+            operationContext: "yarn slack"
+        ),
+        credentials: [credential(notes: [accountNote, ambiguityWarning])]
+    )
 default:
     fail("unknown scenario \(scenario)")
 }
@@ -160,6 +258,23 @@ Task { @MainActor in
         let content = panel.contentView
     else {
         fail("review panel never appeared")
+    }
+    if ProcessInfo.processInfo.environment["CSEC_PREVIEW_EXPAND"] != nil {
+        @MainActor func findDisclosure(in view: NSView) -> NSButton? {
+            if let button = view as? NSButton,
+                button.title == "Show command and security details" {
+                return button
+            }
+            for child in view.subviews {
+                if let button = findDisclosure(in: child) { return button }
+            }
+            return nil
+        }
+        guard let disclosure = findDisclosure(in: content) else {
+            fail("automation details disclosure was not found")
+        }
+        disclosure.performClick(nil)
+        try? await Task.sleep(nanoseconds: 150_000_000)
     }
     // Capture the window's frame view so the appearance-correct window
     // background and title bar are part of the image; the content view alone

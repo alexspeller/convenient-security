@@ -17,6 +17,8 @@ protocol SecretWriteDestination {
 enum SecretWriteDestinationError: Error, LocalizedError {
     case onePasswordCLIUnavailable
     case onePasswordFailed(operation: String, detail: String)
+    case onePasswordVaultNotFound(vault: String, accounts: [String])
+    case onePasswordAccountUndecidable(vault: String, accounts: [String])
 
     var errorDescription: String? {
         switch self {
@@ -24,6 +26,13 @@ enum SecretWriteDestinationError: Error, LocalizedError {
             return "the 1Password CLI (op) was not found or does not satisfy the signing requirement"
         case .onePasswordFailed(let operation, let detail):
             return "op \(operation) failed: \(detail)"
+        case let .onePasswordVaultNotFound(vault, accounts):
+            return "no signed-in 1Password account has vault \"\(vault)\""
+                + " (searched \(accounts.joined(separator: ", ")))"
+        case let .onePasswordAccountUndecidable(vault, accounts):
+            return "vault \"\(vault)\" exists in more than one signed-in 1Password account"
+                + " (\(accounts.joined(separator: ", "))); rerun on a terminal to choose one,"
+                + " or name the vault by its unique id in --dest"
         }
     }
 }
@@ -40,8 +49,81 @@ func makeSecretWriteDestination(
         guard let cliPath = OnePasswordCLI.locate() else {
             throw SecretWriteDestinationError.onePasswordCLIUnavailable
         }
-        return OnePasswordWriteDestination(cliPath: cliPath, vault: vault, itemTitle: item)
+        return OnePasswordWriteDestination(
+            cliPath: cliPath,
+            account: try selectOnePasswordAccount(cliPath: cliPath, vault: vault, item: item),
+            vault: vault,
+            itemTitle: item
+        )
     }
+}
+
+/// Which 1Password account a write goes to. A vault name is unique only inside
+/// one account, so with several signed in this must be decided before anything
+/// is written — `op`'s own default can point at a different organization
+/// entirely, and an item created there is a real secret in the wrong place.
+///
+/// One candidate is not a choice, so it is used (and shown in the confirmation).
+/// More than one is a choice, so it is asked, never assumed; without a terminal
+/// to ask on, the write fails instead.
+private func selectOnePasswordAccount(
+    cliPath: String, vault: String, item: String
+) throws -> OnePasswordAccount? {
+    Prompt.note("Checking which 1Password account owns vault “\(vault)”…")
+    let index = try OnePasswordAccountDirectory.buildIndex(cliPath: cliPath)
+    let selection = OnePasswordAccountDirectory.select(
+        vault: vault,
+        item: item,
+        in: index,
+        itemIdentities: {
+            OnePasswordAccountDirectory.itemIdentities(cliPath: cliPath, candidate: $0)
+        }
+    )
+    switch selection {
+    case .unique(let candidate):
+        return candidate.account
+    case .notFound(let searched):
+        throw SecretWriteDestinationError.onePasswordVaultNotFound(
+            vault: vault, accounts: searched.map(\.label)
+        )
+    case .indeterminate:
+        // An account could not be listed, so its vaults are unknown. Let `op`
+        // resolve the vault itself rather than claiming knowledge we lack.
+        return nil
+    case .ambiguous(let candidates):
+        guard let chosen = promptForOnePasswordAccount(vault: vault, candidates: candidates)
+        else {
+            throw SecretWriteDestinationError.onePasswordAccountUndecidable(
+                vault: vault, accounts: candidates.map(\.account.label)
+            )
+        }
+        return chosen.account
+    }
+}
+
+/// Numbered cooked-mode prompt on stderr, matching the other `csec protect`
+/// prompts. Returns nil when there is no terminal to ask on.
+private func promptForOnePasswordAccount(
+    vault: String, candidates: [OnePasswordVaultCandidate]
+) -> OnePasswordVaultCandidate? {
+    guard isatty(STDIN_FILENO) == 1, isatty(STDERR_FILENO) == 1 else { return nil }
+    Prompt.warn("More than one signed-in 1Password account has a vault named “\(vault)”.")
+    for (offset, candidate) in candidates.enumerated() {
+        let row = "  \(offset + 1)) \(candidate.account.label) · \(candidate.account.email)"
+            + " · vault id \(candidate.vault.id)\n"
+        FileHandle.standardError.write(Data(row.utf8))
+    }
+    for _ in 0..<3 {
+        FileHandle.standardError.write(Data(
+            "Write to which account? [1-\(candidates.count)]: ".utf8))
+        guard let line = readLine(strippingNewline: true) else { return nil }
+        if let choice = Int(line.trimmingCharacters(in: .whitespaces)),
+           choice >= 1, choice <= candidates.count {
+            return candidates[choice - 1]
+        }
+        FileHandle.standardError.write(Data("  enter a number from the list\n".utf8))
+    }
+    return nil
 }
 
 /// Document-tier import into the native encrypted store: one Touch ID for the
@@ -81,17 +163,27 @@ struct NativeStoreWriteDestination: SecretWriteDestination {
 /// exclusively via stdin JSON templates — never argv.
 struct OnePasswordWriteDestination: SecretWriteDestination {
     let cliPath: String
+    /// The account this write lands in, chosen before anything is written. Nil
+    /// only when the account index was incomplete, leaving the choice to `op`.
+    let account: OnePasswordAccount?
     let vault: String
     let itemTitle: String
 
-    var summaryLine: String { "1Password (op://\(vault)/\(itemTitle))" }
+    var summaryLine: String {
+        let target = "1Password (op://\(vault)/\(itemTitle))"
+        guard let account else { return target }
+        return "\(target) in \(account.label)"
+    }
 
     func commit(values: [String: String]) throws -> [String: String] {
         let fields = values.sorted { $0.key < $1.key }
             .map { OnePasswordItemWrite.Field(label: $0.key, value: $0.value) }
 
         let existing = try OnePasswordCLI.runSync(
-            cliPath, OnePasswordItemWrite.getItemArguments(title: itemTitle, vault: vault))
+            cliPath,
+            OnePasswordItemWrite.getItemArguments(
+                title: itemTitle, vault: vault, account: account
+            ))
         if existing.status == 0 {
             let updated = try OnePasswordItemWrite.updatedItemJSON(
                 existingItem: existing.stdout, fields: fields)
@@ -100,7 +192,9 @@ struct OnePasswordWriteDestination: SecretWriteDestination {
             let itemID = (try? JSONSerialization.jsonObject(with: existing.stdout)
                 as? [String: Any])?["id"] as? String ?? itemTitle
             let edit = try OnePasswordCLI.runSync(
-                cliPath, OnePasswordItemWrite.editArguments(itemID: itemID), stdin: updated)
+                cliPath,
+                OnePasswordItemWrite.editArguments(itemID: itemID, account: account),
+                stdin: updated)
             guard edit.status == 0 else {
                 throw SecretWriteDestinationError.onePasswordFailed(
                     operation: "item edit", detail: Self.detailLine(edit.stderr))
@@ -108,7 +202,9 @@ struct OnePasswordWriteDestination: SecretWriteDestination {
         } else {
             let template = try OnePasswordItemWrite.createTemplate(title: itemTitle, fields: fields)
             let create = try OnePasswordCLI.runSync(
-                cliPath, OnePasswordItemWrite.createArguments(vault: vault), stdin: template)
+                cliPath,
+                OnePasswordItemWrite.createArguments(vault: vault, account: account),
+                stdin: template)
             guard create.status == 0 else {
                 throw SecretWriteDestinationError.onePasswordFailed(
                     operation: "item create", detail: Self.detailLine(create.stderr))

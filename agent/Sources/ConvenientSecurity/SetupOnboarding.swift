@@ -1547,6 +1547,29 @@ public enum OnboardingAuditPrompt {
     }
 }
 
+// MARK: - Full Disk Access state (derived from the value-free audit)
+
+/// Whether csecd currently holds Full Disk Access.
+public enum FDAState: Sendable, Equatable {
+    case granted
+    case missing
+    case unknown
+}
+
+/// Derive csecd's Full Disk Access state from the value-free host audit, without
+/// any new agent verb or a live TCC read on the launcher side. HA-D01 reports
+/// `.unknown` exactly when csec cannot enumerate the FDA grantees because it
+/// itself lacks Full Disk Access; any other status means it read the TCC database
+/// (FDA is granted). A `nil` report (csecd unreachable) or an absent HA-D01 is
+/// `.unknown`.
+public func fdaState(from report: HostAuditReport?) -> FDAState {
+    guard let report,
+          let finding = report.findings.first(where: { $0.id == "HA-D01" }) else {
+        return .unknown
+    }
+    return finding.status == .unknown ? .missing : .granted
+}
+
 private func safeMetadata(_ value: String) -> String {
     let bidiControls: Set<UInt32> = [
         0x061c, 0x200e, 0x200f,

@@ -174,6 +174,30 @@ func startAgentServer() async {
     local: TrustedPolicyReview(),
     remote: remoteApproval
   )
+  let automationService: AutomationService?
+  if cacheEnabled {
+    automationService = AutomationService(
+      resolver: resolver,
+      grantStore: SecurityAutomationGrantStore(),
+      materializationStore: SecurityAutomationMaterializationStore(),
+      consent: consent,
+      policyReview: policyReview
+    )
+  } else {
+    #if DEBUG
+      // Unsigned development builds cannot persist in the product Keychain.
+      // Keep the complete feature process-local; release builds never fall back.
+      automationService = AutomationService(
+        resolver: resolver,
+        grantStore: InMemoryAutomationGrantStore(),
+        materializationStore: InMemoryAutomationMaterializationStore(),
+        consent: consent,
+        policyReview: policyReview
+      )
+    #else
+      automationService = nil
+    #endif
+  }
   let sshSigningService: SSHSigningService?
   if cacheEnabled {
     sshSigningService = SSHSigningService(
@@ -206,7 +230,9 @@ func startAgentServer() async {
       policyReview: policyReview,
       nativeStore: nativeStore,
       sshSigningService: sshSigningService,
-      allowUnverifiedPlansForTesting: true
+      automationService: automationService,
+      allowUnverifiedPlansForTesting: true,
+      allowUnverifiedAutomationCallersForTesting: true
     )
     let clientTrustPolicy: SocketPeerTrustPolicy = .allowUnverifiedForTesting
   #else
@@ -216,7 +242,8 @@ func startAgentServer() async {
       consent: consent,
       policyReview: policyReview,
       nativeStore: nativeStore,
-      sshSigningService: sshSigningService
+      sshSigningService: sshSigningService,
+      automationService: automationService
     )
     let clientTrustPolicy: SocketPeerTrustPolicy = .requireProductLauncher
   #endif
@@ -299,6 +326,8 @@ func startAgentServer() async {
       }
     case .configureSSH(let request):
       return await agent.configureSSH(request: request, caller: caller)
+    case .configureAutomation(let request):
+      return await agent.configureAutomation(request: request, caller: caller)
     case .beginSession(let begin):
       return await agent.beginSession(request: begin, caller: caller)
     case .beginOutputRedaction(let begin):

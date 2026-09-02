@@ -5,215 +5,44 @@ import CSecuritySupport
 import Darwin
 #endif
 
-// The launcher / CLI.
-//
-//   csec get <reference> [--reason <text>] [--for <seconds>]
-//       Fetch a secret from the running agent after reviewing the exact stdout
-//       shape: terminal, shell-delegated pipe, or ordinary persistent file.
-//
-//   csec exec [options] [--set NAME=<reference>]… -- <cmd> [args…]
-//       Resolve secret references (from the environment and any --set flags) and
-//       run <cmd> with those values injected into its environment. Environment
-//       values that are themselves references (e.g. DATABASE_URL=csec://…) are
-//       resolved in place, so unmodified tools like `rails`/`psql` just work.
-//
-//   csec session -- <cmd> [args…]
-//       Register this PID/start-time as an explicit broad session root, then
-//       replace csec with the requested command.
-//
-//   csec creds aws|git ...
-//       Serve a tool-native credential protocol over a private stdout pipe.
-//
-//   csec exec-fd (--fd ENV=<reference>|--preset NAME=<reference>)… -- <cmd>
-//       Stream file-shaped secrets into inherited anonymous descriptors.
-//
-//   csec exec-file (--file ENV=<reference>|--gh-config <reference>)… -- <cmd>
-//       Ask the root helper to launch a process tree with regular files protected
-//       by a fresh primary-GID capability on bounded tmpfs.
 
-//   csec root-status
-//       Verify that the authenticated root helper is reachable.
-//
-//   csec tool-exec --destination ai -- <cmd> [args…]
-//       Run a command whose output is scanned against every active value in the
-//       resident agent before any bytes are returned to an AI command runner.
-//
-//   csec edit [--editor] <store>
-//       Open the native csec:// store as strict JSON. The built-in fileless
-//       editor is the default; --editor opts into a named plaintext file for
-//       compatibility with the command in $EDITOR.
-//
-//   csec setup [--apply] [options]
-//       Dry-run-first onboarding for coding-agent hooks, value-free local source
-//       discovery, selected native-store import, and a bounded audit prompt.
-
-func usage() -> Never {
-    FileHandle.standardError.write(Data("""
-    usage:
-      csec get <reference> [--reason <text>] [--for <seconds>] [--reveal | --allow-plaintext-file]
-      csec exec [--reason <text>] [--for <seconds>] [--set NAME=<reference>]…
-                [--redact-output=always|tty|never]
-                [--redact-output-label=reference|opaque] [--redact-short-values]
-                [--redact-output-warn]
-                -- <cmd> [args…]
-      csec session -- <cmd> [args…]
-      csec creds aws (--item <reference> |
-                     --access-key-id-ref <reference> --secret-access-key-ref <reference>
-                     [--session-token-ref <reference>] [--expiration-ref <reference>])
-                     [--reason <text>] [--for <seconds>]
-      csec creds git --host <host> [--protocol <scheme>] [--path <repository>]
-                     [--username-ref <reference>] --password-ref <reference>
-                     [--reason <text>] [--for <seconds>] get|store|erase
-      csec exec-fd [--reason <text>] [--for <seconds>]
-                   (--fd ENV_NAME=<reference> |
-                    --preset {pgpass|kubeconfig|aws-shared-credentials|google-service-account}=<reference>)…
-                   [--redact-output=always|tty|never]
-                   [--redact-output-label=reference|opaque] [--redact-short-values]
-                [--redact-output-warn]
-                   -- <cmd> [args…]
-      csec exec-file [--reason <text>] [--for <seconds>] [--hard-ttl]
-                     (--file ENV_NAME=<reference> | --gh-config <reference>)…
-                     [--github-host <host>] [--github-user <login>]
-                     [--github-git-protocol https|ssh]
-                     [--redact-output=always|tty|never]
-                     [--redact-output-label=reference|opaque] [--redact-short-values]
-                [--redact-output-warn]
-                     -- <cmd> [args…]
-      csec bridge
-      csec tool-exec --destination ai -- <cmd> [args…]
-      csec hook claude|codex
-      csec hook-config claude|codex
-      csec edit [--editor] <store>
-      csec edit <reference>
-      csec protect [--store <store>] [--keep-plaintext] [--dry-run] <path>…
-      csec protect --ssh [--store <store>] [--keep-plaintext] [--dry-run]
-                   <private-key>…
-      csec protect --env [--store <store> | --dest <csec://STORE|op://VAULT[/ITEM]>]
-                   [--dry-run] <file>
-      csec setup [--apply] [--agent claude|codex]… [--skip-agents]
-                 [--project <directory>] [--replace-csec-hook]
-                 [--store <store>
-                  --import DEST=env:NAME|DEST=dotenv:PATH:NAME]…
-                 [--replace-secret] [--no-audit-prompt]
-      csec audit [--report-only] [--json] [--attest] [--scan-filesystem]
-      csec remote status | enable <phone-pairing-code> | disable
-      csec ssh socket | env | list
-      csec ssh register [--label <label>] <reference|sidecar.csec>
-      csec ssh remove <SHA256:fingerprint>
-      csec install | uninstall
-      csec status
-      csec doctor [--check]
-      csec root-status
-
-    get        Fetch a secret from csecd and write it to the selected stdout shape:
-                 csec get REF | command          pipe to a command — allowed
-                 value=$(csec get REF)           command substitution — allowed
-                 csec get REF                    terminal — refused; --reveal to echo
-                 csec get REF > file             file — refused; --allow-plaintext-file
-               A raw value is refused when it would land in terminal scrollback, on
-               disk, or in a non-interactive (agent/script) capture, since a coding
-               agent or logger could retain it; the matching flag overrides under
-               Touch ID. Prefer csec exec/exec-file/creds, which hand the value to a
-               tool without returning it here. The verified direct-parent shell owns
-               the PID/start-time-bound subtree grant; signed csec is the emitter.
-               File redirection persists plaintext and may expose it to same-user
-               processes, copies, backups, and later access. Each delivery shape is
-               approved separately. Prefer csec exec for environment injection,
-               csec exec-fd for anonymous file-shaped input, csec exec-file for
-               protected regular files, or csec creds for supported tool-native
-               credential protocols.
-    exec       Run <cmd> with secret references resolved into its environment. Any env
-               value that is a secret reference (DATABASE_URL=csec://…) is resolved in
-               place; --set NAME=<ref> injects additional ones. If the project holds
-               *.csec sidecars (from csec protect), csec instead materializes each
-               protected file back at its original path for the wrapped tree on
-               root-owned tmpfs (the same boundary as exec-file). Resolved values
-               appearing in the child's output are masked everywhere by default
-               (--redact-output=always): terminals, pipes, and captured logs.
-               --redact-output=tty limits masking to terminal output, and
-               --redact-output=never disables masking for an explicitly
-               byte-exact stream. A masked value is replaced in-band with
-               [redacted: <reference>] naming the reference it came from;
-               --redact-output-label=opaque restores an opaque [csec:secret-N].
-               A per-match stderr warning is opt-in via --redact-output-warn.
-    session    Register a kernel-verified broad grant root, then run <cmd> at the same PID.
-    creds      Serve AWS credential_process or Git credential-helper output via a private pipe.
-    exec-fd    Give a child anonymous single-open secret files at /dev/fd/N. Presets set
-               PGPASSFILE, KUBECONFIG, AWS_SHARED_CREDENTIALS_FILE, or
-               GOOGLE_APPLICATION_CREDENTIALS to the non-secret descriptor path.
-    exec-file  Give a launched process tree seekable/reopenable root-owned regular files
-               on bounded tmpfs. A fresh primary GID is the per-launch capability;
-               csec never receives file bytes. --gh-config creates protected hosts.yml
-               only after ambient GitHub authentication has been removed.
-    protect    Move whole plaintext secret files into the encrypted store and replace
-               each with a tiny <name>.csec sidecar; a later csec exec materializes
-               them. The value is durable in the store before any plaintext is removed.
-               --keep-plaintext leaves the original in place; --dry-run only reports.
-               --env instead treats one file as an env file (direnv semantics):
-               an interactive picker chooses which variables to import into the
-               native store or 1Password (--dest op://VAULT[/ITEM]), then the file
-               is rewritten in place with csec://-/op://-references — values are
-               durable at the destination before the file is touched, and
-               csec exec resolves the references at run time.
-               --ssh protects explicitly named private keys (including paths outside
-               the current project), registers only their canonical references and
-               public metadata with csecd's SSH signer, preserves existing .pub files,
-               and creates a missing .pub. One Touch ID covers the native import and
-               registration; the private key is removed only after both succeed.
-    bridge     Private framed stdin/stdout protocol for language clients; not for terminals.
-    tool-exec  Fail-closed AI command broker using csecd's active-value scanner.
-    hook       PreToolUse stdin/stdout adapter for Claude Code or Codex.
-    hook-config  Print a hook JSON fragment using this exact csec executable.
-    edit       Edit a csec:// store as strict JSON. The default built-in editor is
-               fileless; --editor uses $EDITOR with a temporary plaintext file.
-               With a full reference (csec://STORE/KEY or op://VAULT/ITEM/FIELD)
-               it sets that one secret instead: on a terminal the value is typed
-               into a hidden prompt (entered twice, never echoed); otherwise it
-               is read from stdin (one trailing newline stripped), so
-               `printf %s VALUE | csec edit csec://store/KEY` works. A missing
-               csec:// key is created; the value never appears in argv or output.
-    setup      Detect supported coding agents and local secret sources without
-               displaying values. The default is a dry run. --apply safely merges
-               fail-closed hooks and may import only explicitly selected plaintext
-               candidates into one native encrypted store; existing hooks/keys are
-               never replaced without their separate explicit replacement flags.
-    audit      Run the value-free host posture audit through csecd and render the
-               findings (severity-ordered, ★ marks controls that shrink same-user
-               malware blast radius). On a terminal the scan animates live progress;
-               piped or --json output stays plain. By default it then offers the
-               reversible fixes as an in-terminal checkbox picker (one bare Touch ID
-               in csecd applies the selected set), triages whatever is still failing
-               (accept as an exemption, or keep as a TODO with weekly reminders), and
-               prints a copy-paste attestation of the final posture. --report-only
-               just prints the report, --attest prints only the pasteable
-               attestation, --json emits the machine-readable report, and
-               --scan-filesystem adds the bounded SUID/world-writable sweep.
-    remote     Explicitly opt one iPhone into mirrored approvals. `enable` pins
-               the phone's public pairing code under local Touch ID, then prints
-               the Mac public pairing code to import in the phone app. Once both
-               sides are paired, the local and phone prompts race; the first
-               authenticated decision wins. `disable` removes the pin under
-               local Touch ID. Pairing codes contain no credential values.
-    ssh        Manage the backend-neutral SSH key catalog and print the manual agent
-               socket. `register` accepts csec://, op://, future provider references,
-               or an ordinary .csec sidecar. Use `export SSH_AUTH_SOCK="$(csec ssh
-               socket)"`; signing is limited to Apple /usr/bin/ssh, a verified
-               non-forwarded destination session, SSH user-auth payloads, and bounded
-               host-key + remote-user + process-subtree grants.
-    install    Register csecd as a login-item LaunchAgent so it runs in the background.
-    uninstall  Unregister the csecd LaunchAgent.
-    status     Show app, LaunchAgent, authenticated agent/provider, SSH, shell,
-               remote-approval, and root-helper status together.
-    doctor     Diagnose and repair the installed app's per-user agent, stale
-               sockets, and service health. --check performs no repairs.
-    root-status  Verify that the authenticated regular-file root helper is reachable.
-
-    """.utf8))
-    exit(2)
+/// Report a usage error for `command` (bad/missing args): print that command's
+/// help to stderr and exit 2, or the global help when no command is given.
+func usage(_ command: String? = nil) -> Never {
+    if let command {
+        printCommandHelp(command, explicit: false)
+    }
+    printGlobalHelp(exitCode: 2)
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
-guard let command = arguments.first else { usage() }
+
+// Help is intercepted before dispatch: `csec`, `csec help [cmd]`, `csec --help`,
+// and `csec <cmd> --help` print help to stdout and exit 0; an unknown command or
+// bad args print help to stderr and exit 2.
+guard let command = arguments.first else { printGlobalHelp(exitCode: 0) }
+let commandArguments = Array(arguments.dropFirst())
+
+switch command {
+case "--help", "-h":
+    printGlobalHelp(exitCode: 0)
+case "help":
+    if let requested = commandArguments.first {
+        if CLICatalog.command(named: requested) != nil {
+            printCommandHelp(requested, explicit: true)
+        }
+        printUnknownCommand(requested)
+    }
+    printGlobalHelp(exitCode: 0)
+default:
+    break
+}
+
+// A per-command `-h`/`--help` before any `--` prints that command's help, so
+// `csec exec --help` documents exec while `csec exec -- rails --help` forwards.
+if CLICatalog.command(named: command) != nil, wantsHelp(commandArguments) {
+    printCommandHelp(command, explicit: true)
+}
 
 switch command {
 case "get":
@@ -229,7 +58,7 @@ case "exec-fd":
 case "exec-file":
     runExecFile(Array(arguments.dropFirst()))
 case "bridge":
-    guard arguments.count == 1 else { usage() }
+    guard arguments.count == 1 else { usage("bridge") }
     runBridge()
 case "tool-exec":
     runToolExec(Array(arguments.dropFirst()))
@@ -249,6 +78,8 @@ case "remote":
     runRemote(Array(arguments.dropFirst()))
 case "ssh":
     runSSH(Array(arguments.dropFirst()))
+case "automation":
+    runAutomation(Array(arguments.dropFirst()))
 case "install":
     runInstall()
 case "uninstall":
@@ -258,17 +89,17 @@ case "status":
 case "doctor":
     runDoctor(Array(arguments.dropFirst()))
 case "root-status":
-    guard arguments.count == 1 else { usage() }
+    guard arguments.count == 1 else { usage("root-status") }
     runRootStatus()
 default:
-    usage()
+    printUnknownCommand(command)
 }
 
 // MARK: - AI command hooks and fail-closed tool execution
 
 func runHook(_ arguments: [String]) -> Never {
     guard arguments.count == 1,
-          let client = AICommandHookClient(rawValue: arguments[0]) else { usage() }
+          let client = AICommandHookClient(rawValue: arguments[0]) else { usage("hook") }
     do {
         let input = FileHandle.standardInput.readDataToEndOfFile()
         let output = try AICommandHook.rewrite(
@@ -291,7 +122,7 @@ func runHook(_ arguments: [String]) -> Never {
 
 func runHookConfig(_ arguments: [String]) -> Never {
     guard arguments.count == 1,
-          let client = AICommandHookClient(rawValue: arguments[0]) else { usage() }
+          let client = AICommandHookClient(rawValue: arguments[0]) else { usage("hook-config") }
     do {
         FileHandle.standardOutput.write(try AICommandHook.hookConfiguration(
             client: client,
@@ -299,7 +130,7 @@ func runHookConfig(_ arguments: [String]) -> Never {
         ))
         exit(0)
     } catch {
-        FileHandle.standardError.write(Data("csec hook-config: could not build configuration\n".utf8))
+        csecError("hook-config", "could not build configuration")
         exit(1)
     }
 }
@@ -313,22 +144,22 @@ func runToolExec(_ arguments: [String]) -> Never {
         switch arguments[index] {
         case "--destination":
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("tool-exec") }
             destination = arguments[index]
         case "--encoded-shell-command":
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("tool-exec") }
             encodedShellCommand = arguments[index]
         case "--":
             commandLine = Array(arguments[(index + 1)...])
             break parse
         default:
-            usage()
+            usage("tool-exec")
         }
         index += 1
     }
     guard destination == "ai",
-          encodedShellCommand == nil || commandLine.isEmpty else { usage() }
+          encodedShellCommand == nil || commandLine.isEmpty else { usage("tool-exec") }
 
     let executablePath: String
     if let encodedShellCommand {
@@ -342,17 +173,17 @@ func runToolExec(_ arguments: [String]) -> Never {
             executablePath = "/bin/zsh"
             commandLine = [executablePath, "-lc", command]
         } catch {
-            FileHandle.standardError.write(Data("csec tool-exec: invalid encoded command\n".utf8))
+            csecError("tool-exec", "invalid encoded command")
             exit(2)
         }
     } else {
-        guard !commandLine.isEmpty else { usage() }
+        guard !commandLine.isEmpty else { usage("tool-exec") }
         do {
             executablePath = try ExecutableInspection.plannedExecutable(
                 command: commandLine[0]
             ).canonicalPath
         } catch {
-            FileHandle.standardError.write(Data("csec tool-exec: command is not executable\n".utf8))
+            csecError("tool-exec", "command is not executable")
             exit(127)
         }
     }
@@ -416,28 +247,28 @@ func runEdit(_ arguments: [String]) -> Never {
     // so the two forms are unambiguous. --editor applies only to the
     // document editor.
     if arguments.contains(where: { $0.contains("://") }) {
-        guard arguments.count == 1 else { usage() }
+        guard arguments.count == 1 else { usage("edit") }
         runEditReference(arguments[0])
     }
     var useExternalEditor = false
     var storeArgument: String?
     for argument in arguments {
         if argument == "--editor" {
-            guard !useExternalEditor else { usage() }
+            guard !useExternalEditor else { usage("edit") }
             useExternalEditor = true
         } else {
-            guard storeArgument == nil, !argument.hasPrefix("-") else { usage() }
+            guard storeArgument == nil, !argument.hasPrefix("-") else { usage("edit") }
             storeArgument = argument
         }
     }
-    guard let storeArgument else { usage() }
+    guard let storeArgument else { usage("edit") }
 
     let externalEditor: ExternalEditorCommand?
     if useExternalEditor {
         do {
             externalEditor = try ExternalEditorCommand()
         } catch {
-            FileHandle.standardError.write(Data("csec edit: \(error.localizedDescription)\n".utf8))
+            csecError("edit", "\(error.localizedDescription)")
             exit(2)
         }
         FileHandle.standardError.write(Data("""
@@ -458,7 +289,7 @@ func runEdit(_ arguments: [String]) -> Never {
     do {
         store = try NativeStoreName(storeArgument)
     } catch {
-        FileHandle.standardError.write(Data("csec edit: \(error.localizedDescription)\n".utf8))
+        csecError("edit", "\(error.localizedDescription)")
         exit(2)
     }
 
@@ -471,7 +302,7 @@ func runEdit(_ arguments: [String]) -> Never {
             exit(1)
         }
     } catch {
-        FileHandle.standardError.write(Data("csec edit: cannot reach the trusted agent\n".utf8))
+        csecError("edit", "cannot reach the trusted agent")
         exit(1)
     }
 
@@ -483,7 +314,7 @@ func runEdit(_ arguments: [String]) -> Never {
             externalEditorPath: externalEditor?.executablePath
         )
     } catch {
-        FileHandle.standardError.write(Data("csec edit: \(error.localizedDescription)\n".utf8))
+        csecError("edit", "\(error.localizedDescription)")
         exit(1)
     }
 
@@ -548,7 +379,7 @@ func runEdit(_ arguments: [String]) -> Never {
             showEditValidationError(message, external: useExternalEditor)
         } catch {
             client.cancelNativeStoreEdit(sessionID: edit.sessionID)
-            FileHandle.standardError.write(Data("csec edit: \(error.localizedDescription)\n".utf8))
+            csecError("edit", "\(error.localizedDescription)")
             exit(1)
         }
     }
@@ -577,11 +408,11 @@ func runGet(_ arguments: [String]) -> Never {
         switch arguments[index] {
         case "--reason":
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("get") }
             reason = arguments[index]
         case "--for":
             index += 1
-            guard index < arguments.count, let seconds = Int(arguments[index]) else { usage() }
+            guard index < arguments.count, let seconds = Int(arguments[index]) else { usage("get") }
             ttlSeconds = seconds
         case "--reveal":
             reveal = true
@@ -592,9 +423,9 @@ func runGet(_ arguments: [String]) -> Never {
         }
         index += 1
     }
-    guard !references.isEmpty else { usage() }
+    guard !references.isEmpty else { usage("get") }
     guard ttlSeconds > 0, ttlSeconds <= 24 * 60 * 60 else {
-        FileHandle.standardError.write(Data("csec get: --for must be between 1 and 86400 seconds\n".utf8))
+        csecError("get", "--for must be between 1 and 86400 seconds")
         exit(2)
     }
 
@@ -764,36 +595,36 @@ func runExec(_ arguments: [String]) -> Never {
             break parse
         case "--reason":
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("exec") }
             reason = arguments[index]
         case "--for":
             index += 1
-            guard index < arguments.count, let seconds = Int(arguments[index]) else { usage() }
+            guard index < arguments.count, let seconds = Int(arguments[index]) else { usage("exec") }
             ttlSeconds = seconds
         case "--set":
             index += 1
-            guard index < arguments.count, let equals = arguments[index].firstIndex(of: "=") else { usage() }
+            guard index < arguments.count, let equals = arguments[index].firstIndex(of: "=") else { usage("exec") }
             let name = String(arguments[index][..<equals])
             let reference = String(arguments[index][arguments[index].index(after: equals)...])
-            guard !name.isEmpty, !reference.isEmpty else { usage() }
+            guard !name.isEmpty, !reference.isEmpty else { usage("exec") }
             explicit.append((name: name, reference: reference))
         case "--redact-output":
             index += 1
             guard index < arguments.count,
-                  let mode = OutputGuardMode(rawValue: arguments[index]) else { usage() }
+                  let mode = OutputGuardMode(rawValue: arguments[index]) else { usage("exec") }
             outputGuard.mode = mode
         case let option where option.hasPrefix("--redact-output="):
             let value = String(option.dropFirst("--redact-output=".count))
-            guard let mode = OutputGuardMode(rawValue: value) else { usage() }
+            guard let mode = OutputGuardMode(rawValue: value) else { usage("exec") }
             outputGuard.mode = mode
         case "--redact-output-label":
             index += 1
             guard index < arguments.count,
-                  let style = OutputRedactionLabelStyle(rawValue: arguments[index]) else { usage() }
+                  let style = OutputRedactionLabelStyle(rawValue: arguments[index]) else { usage("exec") }
             outputGuard.labelStyle = style
         case let option where option.hasPrefix("--redact-output-label="):
             let value = String(option.dropFirst("--redact-output-label=".count))
-            guard let style = OutputRedactionLabelStyle(rawValue: value) else { usage() }
+            guard let style = OutputRedactionLabelStyle(rawValue: value) else { usage("exec") }
             outputGuard.labelStyle = style
         case "--redact-short-values":
             outputGuard.includeShortValues = true
@@ -807,9 +638,9 @@ func runExec(_ arguments: [String]) -> Never {
         index += 1
     }
 
-    guard !commandLine.isEmpty else { usage() }
+    guard !commandLine.isEmpty else { usage("exec") }
     guard ttlSeconds > 0, ttlSeconds <= 24 * 60 * 60 else {
-        FileHandle.standardError.write(Data("csec exec: --for must be between 1 and 86400 seconds\n".utf8))
+        csecError("exec", "--for must be between 1 and 86400 seconds")
         exit(2)
     }
 
@@ -844,7 +675,7 @@ func runExec(_ arguments: [String]) -> Never {
                     .map { (name: $0.key, reference: $0.value) }
                     .sorted { $0.name < $1.name }
             } catch {
-                FileHandle.standardError.write(Data("csec exec: \(error)\n".utf8))
+                csecError("exec", "\(error)")
                 exit(1)
             }
             runSidecarExec(
@@ -857,7 +688,7 @@ func runExec(_ arguments: [String]) -> Never {
             )
         }
     } catch {
-        FileHandle.standardError.write(Data("csec exec: \(error.localizedDescription)\n".utf8))
+        csecError("exec", "\(error.localizedDescription)")
         exit(1)
     }
 
@@ -867,7 +698,7 @@ func runExec(_ arguments: [String]) -> Never {
     do {
         knownSchemes = Set(try client.schemes())
     } catch {
-        FileHandle.standardError.write(Data("csec exec: cannot reach agent: \(error)\n".utf8))
+        csecError("exec", "cannot reach agent: \(error)")
         exit(1)
     }
 
@@ -879,7 +710,7 @@ func runExec(_ arguments: [String]) -> Never {
             knownSchemes: knownSchemes
         )
     } catch {
-        FileHandle.standardError.write(Data("csec exec: \(error)\n".utf8))
+        csecError("exec", "\(error)")
         exit(1)
     }
 
@@ -921,7 +752,7 @@ func runExec(_ arguments: [String]) -> Never {
             resolvedExecutablePath = executable.canonicalPath
             injected = try ExecPlanner.resolvedEnvironment(base: [:], plan: plan, values: values)
         } catch {
-            FileHandle.standardError.write(Data("csec exec: \(error.localizedDescription)\n".utf8))
+            csecError("exec", "\(error.localizedDescription)")
             // A failed resolution names the reference; say which environment
             // name carries each one so the user knows what to fix or unset.
             if case AgentClient.ClientError.protocolFailure(.resolutionFailed, _) = error {
@@ -991,7 +822,7 @@ func runExec(_ arguments: [String]) -> Never {
             )
             cs_terminate_like_wait_status(status)
         } catch {
-            FileHandle.standardError.write(Data("csec exec: \(error)\n".utf8))
+            csecError("exec", "\(error)")
             exit(1)
         }
     }
@@ -1015,11 +846,11 @@ func runExec(_ arguments: [String]) -> Never {
     if errno == ENOENT, commandLine[0].contains(where: \.isWhitespace) {
         let guidance = ExecutableInspectionError
             .notFoundLooksLikeShellCommand(commandLine[0]).localizedDescription
-        FileHandle.standardError.write(Data("csec exec: \(guidance)\n".utf8))
+        csecError("exec", "\(guidance)")
         exit(127)
     }
     let message = String(cString: strerror(errno))
-    FileHandle.standardError.write(Data("csec exec: \(commandLine[0]): \(message)\n".utf8))
+    csecError("exec", "\(commandLine[0]): \(message)")
     exit(127)
 }
 
@@ -1140,7 +971,7 @@ func runInstall() -> Never {
         }
         exit(0)
     } catch {
-        FileHandle.standardError.write(Data("csec install: \(error)\n".utf8))
+        csecError("install", "\(error)")
         FileHandle.standardError.write(Data(
             "  csec must run from inside the installed .app bundle so SMAppService can find the LaunchAgent plist.\n".utf8
         ))
@@ -1154,7 +985,7 @@ func runUninstall() -> Never {
         print("csec: agent unregistered.")
         exit(0)
     } catch {
-        FileHandle.standardError.write(Data("csec uninstall: \(error)\n".utf8))
+        csecError("uninstall", "\(error)")
         exit(1)
     }
 }
@@ -1178,15 +1009,15 @@ func runRootStatus() -> Never {
 }
 
 func runRemote(_ arguments: [String]) -> Never {
-    guard let action = arguments.first else { usage() }
+    guard let action = arguments.first else { usage("remote") }
     let client = makeAgentClient()
     do {
         switch action {
         case "status":
-            guard arguments.count == 1 else { usage() }
+            guard arguments.count == 1 else { usage("remote") }
             printRemoteApprovalStatus(try client.remoteApprovalStatus())
         case "enable":
-            guard arguments.count == 2 else { usage() }
+            guard arguments.count == 2 else { usage("remote") }
             let result = try client.enableRemoteApproval(
                 phonePairingCode: arguments[1]
             )
@@ -1195,10 +1026,10 @@ func runRemote(_ arguments: [String]) -> Never {
             print(result.macPairingCode)
             print("Remote approval starts immediately after the phone accepts that code.")
         case "disable":
-            guard arguments.count == 1 else { usage() }
+            guard arguments.count == 1 else { usage("remote") }
             printRemoteApprovalStatus(try client.disableRemoteApproval())
         default:
-            usage()
+            usage("remote")
         }
         exit(0)
     } catch {

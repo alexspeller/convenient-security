@@ -29,9 +29,14 @@ public enum ExecutableInspectionError: Error, LocalizedError {
 public enum ExecutableInspection {
     public static func plannedExecutable(
         command: String,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        workingDirectory: String? = nil
     ) throws -> PlannedExecutable {
-        let path = try resolve(command: command, environment: environment)
+        let path = try resolve(
+            command: command,
+            environment: environment,
+            workingDirectory: workingDirectory
+        )
         let staticIdentity = signingIdentity(path: path)
         return PlannedExecutable(
             canonicalPath: path,
@@ -49,21 +54,23 @@ public enum ExecutableInspection {
 
     public static func resolve(
         command: String,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        workingDirectory: String? = nil
     ) throws -> String {
         let fm = FileManager.default
+        let baseDirectory = workingDirectory ?? fm.currentDirectoryPath
         let candidates: [String]
         if command.contains("/") {
             let expanded = (command as NSString).expandingTildeInPath
             if expanded.hasPrefix("/") {
                 candidates = [expanded]
             } else {
-                candidates = [(fm.currentDirectoryPath as NSString).appendingPathComponent(expanded)]
+                candidates = [(baseDirectory as NSString).appendingPathComponent(expanded)]
             }
         } else {
             let path = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
             candidates = path.split(separator: ":", omittingEmptySubsequences: false).map { component in
-                let directory = component.isEmpty ? fm.currentDirectoryPath : String(component)
+                let directory = component.isEmpty ? baseDirectory : String(component)
                 return (directory as NSString).appendingPathComponent(command)
             }
         }

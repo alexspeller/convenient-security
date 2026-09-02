@@ -11,23 +11,16 @@ import ConvenientSecurity
 // Both are fully interactive terminal flows launched from `csec audit`.
 
 enum GuidedHelper {
-    /// Prompt the user with a yes/no question; default No.
-    private static func confirm(_ prompt: String) -> Bool {
-        FileHandle.standardOutput.write(Data("\(prompt) [y/N]: ".utf8))
-        guard let line = readLine(strippingNewline: true) else { return false }
-        return line.lowercased() == "y" || line.lowercased() == "yes"
-    }
-
     // MARK: FileVault (HA-G03)
 
     static func fileVault() {
-        print("\n# Guided: FileVault full-disk encryption")
+        Prompt.title("Guided: FileVault full-disk encryption")
         let status = runCapturing("/usr/bin/fdesetup", ["status"])
         if status.lowercased().contains("filevault is on") {
-            print("FileVault is already on. Nothing to do.")
+            Prompt.success("FileVault is already on. Nothing to do.")
             return
         }
-        print("""
+        Prompt.note("""
         FileVault encrypts the whole startup disk so a lost or stolen Mac cannot be read.
         Enabling it:
           • requires your administrator password (via sudo),
@@ -35,8 +28,8 @@ enum GuidedHelper {
           • keeps that key local (this helper never escrows it to iCloud),
           • needs a restart to begin encrypting.
         """)
-        guard confirm("Enable FileVault now?") else {
-            print("Skipped. You can enable it later in System Settings → Privacy & Security → FileVault.")
+        guard Prompt.confirm("Enable FileVault now?") else {
+            Prompt.note("Skipped. You can enable it later in System Settings → Privacy & Security → FileVault.")
             return
         }
         // Run interactively, inheriting the terminal, so macOS handles the sudo
@@ -44,11 +37,10 @@ enum GuidedHelper {
         // or stores the key value.
         let code = runInteractive("/usr/bin/sudo", ["fdesetup", "enable"])
         if code != 0 {
-            print("fdesetup did not complete (exit \(code)). FileVault was not enabled.")
+            Prompt.warn("fdesetup did not complete (exit \(code)). FileVault was not enabled.")
             return
         }
-        print("""
-
+        Prompt.note("""
         FileVault is now enabling. IMPORTANT:
           • Save the recovery key shown above in a safe place.
           • To keep it inside a csec vault, run:  csec edit <store>   and add it as a field.
@@ -61,14 +53,14 @@ enum GuidedHelper {
     static let santaReleasesURL = "https://github.com/northpolesec/santa/releases/latest"
 
     static func santa() {
-        print("\n# Guided: Santa binary allow-listing")
+        Prompt.title("Guided: Santa binary allow-listing")
         let installed = FileManager.default.fileExists(atPath: "/Applications/Santa.app")
             || FileManager.default.isExecutableFile(atPath: "/usr/local/bin/santactl")
         if installed {
             let status = runCapturing("/usr/local/bin/santactl", ["status"])
             let mode = status.lowercased().contains("lockdown") ? "LOCKDOWN" :
                 (status.lowercased().contains("monitor") ? "MONITOR" : "unknown")
-            print("""
+            Prompt.note("""
             Santa is installed (mode: \(mode)).
             Recommended starting posture is MONITOR mode — it logs every execution without
             blocking, so you learn what runs before you ever tighten to LOCKDOWN. Do not switch
@@ -77,7 +69,7 @@ enum GuidedHelper {
             """)
             return
         }
-        print("""
+        Prompt.note("""
         Santa (North Pole Security) is the single strongest control against a trojaned CLI
         executing: it allow-lists which binaries may run. csec will NOT download or install it
         automatically — install only the official signed package yourself:
@@ -87,7 +79,7 @@ enum GuidedHelper {
         After installing, start in MONITOR mode (log-only). Tighten to LOCKDOWN later, once you
         have reviewed what runs. csec deliberately never sets LOCKDOWN for you.
         """)
-        if confirm("Open the official Santa releases page now?") {
+        if Prompt.confirm("Open the official Santa releases page now?") {
             _ = runInteractive("/usr/bin/open", [santaReleasesURL])
         }
     }

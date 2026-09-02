@@ -168,6 +168,22 @@ The subtree model intentionally gives descendants of an approved root access to
 the same granted references. Code running inside that subtree is therefore part
 of the trusted consumer boundary.
 
+### Explicit persistent automation exception
+
+Unattended jobs are not represented as long ordinary grants. `csec automation`
+uses a separate persistent, value-free job catalog plus a separate device-only
+Keychain materialization. One attended local review opts an exact canonical ref
+set and command recipe into the deliberately weaker `mutable_interpreted`
+consumer class until revoke. Resolution still happens through `SecretResolver`
+only after review; the catalog never stores provider-private identifiers.
+
+Each trigger creates a memory-only lease for the authenticated signed csec
+runner's PID/start time before it spawns the stored interpreter. Only that exact
+direct child can use a language bridge, and only for a subset of the registered
+refs until the maximum runtime. Job names and run IDs are lookup hints, not
+bearer capabilities. Script, dependency, and input integrity is expressly
+outside this boundary. See [`docs/automation.md`](docs/automation.md).
+
 ## Trusted review and consent
 
 The production daemon owns one AppKit review-and-authentication window. It
@@ -629,18 +645,42 @@ its provisioned Keychain group is usable. A single request, language-client call
 or `csec exec` launch can contain both schemes.
 
 The 1Password provider starts independently after the daemon begins serving. It
-dynamically locates and signature-checks the official CLI, immediately runs a
-metadata-only `op whoami --format=json`, discards that command's output, and
-repeats the probe every eight minutes while access remains available. This stays
-inside 1Password desktop integration's ten-minute inactivity window without
-prefetching any secret. All CLI commands are serialized, concurrent reconnects
-share one attempt, and every spawn rechecks the CLI's code identity. A failed
-background probe retries after 5, 15, then at most 30 minutes; an actual secret
-request does not wait for that backoff and reconnects immediately. Installing a
-trusted CLI after launch is noticed on a later probe without restarting csecd.
-Authentication probes have a 60-second deadline and reads a 120-second deadline,
-including forced termination of an unresponsive CLI. Logs expose only fixed
-connection states.
+dynamically locates and signature-checks the official CLI, then immediately runs
+a metadata-only probe: `op account list`, followed by one
+`op vault list --account <user id>` per signed-in account. It repeats that probe
+every eight minutes while access remains available. `op whoami` cannot serve as
+this probe — it reports an `op signin` session and answers "account is not signed
+in" under the desktop-app authorization csec actually uses, while a vault listing
+succeeds exactly when an account is authorized. Because 1Password's ten-minute
+inactivity window is per account, listing every account is also what keeps a
+second account's authorization alive. All CLI commands are serialized, concurrent
+reconnects share one attempt, and every spawn rechecks the CLI's code identity. A
+failed background probe retries after 5, 15, then at most 30 minutes; an actual
+secret request does not wait for that backoff and reconnects immediately.
+Installing a trusted CLI after launch is noticed on a later probe without
+restarting csecd. Authentication probes have a 60-second deadline and reads a
+120-second deadline, including forced termination of an unresponsive CLI. Logs
+expose only fixed connection states.
+
+That probe doubles as the **account index**: which signed-in account holds which
+vault. An `op://VAULT/ITEM/FIELD` reference carries no account, and plain `op`
+resolves it against whichever account its own config last recorded — a default
+that moves when a different account is unlocked, and that silently points at the
+wrong organization when several are signed in. csec decides instead, and reads
+with an explicit `--account`: an exact vault id, else a vault name matched
+case-insensitively exactly as `op` matches it, else the account whose vault
+actually holds the item (`op item list`, titles and ids only). If several
+accounts still qualify, the trusted review window names the one that will be used
+and warns that the vault name is not unique; resolution proceeds only for a
+choice a review displayed, so csec never silently picks between accounts. The
+account each reference resolved from is then remembered for the daemon's
+lifetime, so an approved reference cannot drift to another account later. If any
+account could not be listed its vaults are unknown, so csec falls back to the
+account-less read rather than claiming a vault is missing. The index is derived
+state held only in memory — writing a vault-to-account map to disk would give
+same-uid malware a way to redirect a reference at an account it controls.
+`csec status` reports how many accounts are authorized and how many vaults are
+indexed.
 
 This is best-effort continuity, not a bypass of 1Password policy: locking the
 1Password app revokes CLI authorization, and desktop integration still applies

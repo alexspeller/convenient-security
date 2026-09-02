@@ -19,6 +19,7 @@ private struct CompleteStatus {
     let launchAgentLoaded: Bool
     let agentReachable: Bool
     let schemes: [String]?
+    let providerStatus: [ProviderStatusSummary]
     let sshSocketPresent: Bool
     let sshKeys: Int?
     let sshEnvironmentConfigured: Bool
@@ -81,15 +82,15 @@ func runDoctor(_ arguments: [String]) -> Never {
     switch arguments {
     case []: checkOnly = false
     case ["--check"]: checkOnly = true
-    default: usage()
+    default: usage("doctor")
     }
 
-    print("csec doctor: checking the complete installation")
+    Prompt.note("checking the complete installation")
     var status = collectCompleteStatus()
     if checkOnly || status.healthy || status.developmentEndpoint {
         renderCompleteStatus(status)
         if checkOnly, !status.healthy {
-            print("Repair: run `csec doctor` without --check.")
+            Prompt.note("Repair: run `csec doctor` without --check.")
         }
         if !status.sshEnvironmentConfigured {
             FileHandle.standardOutput.write(Data(sshActivationGuidanceIfNeeded().utf8))
@@ -99,10 +100,8 @@ func runDoctor(_ arguments: [String]) -> Never {
 
     guard status.installedApplicationReady else {
         renderCompleteStatus(status)
-        FileHandle.standardError.write(Data(
-            "csec doctor: the root-owned installed app is missing or incomplete; "
-                .appending("run ./packaging/bin/build-and-install.sh\n").utf8
-        ))
+        csecError("doctor", "the root-owned installed app is missing or incomplete; "
+            + "run ./packaging/bin/build-and-install.sh")
         exit(1)
     }
 
@@ -111,9 +110,7 @@ func runDoctor(_ arguments: [String]) -> Never {
         switch status.serviceManagementStatus {
         case .requiresApproval:
             renderCompleteStatus(status)
-            FileHandle.standardError.write(Data(
-                "csec doctor: approve ConvenientSecurity in System Settings > General > Login Items, then rerun csec doctor\n".utf8
-            ))
+            csecError("doctor", "approve ConvenientSecurity in System Settings > General > Login Items, then rerun csec doctor")
             exit(1)
         case .enabled:
             if LaunchctlInspection.kickstartAgent() {
@@ -125,9 +122,7 @@ func runDoctor(_ arguments: [String]) -> Never {
                 repairs.append("registered the per-user csecd LaunchAgent")
                 if registered.needsApproval {
                     renderCompleteStatus(collectCompleteStatus())
-                    FileHandle.standardError.write(Data(
-                        "csec doctor: approve ConvenientSecurity in System Settings > General > Login Items, then rerun csec doctor\n".utf8
-                    ))
+                    csecError("doctor", "approve ConvenientSecurity in System Settings > General > Login Items, then rerun csec doctor")
                     exit(1)
                 }
             } catch {
@@ -135,9 +130,7 @@ func runDoctor(_ arguments: [String]) -> Never {
                 // Reinspect before treating registration failure as terminal.
                 guard LaunchctlInspection.agentLoaded() else {
                     renderCompleteStatus(collectCompleteStatus())
-                    FileHandle.standardError.write(Data(
-                        "csec doctor: could not register the per-user LaunchAgent: \(ReviewDisplay.sanitized(error.localizedDescription))\n".utf8
-                    ))
+                    csecError("doctor", "could not register the per-user LaunchAgent: \(ReviewDisplay.sanitized(error.localizedDescription))")
                     exit(1)
                 }
             }
@@ -158,7 +151,7 @@ func runDoctor(_ arguments: [String]) -> Never {
         status = waitForRootHelper(timeout: 2)
     }
 
-    for repair in repairs { print("csec doctor: repaired — \(repair)") }
+    for repair in repairs { Prompt.success("repaired — \(repair)") }
     renderCompleteStatus(status)
     if !status.sshEnvironmentConfigured {
         FileHandle.standardOutput.write(Data(sshActivationGuidanceIfNeeded().utf8))
@@ -167,18 +160,14 @@ func runDoctor(_ arguments: [String]) -> Never {
     guard status.healthy else {
         if !status.agentReachable {
             let log = (AgentSocket.directory() as NSString).appendingPathComponent("csecd.log")
-            FileHandle.standardError.write(Data(
-                "csec doctor: csecd did not become healthy; inspect \(ReviewDisplay.sanitized(log))\n".utf8
-            ))
+            csecError("doctor", "csecd did not become healthy; inspect \(ReviewDisplay.sanitized(log))")
         }
         if !status.rootHelperReachable {
-            FileHandle.standardError.write(Data(
-                "csec doctor: the authenticated root helper is unavailable; rerun ./packaging/bin/build-and-install.sh\n".utf8
-            ))
+            csecError("doctor", "the authenticated root helper is unavailable; rerun ./packaging/bin/build-and-install.sh")
         }
         exit(1)
     }
-    print("csec doctor: installation is healthy")
+    Prompt.success("installation is healthy")
     exit(0)
 }
 
@@ -190,7 +179,8 @@ private func collectCompleteStatus() -> CompleteStatus {
     let client = makeAgentClient()
 
     let agentReachable = (try? client.capabilities()) != nil
-    let schemes = agentReachable ? try? client.schemes().sorted() : nil
+    let providers = agentReachable ? try? client.schemesWithProviderStatus() : nil
+    let schemes = providers?.schemes.sorted()
     let sshKeys = agentReachable ? try? client.listSSHKeys().count : nil
     let remoteApproval = agentReachable ? try? client.remoteApprovalStatus().state : nil
     let sshPath = SSHAgentSocket.defaultPath()
@@ -202,6 +192,7 @@ private func collectCompleteStatus() -> CompleteStatus {
         launchAgentLoaded: launchAgentLoaded,
         agentReachable: agentReachable,
         schemes: schemes,
+        providerStatus: providers?.providerStatus ?? [],
         sshSocketPresent: ownedSocketExists(path: sshPath, requiredMode: 0o600),
         sshKeys: sshKeys,
         sshEnvironmentConfigured:
@@ -212,40 +203,91 @@ private func collectCompleteStatus() -> CompleteStatus {
 }
 
 private func renderCompleteStatus(_ status: CompleteStatus) {
-    print("Convenient Security status")
+    print(StatusRenderer.render(
+        title: "Convenient Security status",
+        rows: statusRows(status),
+        overallHealthy: status.healthy,
+        color: TerminalStyle.colorEnabled(STDOUT_FILENO),
+        width: TerminalStyle.terminalWidth(fd: STDOUT_FILENO)))
+}
+
+/// Map the launcher's `CompleteStatus` facts into colored status rows. A
+/// development endpoint reports app/LaunchAgent as neutral (not a real install);
+/// otherwise each row grades to ok/warn/bad the way `CompleteStatus.healthy` does.
+private func statusRows(_ status: CompleteStatus) -> [StatusRow] {
+    var rows: [StatusRow] = []
+
     if status.developmentEndpoint {
-        print("  Installed app: development endpoint selected")
-        print("  LaunchAgent: development endpoint selected")
+        rows.append(StatusRow(label: "Installed app", value: "development endpoint selected", state: .neutral))
+        rows.append(StatusRow(label: "LaunchAgent", value: "development endpoint selected", state: .neutral))
     } else {
-        print("  Installed app: \(status.installedApplicationReady ? "installed" : "missing or incomplete")")
+        rows.append(StatusRow(
+            label: "Installed app",
+            value: status.installedApplicationReady ? "installed" : "missing or incomplete",
+            state: status.installedApplicationReady ? .ok : .bad))
         if status.launchAgentLoaded {
-            print("  LaunchAgent: registered with launchd")
+            rows.append(StatusRow(label: "LaunchAgent", value: "registered with launchd", state: .ok))
         } else {
-            print("  LaunchAgent: \(status.serviceManagementStatus.description)")
+            rows.append(StatusRow(
+                label: "LaunchAgent",
+                value: status.serviceManagementStatus.description,
+                state: status.serviceManagementStatus == .requiresApproval ? .warn : .bad))
         }
     }
-    print("  Agent control channel: \(status.agentReachable ? "reachable and authenticated" : "unavailable")")
-    let providerDescription: String
-    switch status.schemes {
-    case nil: providerDescription = "unavailable"
-    case []: providerDescription = "none available"
-    case .some(let schemes): providerDescription = schemes.joined(separator: ", ")
-    }
-    print("  Providers: \(providerDescription)")
 
-    let sshState: String
-    if status.sshSocketPresent, status.sshKeys != nil {
-        sshState = "ready"
-    } else if status.sshSocketPresent {
-        sshState = "socket present, signer unavailable"
-    } else {
-        sshState = "unavailable"
+    rows.append(StatusRow(
+        label: "Agent control channel",
+        value: status.agentReachable ? "reachable and authenticated" : "unavailable",
+        state: status.agentReachable ? .ok : .bad))
+
+    switch status.schemes {
+    case nil:
+        rows.append(StatusRow(label: "Providers", value: "unavailable", state: .bad))
+    case .some(let schemes) where schemes.isEmpty:
+        rows.append(StatusRow(label: "Providers", value: "none available", state: .warn))
+    case .some(let schemes):
+        rows.append(StatusRow(label: "Providers", value: schemes.joined(separator: ", "), state: .ok))
     }
-    print("  SSH agent: \(sshState)")
-    print("  Protected SSH keys: \(status.sshKeys.map(String.init) ?? "unavailable")")
-    print("  Shell SSH_AUTH_SOCK: \(status.sshEnvironmentConfigured ? "configured for csec" : "not configured for csec")")
-    print("  Remote approval: \(remoteApprovalDescription(status.remoteApproval))")
-    print("  Root helper: \(status.rootHelperReachable ? "reachable and authenticated" : "unavailable")")
+
+    // Per-provider detail (e.g. how many 1Password accounts are authorized and
+    // how many vaults are indexed), so a provider that is registered but cannot
+    // currently serve is visible without reading csecd's log.
+    for provider in status.providerStatus {
+        rows.append(StatusRow(
+            label: ReviewDisplay.sanitized(String(provider.label.prefix(32))),
+            value: ReviewDisplay.sanitized(String(provider.detail.prefix(160))),
+            state: provider.healthy ? .ok : .warn))
+    }
+
+    if status.sshSocketPresent, status.sshKeys != nil {
+        rows.append(StatusRow(label: "SSH agent", value: "ready", state: .ok))
+    } else if status.sshSocketPresent {
+        rows.append(StatusRow(label: "SSH agent", value: "socket present, signer unavailable", state: .warn))
+    } else {
+        rows.append(StatusRow(label: "SSH agent", value: "unavailable", state: .bad))
+    }
+
+    rows.append(StatusRow(
+        label: "Protected SSH keys",
+        value: status.sshKeys.map(String.init) ?? "unavailable",
+        state: status.sshKeys != nil ? .ok : .bad))
+
+    rows.append(StatusRow(
+        label: "Shell SSH_AUTH_SOCK",
+        value: status.sshEnvironmentConfigured ? "configured for csec" : "not configured for csec",
+        state: status.sshEnvironmentConfigured ? .ok : .warn))
+
+    rows.append(StatusRow(
+        label: "Remote approval",
+        value: remoteApprovalDescription(status.remoteApproval),
+        state: status.remoteApproval == .enabled ? .ok : .neutral))
+
+    rows.append(StatusRow(
+        label: "Root helper",
+        value: status.rootHelperReachable ? "reachable and authenticated" : "unavailable",
+        state: status.rootHelperReachable ? .ok : .bad))
+
+    return rows
 }
 
 private func remoteApprovalDescription(

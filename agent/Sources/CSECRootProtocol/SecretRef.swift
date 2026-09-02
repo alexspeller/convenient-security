@@ -81,6 +81,9 @@ public struct SecretRef: Hashable, Sendable, CustomStringConvertible {
         return "item: \(Self.promptSafe(path))"
     }
 
+    // Intentionally duplicates `ReviewDisplay.sanitized` (default mode). This is
+    // the lowest module in the stack and cannot import ConvenientSecurity, so the
+    // ~12-line copy is the correct layering tradeoff rather than a shared dep.
     private static func promptSafe(_ value: String) -> String {
         let bidiControls: Set<UInt32> = [
             0x061c, 0x200e, 0x200f,

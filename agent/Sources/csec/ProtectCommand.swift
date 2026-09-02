@@ -43,11 +43,11 @@ func runProtect(_ arguments: [String]) -> Never {
         switch arguments[index] {
         case "--store":
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("protect") }
             storeOverride = arguments[index]
         case "--dest":
             index += 1
-            guard index < arguments.count else { usage() }
+            guard index < arguments.count else { usage("protect") }
             destOverride = arguments[index]
         case "--env":
             envMode = true
@@ -58,7 +58,7 @@ func runProtect(_ arguments: [String]) -> Never {
         case "--dry-run":
             dryRun = true
         case let token where token.hasPrefix("-"):
-            usage()
+            usage("protect")
         default:
             paths.append(arguments[index])
         }
@@ -81,7 +81,7 @@ func runProtect(_ arguments: [String]) -> Never {
     }
     if sshMode {
         guard destOverride == nil else { protectFail("--dest does not apply to --ssh") }
-        guard !paths.isEmpty else { usage() }
+        guard !paths.isEmpty else { usage("protect") }
         runProtectSSH(
             rawPaths: paths,
             storeOverride: storeOverride,
@@ -92,7 +92,7 @@ func runProtect(_ arguments: [String]) -> Never {
     guard destOverride == nil else {
         protectFail("--dest requires --env")
     }
-    guard !paths.isEmpty else { usage() }
+    guard !paths.isEmpty else { usage("protect") }
 
     // Canonicalize the project directory (resolving symlinks such as macOS's
     // /var -> /private/var) so containment checks and relative paths are computed

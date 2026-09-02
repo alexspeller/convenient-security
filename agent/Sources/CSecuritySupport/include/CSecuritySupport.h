@@ -115,11 +115,13 @@ typedef enum {
 /// whose close-on-exec flag is cleared in the child only. The function returns
 /// success only after the kernel has replaced the child image with `execve`, so
 /// the parent can begin writing inherited secret pipes after the target exists.
+/// A non-NULL `working_directory` is entered in the child before exec.
 /// No secret is installed into the supervisor's own environment.
 int32_t cs_spawn_supervised(
     const char *executable_path,
     char *const argv[],
     char *const envp[],
+    const char *working_directory,
     int32_t stdin_uses_pty,
     cs_output_mode stdout_mode,
     cs_output_mode stderr_mode,

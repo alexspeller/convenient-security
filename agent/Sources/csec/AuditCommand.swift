@@ -30,8 +30,8 @@ func runAudit(_ arguments: [String]) -> Never {
         case "--attest": attest = true
         case "--scan-filesystem": scanFilesystem = true
         default:
-            FileHandle.standardError.write(Data("csec audit: unknown option \(auditSafe(argument))\n".utf8))
-            usage()
+            csecError("audit", "unknown option \(ReviewDisplay.sanitized(argument, allowNewlines: true))")
+            usage("audit")
         }
     }
     exit(performHostAudit(
@@ -63,8 +63,7 @@ func performHostAudit(
             print("\ncsec audit: the resident agent (csecd) is not reachable; run `csec audit` after it is running.")
             return 0
         }
-        FileHandle.standardError.write(Data(
-            "csec audit: could not reach the resident agent (csecd). Is it running? (`csec status`)\n".utf8))
+        csecError("audit", "could not reach the resident agent (csecd). Is it running? (`csec status`)")
         return 1
     }
 
@@ -155,7 +154,7 @@ private func emitJSON(_ report: HostAuditReport) -> Int32 {
         print(text)
         return exitCode(for: report)
     }
-    FileHandle.standardError.write(Data("csec audit: failed to encode report as JSON\n".utf8))
+    csecError("audit", "failed to encode report as JSON")
     return 1
 }
 
@@ -253,9 +252,10 @@ private func renderRemediation(_ summary: HostRemediationSummary) {
         print("No changes applied (Touch ID declined or unavailable).")
         return
     }
-    if !summary.applied.isEmpty { print("Applied: \(summary.applied.map(auditSafe).joined(separator: ", "))") }
-    if !summary.skipped.isEmpty { print("Skipped: \(summary.skipped.map(auditSafe).joined(separator: ", "))") }
-    if !summary.failed.isEmpty { print("Failed:  \(summary.failed.map(auditSafe).joined(separator: ", "))") }
+    func safe(_ value: String) -> String { ReviewDisplay.sanitized(value, allowNewlines: true) }
+    if !summary.applied.isEmpty { print("Applied: \(summary.applied.map(safe).joined(separator: ", "))") }
+    if !summary.skipped.isEmpty { print("Skipped: \(summary.skipped.map(safe).joined(separator: ", "))") }
+    if !summary.failed.isEmpty { print("Failed:  \(summary.failed.map(safe).joined(separator: ", "))") }
     if summary.applied.isEmpty && summary.failed.isEmpty { print("No changes were applied.") }
 }
 
@@ -286,18 +286,3 @@ private func mergeTriage(
     return byID.values.sorted { $0.id < $1.id }
 }
 
-/// Neutralize control / bidi characters in any string sent to the terminal.
-/// The findings are already value-free and sanitized in the engine; this is a
-/// belt-and-suspenders pass at the display boundary.
-func auditSafe(_ value: String) -> String {
-    let bidiControls: Set<UInt32> = [
-        0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
-        0x2066, 0x2067, 0x2068, 0x2069,
-    ]
-    return value.unicodeScalars.map { scalar in
-        if CharacterSet.controlCharacters.contains(scalar) || bidiControls.contains(scalar.value) {
-            return "\u{FFFD}"
-        }
-        return String(scalar)
-    }.joined()
-}

@@ -40,7 +40,7 @@ public struct BiometricConsent: ConsentProvider {
     }
 
     public func authenticate(reason: String) async -> ConsentOutcome {
-        await evaluate(localizedReason: Self.promptSafe(reason))
+        await evaluate(localizedReason: ReviewDisplay.sanitized(reason))
     }
 
     private func evaluate(localizedReason: String) async -> ConsentOutcome {
@@ -82,29 +82,13 @@ public struct BiometricConsent: ConsentProvider {
         let list = references.map { "• \($0.displayString)" }.joined(separator: "\n")
         let count = references.count
         let noun = count == 1 ? "secret" : "secrets"
-        let policyLine = policySummary.map { "\npolicy: \(promptSafe($0))" } ?? ""
+        let policyLine = policySummary.map { "\npolicy: \(ReviewDisplay.sanitized($0))" } ?? ""
         return """
-        grant \(promptSafe(caller.description)) access to \(count) \(noun):
+        grant \(ReviewDisplay.sanitized(caller.description)) access to \(count) \(noun):
         \(list)
-        purpose: \(promptSafe(reason))
+        purpose: \(ReviewDisplay.sanitized(reason))
         duration: \(formatDuration(ttl))\(policyLine)
         """
-    }
-
-    private static func promptSafe(_ value: String) -> String {
-        let bidiControls: Set<UInt32> = [
-            0x061c, 0x200e, 0x200f,
-            0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
-            0x2066, 0x2067, 0x2068, 0x2069,
-        ]
-        return value.unicodeScalars.map { scalar in
-            if CharacterSet.controlCharacters.contains(scalar)
-                || CharacterSet.newlines.contains(scalar)
-                || bidiControls.contains(scalar.value) {
-                return "�"
-            }
-            return String(scalar)
-        }.joined()
     }
 
     public static func formatDuration(_ ttl: TimeInterval) -> String {

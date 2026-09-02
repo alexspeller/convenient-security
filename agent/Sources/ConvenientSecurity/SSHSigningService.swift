@@ -180,7 +180,7 @@ public actor SSHSigningService: SSHAgentKeyProvider {
             caller: caller,
             reason: plan.operationContext,
             plan: plan,
-            credentials: references.map { PolicyReviewCredential(references: [$0]) }
+            credentials: await resolver.reviewCredentials(for: references.map { [$0] })
         )
         guard case let .approved(approval) = await policyReview.reviewAccess(review) else {
             throw SSHProtectionError.authorizationDenied

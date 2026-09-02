@@ -96,6 +96,20 @@ public struct AgentClient {
         return schemes
     }
 
+    /// The same capability query, with each provider's one-line health summary.
+    /// Older agents omit the summaries; the schemes are always present.
+    public func schemesWithProviderStatus() throws -> (
+        schemes: [String], providerStatus: [ProviderStatusSummary]
+    ) {
+        let response = try send(.schemes)
+        if let failure = response.failure {
+            throw ClientError.protocolFailure(failure.code, failure.message)
+        }
+        if let error = response.error { throw ClientError.agentError(error) }
+        guard let schemes = response.schemes else { throw ClientError.transportFailed }
+        return (schemes, response.providerStatus ?? [])
+    }
+
     public func capabilities() throws -> ProtocolCapabilities {
         let response = try send(.capabilities)
         if let failure = response.failure {
@@ -266,6 +280,63 @@ public struct AgentClient {
 
     public func removeSSHKey(fingerprint: String) throws -> [SSHKeyMetadata] {
         try configureSSH(action: .remove, fingerprint: fingerprint).sshKeys ?? []
+    }
+
+    public func enrollAutomation(_ enrollment: AutomationEnrollment) throws -> AutomationJob {
+        let request = AutomationRequest(action: .enroll, enrollment: enrollment)
+        let response = try send(.configureAutomation(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let jobs = response.automationJobs, jobs.count == 1,
+              let job = jobs.first, job.isWellFormed else {
+            throw ClientError.transportFailed
+        }
+        return job
+    }
+
+    public func listAutomation() throws -> [AutomationJob] {
+        let request = AutomationRequest(action: .list)
+        let response = try send(.configureAutomation(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let jobs = response.automationJobs,
+              jobs.count <= 128,
+              jobs.allSatisfy(\.isWellFormed) else {
+            throw ClientError.transportFailed
+        }
+        return jobs
+    }
+
+    public func beginAutomationRun(name: String) throws -> AutomationRunDecision {
+        let request = AutomationRequest(action: .beginRun, name: name)
+        let response = try send(.configureAutomation(request))
+        try Self.check(response: response, requestID: request.requestID)
+        if let run = response.automationRun,
+           UUID(uuidString: run.runID)?.uuidString.lowercased() == run.runID,
+           run.job.isWellFormed,
+           run.expiresAt > Date() {
+            return .started(run)
+        }
+        if let next = response.automationNextEligibleAt,
+           response.automationRun == nil {
+            return .skipped(nextEligibleAt: next)
+        }
+        throw ClientError.transportFailed
+    }
+
+    public func finishAutomationRun(runID: String) throws {
+        let request = AutomationRequest(action: .finishRun, runID: runID)
+        let response = try send(.configureAutomation(request))
+        try Self.check(response: response, requestID: request.requestID)
+    }
+
+    public func revokeAutomation(name: String) throws -> AutomationJob {
+        let request = AutomationRequest(action: .revoke, name: name)
+        let response = try send(.configureAutomation(request))
+        try Self.check(response: response, requestID: request.requestID)
+        guard let jobs = response.automationJobs, jobs.count == 1,
+              let job = jobs.first, job.isWellFormed else {
+            throw ClientError.transportFailed
+        }
+        return job
     }
 
     private func configureSSH(
