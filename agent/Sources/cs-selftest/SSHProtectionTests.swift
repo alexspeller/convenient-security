@@ -807,17 +807,80 @@ func sshProtectionTests() async {
         let catalog = SSHKeyCatalog(store: InMemorySSHKeyCatalogStore())
         let consent = SSHFixtureConsent()
         let review = SSHFixtureReview()
+        let claudePID: pid_t = 91_000
+        let firstWrapperPID: pid_t = 91_010
+        let firstSSHPID: pid_t = 91_011
+        let secondWrapperPID: pid_t = 91_020
+        let secondSSHPID: pid_t = 91_021
+        let codexPID: pid_t = 92_000
+        let otherWrapperPID: pid_t = 92_010
+        let otherSSHPID: pid_t = 92_011
+        let processStartTimes: [pid_t: UInt64] = [
+            claudePID: 1_001,
+            firstWrapperPID: 1_002,
+            firstSSHPID: 1_003,
+            secondWrapperPID: 1_004,
+            secondSSHPID: 1_005,
+            codexPID: 2_001,
+            otherWrapperPID: 2_002,
+            otherSSHPID: 2_003,
+        ]
+        let processParents: [pid_t: pid_t] = [
+            firstWrapperPID: claudePID,
+            firstSSHPID: firstWrapperPID,
+            secondWrapperPID: claudePID,
+            secondSSHPID: secondWrapperPID,
+            otherWrapperPID: codexPID,
+            otherSSHPID: otherWrapperPID,
+        ]
+        let processNames: [pid_t: String] = [
+            claudePID: "2.1.252",
+            firstWrapperPID: "zsh",
+            firstSSHPID: "ssh",
+            secondWrapperPID: "flashyssh",
+            secondSSHPID: "ssh",
+            codexPID: "codex",
+            otherWrapperPID: "zsh",
+            otherSSHPID: "ssh",
+        ]
+        let processPaths: [pid_t: String] = [
+            claudePID: "/Users/test/.local/share/claude/versions/2.1.252",
+            firstWrapperPID: "/bin/zsh",
+            firstSSHPID: "/usr/bin/ssh",
+            secondWrapperPID: "/Users/test/project/bin/flashyssh",
+            secondSSHPID: "/usr/bin/ssh",
+            codexPID: "/opt/codex/bin/codex",
+            otherWrapperPID: "/bin/zsh",
+            otherSSHPID: "/usr/bin/ssh",
+        ]
+        let processInspection = SSHProcessInspection(
+            startTime: { processStartTimes[$0] },
+            parent: { processParents[$0] },
+            name: { processNames[$0] },
+            executablePath: { processPaths[$0] }
+        )
         let service = SSHSigningService(
             resolver: resolver,
             catalog: catalog,
             consent: consent,
             policyReview: review,
-            allowUnverifiedCallersForTesting: true
+            allowUnverifiedCallersForTesting: true,
+            processInspection: processInspection
         )
         let caller = CallerInfo(
-            pid: getpid(),
-            startTime: ProcessAncestry.startTime(of: getpid()) ?? 1,
-            description: "synthetic SSH client"
+            pid: firstSSHPID,
+            startTime: processStartTimes[firstSSHPID] ?? 0,
+            description: "first synthetic Claude SSH client"
+        )
+        let siblingCaller = CallerInfo(
+            pid: secondSSHPID,
+            startTime: processStartTimes[secondSSHPID] ?? 0,
+            description: "sibling synthetic Claude SSH client"
+        )
+        let otherSessionCaller = CallerInfo(
+            pid: otherSSHPID,
+            startTime: processStartTimes[otherSSHPID] ?? 0,
+            description: "synthetic Codex SSH client"
         )
         let registrations = try await service.register([
             SSHKeyRegistrationIntent(reference: nativeReference, label: "native fixture"),
@@ -868,10 +931,19 @@ func sshProtectionTests() async {
             signedData: signedData,
             flags: 0,
             binding: binding,
-            caller: caller
+            caller: siblingCaller
         )
         check(await review.calls() == reviewsAfterFirstSignature,
-              "a matching key, host, user, and process-subtree grant avoids another review")
+              "sibling SSH wrappers in one coding-agent subtree reuse one review")
+        _ = try await service.signSSHAuthentication(
+            publicKeyBlob: nativeMetadata.publicKeyBlob,
+            signedData: signedData,
+            flags: 0,
+            binding: binding,
+            caller: otherSessionCaller
+        )
+        check(await review.calls() == reviewsAfterFirstSignature + 1,
+              "a different coding-agent process root requires another SSH review")
 
         let deniedCounter = SSHFixtureCounter()
         let deniedResolver = SecretResolver(cache: NullSecretCache())
@@ -892,7 +964,8 @@ func sshProtectionTests() async {
             catalog: SSHKeyCatalog(store: InMemorySSHKeyCatalogStore(keys: [deniedMetadata])),
             consent: consent,
             policyReview: SSHDenyFixtureReview(),
-            allowUnverifiedCallersForTesting: true
+            allowUnverifiedCallersForTesting: true,
+            processInspection: processInspection
         )
         do {
             _ = try await deniedService.signSSHAuthentication(

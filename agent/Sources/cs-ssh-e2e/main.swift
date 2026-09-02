@@ -10,6 +10,7 @@ private enum FixtureError: Error, LocalizedError {
     case invalidCertificateAuthority
     case unsupportedHostMode(String)
     case authenticationFailed(String)
+    case grantReuseFailed(Int)
 
     var errorDescription: String? {
         switch self {
@@ -27,6 +28,8 @@ private enum FixtureError: Error, LocalizedError {
             return "unsupported synthetic host-key mode: \(mode)"
         case let .authenticationFailed(detail):
             return "real OpenSSH authentication failed: \(detail)"
+        case let .grantReuseFailed(reviewCount):
+            return "two sibling OpenSSH connections required \(reviewCount) policy reviews"
         }
     }
 }
@@ -79,6 +82,17 @@ private struct FixtureProvider: SecretProvider {
 
     func authenticate() async throws {}
     func isAvailable() async -> Bool { true }
+}
+
+private actor CountingAutoApprovePolicyReview: PolicyReviewProvider {
+    private var reviewCount = 0
+
+    func reviewAccess(_ review: AccessPolicyReview) async -> AccessPolicyReviewOutcome {
+        reviewCount += 1
+        return .approved(AccessPolicyApproval())
+    }
+
+    func calls() -> Int { reviewCount }
 }
 
 private func runCommand(_ executable: String, _ arguments: [String]) throws {
@@ -190,7 +204,6 @@ let knownHosts = fixtureDirectory.appendingPathComponent("known_hosts")
 let socketPath = fixtureDirectory.appendingPathComponent("agent.sock").path
 let sshdPID = fixtureDirectory.appendingPathComponent("sshd.pid")
 let sshdLog = fixtureDirectory.appendingPathComponent("sshd.log")
-let sshLog = fixtureDirectory.appendingPathComponent("ssh.log")
 
 do {
     try runCommand("/usr/bin/ssh-keygen", [
@@ -227,11 +240,12 @@ do {
     let reference = "fixture://real-open-ssh/rsa-private-key"
     let resolver = SecretResolver(cache: NullSecretCache())
     await resolver.register(FixtureProvider(reference: reference, value: privateKey))
+    let policyReview = CountingAutoApprovePolicyReview()
     let signingService = SSHSigningService(
         resolver: resolver,
         catalog: SSHKeyCatalog(store: InMemorySSHKeyCatalogStore()),
         consent: AutoApproveConsent(),
-        policyReview: AutoApprovePolicyReview(),
+        policyReview: policyReview,
         allowUnverifiedCallersForTesting: true
     )
     let registered = try await signingService.registerAlreadyAuthorized(
@@ -310,40 +324,47 @@ do {
         throw FixtureError.serverDidNotStart(readLog(sshdLog))
     }
 
-    let sshOutput = try makeLogHandle(sshLog)
-    let ssh = Process()
-    ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-    let knownHostsPath = hostMode.usesCertificate ? knownHosts.path : "/dev/null"
-    let strictHostKeyChecking = hostMode.usesCertificate ? "yes" : "no"
-    ssh.arguments = [
-        "-F", "/dev/null", "-vvv", "-p", String(port),
-        "-o", "UserKnownHostsFile=\(knownHostsPath)",
-        "-o", "StrictHostKeyChecking=\(strictHostKeyChecking)",
-        "-o", "HostKeyAlgorithms=\(hostMode.hostKeyAlgorithm)",
-        "-o", "BatchMode=yes",
-        "-o", "PreferredAuthentications=publickey",
-        "-o", "PasswordAuthentication=no",
-        "-o", "KbdInteractiveAuthentication=no",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "IdentityFile=\(clientPublicKey.path)",
-        "127.0.0.1", "/usr/bin/true",
-    ]
-    var environment = ProcessInfo.processInfo.environment
-    environment["SSH_AUTH_SOCK"] = socketPath
-    ssh.environment = environment
-    ssh.standardInput = FileHandle.nullDevice
-    ssh.standardOutput = sshOutput
-    ssh.standardError = sshOutput
-    try ssh.run()
-    ssh.waitUntilExit()
-    try sshOutput.close()
+    for attempt in 1...2 {
+        let sshLog = fixtureDirectory.appendingPathComponent("ssh-\(attempt).log")
+        let sshOutput = try makeLogHandle(sshLog)
+        let ssh = Process()
+        ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        let knownHostsPath = hostMode.usesCertificate ? knownHosts.path : "/dev/null"
+        let strictHostKeyChecking = hostMode.usesCertificate ? "yes" : "no"
+        ssh.arguments = [
+            "-F", "/dev/null", "-vvv", "-p", String(port),
+            "-o", "UserKnownHostsFile=\(knownHostsPath)",
+            "-o", "StrictHostKeyChecking=\(strictHostKeyChecking)",
+            "-o", "HostKeyAlgorithms=\(hostMode.hostKeyAlgorithm)",
+            "-o", "BatchMode=yes",
+            "-o", "PreferredAuthentications=publickey",
+            "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "IdentityFile=\(clientPublicKey.path)",
+            "127.0.0.1", "/usr/bin/true",
+        ]
+        var environment = ProcessInfo.processInfo.environment
+        environment["SSH_AUTH_SOCK"] = socketPath
+        ssh.environment = environment
+        ssh.standardInput = FileHandle.nullDevice
+        ssh.standardOutput = sshOutput
+        ssh.standardError = sshOutput
+        try ssh.run()
+        ssh.waitUntilExit()
+        try sshOutput.close()
 
-    guard ssh.terminationReason == .exit, ssh.terminationStatus == 0 else {
-        throw FixtureError.authenticationFailed(readLog(sshLog))
+        guard ssh.terminationReason == .exit, ssh.terminationStatus == 0 else {
+            throw FixtureError.authenticationFailed(readLog(sshLog))
+        }
+    }
+    let signingReviewCount = await policyReview.calls()
+    guard signingReviewCount == 1 else {
+        throw FixtureError.grantReuseFailed(signingReviewCount)
     }
     print(
-        "ok   - Apple OpenSSH authenticates through csec with a synthetic RSA key "
-            + "and \(hostMode.rawValue) host binding"
+        "ok   - two sibling Apple OpenSSH connections reuse one csec review with "
+            + "a synthetic RSA key and \(hostMode.rawValue) host binding"
     )
 } catch {
     FileHandle.standardError.write(Data("FAIL - \(error.localizedDescription)\n".utf8))

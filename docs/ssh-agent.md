@@ -142,6 +142,14 @@ different key, host key, username, process root, expired process, or daemon
 restart requires a new review. This makes repeated Git/SSH operations usable
 without turning the agent into ambient same-user signing authority.
 
+Claude Code and Codex launch each Bash tool call through a fresh short-lived
+shell, so csec walks the live kernel ancestry and uses the nearest supported
+Claude Code or Codex process as that subtree root. The grant remains bound to
+that exact process incarnation (PID plus start time); a different coding-agent
+session or an unrelated process in the same macOS login session cannot reuse it.
+Outside a supported coding agent, direct shell and transient Git/file-transfer
+behavior is unchanged.
+
 The agent protocol supplies the cryptographic host key, not the DNS hostname.
 The trusted review therefore identifies the destination by host-key fingerprint.
 Hosts that deliberately share one host key are indistinguishable at this layer.
