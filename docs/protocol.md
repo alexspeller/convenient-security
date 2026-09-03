@@ -370,8 +370,10 @@ The launch sequence is:
    complete launch plan/digest, and an ordinary v2 access request derived from
    exactly that plan.
 4. `csecd` verifies that the authenticated caller is the launcher recorded in
-   the plan, evaluates `capability_gid_file` policy with no grant reuse, obtains
-   fresh consent, resolves the exact reference set, and renders each payload.
+   the plan and evaluates `capability_gid_file` policy. This mechanism may reuse
+   only a grant the human deliberately widened to a coding agent or terminal
+   session, never a requesting-process one; absent such a grant it obtains fresh
+   consent. It then resolves the exact reference set and renders each payload.
    Raw payloads are non-empty and at most 1 MiB each/4 MiB total. GitHub mode
    emits a bounded, injection-safe `hosts.yml` selected by the reviewed binding.
 5. `csecd` sends `approve` directly to the authenticated root helper with the

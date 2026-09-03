@@ -61,7 +61,10 @@ to differ for every exposure-shaping field, and to be domain-separated from the
 delivery-plan digest. An `Agent`-level test then proves the wiring end to end
 against live ancestry: one approval at a widened root covers a *different* later
 command of the same shape, a different delivery shape prompts again, and choosing
-the requesting-process root still prompts per command. The end-to-end suite
+the requesting-process root still prompts per command. A companion test covers
+capability-GID launches (`csec exec` over `*.csec` sidecars): they are offered the
+same roots, a later launch of the same shape rides a widened grant, and the
+narrow root still prompts for every launch even when the command is identical. The end-to-end suite
 exercises `csec grants` and `csec revoke` over the real socket and asserts the
 listing never contains a value. That suite pins scope discovery to "offer nothing
 wider" so its per-invocation root assertions do not depend on whether it was

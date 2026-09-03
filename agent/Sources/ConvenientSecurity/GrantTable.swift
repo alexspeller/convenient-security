@@ -21,12 +21,19 @@ public actor GrantTable {
     ///
     /// In both cases the kernel ancestry walk to the exact recorded PID/start-time
     /// pair remains the authority.
+    /// - Parameter widenedScopeOnly: reject per-command grants outright, so only
+    ///   a scope the human deliberately widened past the requesting command can
+    ///   cover this release. Capability-GID launches set it: each is a fresh
+    ///   two-party rendezvous that mints a new root, so it may ride an explicit
+    ///   subtree grant but must never be covered by the incidental per-command
+    ///   one its own outer launcher left behind.
     public func accessibleReferences(
         for pid: pid_t,
         now: Date,
         deliveryPlanDigest: String? = nil,
         releaseShapeDigest: String? = nil,
-        callerAuditSessionID: UInt32? = nil
+        callerAuditSessionID: UInt32? = nil,
+        widenedScopeOnly: Bool = false
     ) -> Set<String> {
         var refs: Set<String> = []
         for grant in grants where grant.isLive(now: now) {
@@ -35,9 +42,11 @@ public actor GrantTable {
                       scopeReuseDigest == releaseShapeDigest,
                       grant.auditSessionID == nil
                         || grant.auditSessionID == callerAuditSessionID else { continue }
-            } else if let deliveryPlanDigest,
-                      grant.deliveryPlanDigest != deliveryPlanDigest {
-                continue
+            } else {
+                guard !widenedScopeOnly else { continue }
+                if let deliveryPlanDigest, grant.deliveryPlanDigest != deliveryPlanDigest {
+                    continue
+                }
             }
             if ProcessAncestry.descends(pid, from: grant.rootPID, rootStartTime: grant.rootStartTime) {
                 refs.formUnion(grant.references)

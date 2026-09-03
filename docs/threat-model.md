@@ -96,6 +96,9 @@ runs different commands, and binding to one command would make the choice
 meaningless. It also means everything in the chosen subtree is inside the trusted
 consumer boundary for those references until the grant expires; the narrower
 per-command root remains one click away, and `csec revoke` drops a grant early.
+A capability-GID launch is the one mechanism that reuses *only* a widened grant:
+because it mints a new root of its own, covering it with a requesting-process
+grant would let a nested launch outlive the authorization that created it.
 Grants expire by TTL and drop when their root exits. Protocol-v1 access is
 recognized only to return `upgrade_required`, so an older or hand-written client
 cannot omit a plan to select the legacy authorization path.

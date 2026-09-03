@@ -559,3 +559,140 @@ func grantScopeAgentWiringTests() async {
     check(callsAfterNarrow == before + 2,
           "choosing the requesting-process root still prompts for every distinct command")
 }
+
+private func capabilityShapedPlan(
+    executablePath: String,
+    operationContext: String,
+    commandDigest: String
+) -> DeliveryPlan {
+    DeliveryPlan(
+        mechanism: .capabilityGIDFile,
+        executable: PlannedExecutable(canonicalPath: executablePath, assurance: .unverified),
+        root: .caller,
+        descendantScope: .subtree,
+        destination: .localDevelopment,
+        requestedTTLSeconds: 600,
+        operationContext: operationContext,
+        commandDigest: commandDigest,
+        outputGuard: OutputGuardPlan(mode: .always)
+    )
+}
+
+/// `csec exec` in a project holding `*.csec` sidecars delivers through a
+/// capability-GID launch. That mechanism mints a fresh root of its own, so it may
+/// never ride the incidental per-command grant its own outer launcher left
+/// behind — but a root the human deliberately widened to their shell or agent is
+/// an explicit authorization for the subtree, and does cover it.
+func capabilityGIDGrantScopeTests() async {
+    print("\n# Agent (capability-GID launches and widened grant scope)")
+
+    let me = pid_t(ProcessInfo.processInfo.processIdentifier)
+    guard let parent = ProcessAncestry.parent(of: me), parent > 1,
+          let myStart = ProcessAncestry.startTime(of: me) else {
+        check(false, "the capability-GID scope test can read its own live ancestry")
+        return
+    }
+
+    // Same live-ancestry harness as the wiring test: only the parent's name and
+    // tty ownership are synthesized, so a terminal-session root is offered
+    // wherever the suite runs.
+    let inspection = ProcessInspection(
+        startTime: { ProcessAncestry.startTime(of: $0) },
+        parent: { ProcessAncestry.parent(of: $0) },
+        name: { $0 == parent ? "fish" : ProcessAncestry.name(of: $0) },
+        executablePath: { ProcessAncestry.executablePath(of: $0) },
+        hasControllingTerminal: { $0 == parent }
+    )
+
+    let reference = "op://vault/sidecar/password"
+    let resolver = SecretResolver(cache: NullSecretCache())
+    await resolver.register(GrantScopeFixtureProvider(
+        values: [reference: Data("synthetic-sidecar-value".utf8)]
+    ))
+    let caller = CallerInfo(pid: me, startTime: myStart, description: "synthetic launcher")
+
+    let sidecarBash = capabilityShapedPlan(
+        executablePath: "/bin/bash",
+        operationContext: "csec exec (1 protected file(s)) bash",
+        commandDigest: String(repeating: "c", count: 64)
+    )
+    let sidecarRuby = capabilityShapedPlan(
+        executablePath: "/usr/bin/ruby",
+        operationContext: "csec exec (1 protected file(s)) ruby",
+        commandDigest: String(repeating: "d", count: 64)
+    )
+
+    // Widened root: one approval covers a later, different sidecar launch.
+    let consent = GrantScopeConsentCounter()
+    let review = GrantScopeSelectingReview(selecting: .terminalSession)
+    let agent = Agent(
+        resolver: resolver,
+        grants: GrantTable(),
+        consent: consent,
+        policyReview: review,
+        allowUnverifiedPlansForTesting: true,
+        processInspection: inspection
+    )
+
+    let first = await agent.handle(
+        request: try! accessRequest(references: [reference], plan: sidecarBash),
+        caller: caller
+    )
+    let offered = await review.offeredChoices()
+    check(offered?.options.contains(where: { $0.kind == .terminalSession }) == true,
+          "a capability-GID launch is offered the terminal-session root")
+    check(offered?.options.first?.processLabel == "bash",
+          "its requesting-command option is labeled with the launched command")
+    let callsAfterFirst = await consent.calls()
+    check(first.values?[reference] != nil && callsAfterFirst == 1,
+          "the first sidecar launch prompts once and resolves its value")
+
+    let second = await agent.handle(
+        request: try! accessRequest(references: [reference], plan: sidecarRuby),
+        caller: caller
+    )
+    let callsAfterSecond = await consent.calls()
+    check(second.values?[reference] != nil && callsAfterSecond == 1,
+          "a later sidecar launch of the same shape reuses the widened grant without prompting")
+
+    // Narrow root: a capability-GID launch never rides a per-command grant, so
+    // even the identical command prompts again — today's behaviour, preserved.
+    let narrowConsent = GrantScopeConsentCounter()
+    let narrowAgent = Agent(
+        resolver: resolver,
+        grants: GrantTable(),
+        consent: narrowConsent,
+        policyReview: GrantScopeSelectingReview(selecting: .requestingCommand),
+        allowUnverifiedPlansForTesting: true,
+        processInspection: inspection
+    )
+    _ = await narrowAgent.handle(
+        request: try! accessRequest(references: [reference], plan: sidecarBash),
+        caller: caller
+    )
+    _ = await narrowAgent.handle(
+        request: try! accessRequest(references: [reference], plan: sidecarBash),
+        caller: caller
+    )
+    check(await narrowConsent.calls() == 2,
+          "choosing the requesting-process root prompts for every capability-GID launch")
+
+    // The same rule, isolated at the table: `widenedScopeOnly` rejects a
+    // per-command grant even on an exact delivery-plan digest match.
+    let now = Date()
+    let table = GrantTable()
+    await table.add(Grant(
+        rootPID: me,
+        rootStartTime: myStart,
+        references: [reference],
+        reason: "synthetic per-command",
+        expiresAt: now.addingTimeInterval(60),
+        deliveryPlanDigest: "plan-a"
+    ))
+    check(await table.accessibleReferences(
+        for: me, now: now, deliveryPlanDigest: "plan-a", widenedScopeOnly: true
+    ).isEmpty, "widenedScopeOnly rejects a per-command grant on an exact digest match")
+    check(await table.accessibleReferences(
+        for: me, now: now, deliveryPlanDigest: "plan-a", widenedScopeOnly: false
+    ) == [reference], "…while the same grant still covers an ordinary release")
+}

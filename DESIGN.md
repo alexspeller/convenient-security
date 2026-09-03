@@ -208,6 +208,18 @@ be reused as a raw-plaintext `csec get`. Widening is a deliberate, displayed
 choice: everything inside the chosen subtree is inside the trusted consumer
 boundary for that reference set.
 
+A capability-GID launch (`csec exec` in a project holding `*.csec` sidecars, and
+`csec exec-file`) mints a fresh root of its own, so it is reusable **only** from a
+widened grant — never from the incidental requesting-process grant its own outer
+launcher left behind, which would let a nested launch outlive the authorization
+that created it. Riding an explicitly widened grant is exactly what the human
+chose, and exposes strictly less than the environment-injection mechanism the
+same choice already covers: the bytes reach a root-owned tmpfs behind a one-time
+capability GID instead of a child's environment, and never pass through the
+launcher. Every other binding on that path — launcher audit-token identity, the
+planted-sidecar path check, and the root helper's nonce and plan digest — is
+still re-verified per launch.
+
 ### Explicit persistent automation exception
 
 Unattended jobs are not represented as long ordinary grants. `csec automation`
@@ -350,8 +362,9 @@ audit token plus live product code identity before reading a body.
 Authorization is a two-party rendezvous. The exact original `csec` prepares the
 plan and passes only cwd/stdin/stdout/stderr descriptors with `SCM_RIGHTS`.
 `csecd` separately receives a digest-bound approval request, evaluates the
-release policy, obtains fresh Touch ID, resolves the exact reference set, renders
-bounded payloads, and sends those bytes directly to the root helper. It returns
+release policy, obtains Touch ID unless a widened grant already covers the
+release, resolves the exact reference set, renders bounded payloads, and sends
+those bytes directly to the root helper. It returns
 only a boolean approval to `csec`; neither values nor rendered files travel back
 through the launcher. Only the original launcher's audit token can consume the
 nonce and start, supervise, signal, or cancel that plan.

@@ -373,8 +373,10 @@ csec exec-file \
 
 Every launch is a fresh, digest-bound rendezvous between the original signed
 `csec`, signed `csecd`, and signed root helper. `csec` supplies the exact launch
-plan and stdio descriptors; `csecd` independently repeats policy review, Touch
-ID, and resolution, then sends the final bytes directly to the helper. The
+plan and stdio descriptors; `csecd` independently repeats policy review and
+resolution — asking for Touch ID unless a grant you widened to your shell or
+coding agent already covers it — then sends the final bytes directly to the
+helper. The
 launcher receives only approval and non-secret paths. The helper creates a
 one-time root-owned directory and files on a 32 MiB/2,048-node tmpfs, drops the
 child to the login UID with a newly allocated primary capability GID, and
@@ -434,6 +436,11 @@ same delivery shape — mechanism, destination, recipient, output guard, and the
 plaintext-exposure gate — so an approved `csec exec` can never be reused as a
 `csec get --reveal`, a new reference still prompts for the delta, and the caller
 must still descend from that exact live process.
+
+`csec exec` in a project holding `*.csec` sidecars delivers through a
+capability-GID launch, which creates a fresh root of its own. That mechanism
+reuses a *widened* grant like any other, but never a requesting-process one — so
+if you keep the narrow default there, every launch prompts.
 
 Live grants are visible and cancellable:
 

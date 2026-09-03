@@ -10,7 +10,7 @@ import Foundation
 //
 // Usage: cs-review-preview <scenario> <output.png> [light|dark]
 //   scenarios: basic | warning | unknown | file | mixed | automation
-//              account | ambiguous-account | scope
+//              account | ambiguous-account | scope | sidecar-scope
 //   CSEC_PREVIEW_EXPAND=1 opens progressive-disclosure details before capture.
 
 func fail(_ message: String) -> Never {
@@ -19,7 +19,7 @@ func fail(_ message: String) -> Never {
 }
 
 guard (3...4).contains(CommandLine.arguments.count) else {
-    fail("usage: cs-review-preview <basic|warning|unknown|file|mixed|automation|account|ambiguous-account|scope> <output.png> [light|dark]")
+    fail("usage: cs-review-preview <basic|warning|unknown|file|mixed|automation|account|ambiguous-account|scope|sidecar-scope> <output.png> [light|dark]")
 }
 let scenario = CommandLine.arguments[1]
 let outputPath = CommandLine.arguments[2]
@@ -255,6 +255,47 @@ case "scope":
             defaultOptionID: GrantScopeOption(
                 kind: .codingAgent, pid: 31163,
                 startTime: 999_997, processLabel: "Claude Code"
+            ).id
+        )
+    )
+case "sidecar-scope":
+    // `csec exec` in a project holding a `*.csec` sidecar: a capability-GID
+    // launch, straight from an interactive fish session with no agent between.
+    // This shape is offered the scope selector like any other.
+    review = AccessPolicyReview(
+        caller: CallerInfo(
+            pid: 72880,
+            startTime: 999_999,
+            description: "launcher [verified] for bash [unverified]"
+        ),
+        reason: "csec exec (1 protected file(s)) bash",
+        plan: DeliveryPlan(
+            mechanism: .capabilityGIDFile,
+            executable: PlannedExecutable(canonicalPath: "/bin/bash", assurance: .unverified),
+            root: .caller,
+            descendantScope: .subtree,
+            destination: .localDevelopment,
+            requestedTTLSeconds: 3600,
+            operationContext: "csec exec (1 protected file(s)) bash",
+            outputGuard: OutputGuardPlan(mode: .always)
+        ),
+        credentials: [credential(references: [
+            ref("op://Employee/Dexory Slack User Token/password"),
+        ])],
+        scopeChoices: GrantScopeChoices(
+            options: [
+                GrantScopeOption(
+                    kind: .requestingCommand, pid: 72880,
+                    startTime: 999_999, processLabel: "bash"
+                ),
+                GrantScopeOption(
+                    kind: .terminalSession, pid: 2589,
+                    startTime: 999_996, processLabel: "fish"
+                ),
+            ],
+            defaultOptionID: GrantScopeOption(
+                kind: .terminalSession, pid: 2589,
+                startTime: 999_996, processLabel: "fish"
             ).id
         )
     )

@@ -266,22 +266,25 @@ public actor Agent {
         // these references without another prompt. A per-command grant needs this
         // exact delivery-plan digest; a grant the human widened to an agent or
         // terminal session needs the same release shape (see
-        // `DeliveryPlan.releaseShapeDigest`). Capability-GID launches never reuse
-        // — each is a fresh two-party rendezvous whose new root must not outlive
-        // its authorization.
+        // `DeliveryPlan.releaseShapeDigest`).
+        //
+        // A capability-GID launch mints a new root of its own, so it may ride
+        // only a deliberately widened grant — never the incidental per-command
+        // grant its own outer launcher left behind, which would let a nested
+        // launch outlive the authorization that created it. Riding a widened one
+        // is exactly what the human chose, and exposes strictly less than the
+        // environment-injection mechanism the same choice already covers: the
+        // bytes reach a root-owned tmpfs behind a one-time capability GID, and
+        // never pass through the launcher.
         let releaseShapeDigest = try? plan.releaseShapeDigest()
-        let accessible: Set<String>
-        if plan.mechanism == .capabilityGIDFile {
-            accessible = []
-        } else {
-            accessible = await grants.accessibleReferences(
-                for: caller.pid,
-                now: now,
-                deliveryPlanDigest: planDigest,
-                releaseShapeDigest: releaseShapeDigest,
-                callerAuditSessionID: caller.peerIdentity?.audit.auditSessionID
-            )
-        }
+        let accessible = await grants.accessibleReferences(
+            for: caller.pid,
+            now: now,
+            deliveryPlanDigest: planDigest,
+            releaseShapeDigest: releaseShapeDigest,
+            callerAuditSessionID: caller.peerIdentity?.audit.auditSessionID,
+            widenedScopeOnly: plan.mechanism == .capabilityGIDFile
+        )
         let newReferenceURIs = Set(refs.map(\.uri)).subtracting(accessible)
 
         if newReferenceURIs.isEmpty {
@@ -327,18 +330,13 @@ public actor Agent {
                 .map(\.references)
         )
         // csecd — not the launcher — resolves which roots may be offered, by
-        // walking kernel ancestry above the already-verified plan root. A
-        // capability-GID rendezvous is deliberately single-use, so it is never
-        // offered a wider root.
-        let scopeChoices: GrantScopeChoices? =
-            plan.mechanism == .capabilityGIDFile
-            ? nil
-            : GrantScopeInspector.choices(
-                planRootPID: rootPID,
-                planRootStartTime: rootStartTime,
-                requestingLabel: scopeRequestingLabel(plan: plan, rootPID: rootPID),
-                inspection: processInspection
-            )
+        // walking kernel ancestry above the already-verified plan root.
+        let scopeChoices: GrantScopeChoices? = GrantScopeInspector.choices(
+            planRootPID: rootPID,
+            planRootStartTime: rootStartTime,
+            requestingLabel: scopeRequestingLabel(plan: plan, rootPID: rootPID),
+            inspection: processInspection
+        )
         let offersScopeChoice = (scopeChoices?.options.count ?? 0) > 1
         let review = AccessPolicyReview(
             caller: displayedCaller(
