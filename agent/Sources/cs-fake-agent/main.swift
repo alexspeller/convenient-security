@@ -109,6 +109,8 @@ let server = SocketServer(path: socketPath, clientTrustPolicy: .allowUnverifiedF
             message: "the standalone fake agent does not persist host triage",
             requestID: request.requestID
         )
+    case let .invalidateCachedReferences(request):
+        return await agent.invalidateCachedReferences(request: request, caller: caller)
     }
 }
 

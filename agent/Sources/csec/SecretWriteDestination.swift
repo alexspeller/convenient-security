@@ -53,8 +53,28 @@ func makeSecretWriteDestination(
             cliPath: cliPath,
             account: try selectOnePasswordAccount(cliPath: cliPath, vault: vault, item: item),
             vault: vault,
-            itemTitle: item
+            itemTitle: item,
+            client: client()
         )
+    }
+}
+
+/// After a value is (re)written, ask csecd to drop any cached resolution for the
+/// affected references so a later resolve returns the new value instead of a
+/// stale cache hit. A 1Password rotation done through `op` never reaches csecd,
+/// which would otherwise serve the pre-rotation value for up to 24h. Best-effort:
+/// the value is already durably stored, so a failure here is only a convenience
+/// regression (possible staleness until the cache entry expires), never a reason
+/// to fail the write. Reveals no value and raises no Touch ID.
+func invalidateResolvedCache(for references: [String], client: AgentClient) {
+    guard !references.isEmpty else { return }
+    do {
+        try client.invalidateCachedReferences(references)
+    } catch {
+        FileHandle.standardError.write(Data(
+            ("csec: note: could not refresh the agent's resolution cache; a running "
+             + "agent may serve the previous value until it expires "
+             + "(\(error.localizedDescription))\n").utf8))
     }
 }
 
@@ -153,6 +173,7 @@ struct NativeStoreWriteDestination: SecretWriteDestination {
         for name in values.keys {
             references[name] = try NativeSecretReference(store: store, key: name).uri
         }
+        invalidateResolvedCache(for: Array(references.values), client: client)
         return references
     }
 }
@@ -168,6 +189,7 @@ struct OnePasswordWriteDestination: SecretWriteDestination {
     let account: OnePasswordAccount?
     let vault: String
     let itemTitle: String
+    let client: AgentClient
 
     var summaryLine: String {
         let target = "1Password (op://\(vault)/\(itemTitle))"
@@ -216,6 +238,7 @@ struct OnePasswordWriteDestination: SecretWriteDestination {
             references[name] = OnePasswordItemWrite.reference(
                 vault: vault, title: itemTitle, field: name)
         }
+        invalidateResolvedCache(for: Array(references.values), client: client)
         return references
     }
 
