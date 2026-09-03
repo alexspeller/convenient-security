@@ -18,8 +18,11 @@ set -euo pipefail
 # csecd MUST be the main executable: the embedded profile only authorizes the
 # restricted keychain-access-groups entitlement for the main executable, and AMFI
 # SIGKILLs a secondary binary that claims it. csec is a plain signed CLI (no
-# restricted entitlements); run from inside the bundle it still sees Bundle.main =
-# this .app, so `csec install` registers the LaunchAgent via SMAppService.
+# restricted keychain entitlements). It carries only the Calendar capability
+# required when its supervised automation descendants use EventKit-backed
+# Calendar or Reminders tools; TCC permission remains user-granted. Run from
+# inside the bundle it still sees Bundle.main = this .app, so `csec install`
+# registers the LaunchAgent via SMAppService.
 #
 # Requires (same values as build-spike.sh):
 #   SIGN_IDENTITY  Developer ID for release, Apple Development for device testing
@@ -36,6 +39,7 @@ app="$here/build/ConvenientSecurity.app"
 label="com.alexspeller.convenient-security"
 root_helper="$here/build/csec-rootd"
 agent_entitlements="$here/agent/csecd.entitlements"
+launcher_entitlements="$here/agent/csec.entitlements"
 
 # CloudKit is an explicit release gate because enabling iCloud invalidates the
 # current Developer ID profile. The ordinary build stays usable until the App
@@ -76,8 +80,20 @@ cp "$root/LICENSE.md" "$app/Contents/Resources/LICENSE.md"
 cp "$here/agent/LaunchAgents/$label.plist" "$app/Contents/Library/LaunchAgents/$label.plist"
 cp "$PROFILE_PATH" "$app/Contents/embedded.provisionprofile"
 
-echo "--- signing inside-out: csec (secondary, no entitlements) first ---"
+for purpose_key in \
+  NSCalendarsUsageDescription \
+  NSCalendarsFullAccessUsageDescription \
+  NSRemindersUsageDescription \
+  NSRemindersFullAccessUsageDescription; do
+  if ! plutil -extract "$purpose_key" raw "$app/Contents/Info.plist" >/dev/null; then
+    echo "error: app Info.plist is missing privacy purpose string: $purpose_key" >&2
+    exit 1
+  fi
+done
+
+echo "--- signing inside-out: csec (secondary, Calendar automation entitlement) first ---"
 codesign --force --options runtime --timestamp \
+  --entitlements "$launcher_entitlements" \
   --identifier "com.alexspeller.convenient-security.csec" \
   --sign "$SIGN_IDENTITY" \
   "$app/Contents/MacOS/csec"
@@ -93,6 +109,13 @@ codesign --force --options runtime --timestamp \
   --entitlements "$agent_entitlements" \
   --sign "$SIGN_IDENTITY" \
   "$app"
+
+# Inspect the final nested signature after the enclosing bundle has been sealed.
+launcher_entitlements_output="$(codesign --display --entitlements - "$app/Contents/MacOS/csec" 2>&1)"
+if [[ "$launcher_entitlements_output" != *"com.apple.security.personal-information.calendars"* ]]; then
+  echo "error: signed csec is missing the Calendar automation entitlement" >&2
+  exit 1
+fi
 
 echo "--- signature (bundle / csecd main, must show keychain-access-groups) ---"
 codesign --display --verbose=2 --entitlements - "$app" 2>&1 || true

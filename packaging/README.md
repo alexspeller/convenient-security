@@ -50,8 +50,9 @@ Four structural rules, each load-bearing:
 - **`csecd` must be the bundle's main executable** (`CFBundleExecutable`). The
   embedded profile authorizes the restricted entitlement only for the main
   executable; a *secondary* binary that claims `keychain-access-groups` is
-  **SIGKILLed by AMFI at launch**. `csec` (no restricted entitlements) is the
-  secondary binary and runs fine.
+  **SIGKILLed by AMFI at launch**. `csec` has no restricted entitlements; its
+  only capability entitlement is Calendar access for supervised automation,
+  which remains subject to a separate user-granted TCC decision.
 - **The credential daemon remains a per-user LaunchAgent, never root.** The
   Secure Enclave, data-protection keychain, provider adapters, policy UI, and
   Touch ID are login-session-only. The separate LaunchDaemon has no provider,
@@ -296,7 +297,16 @@ the bundle context.
   System Settings → Privacy & Security → Full Disk Access. Without the grant the
   audit's privacy section degrades to `unknown` + Settings deep-links rather than
   failing or silently passing.
-- **Signing order** (`build-agent.sh`): sign `csec` (secondary, no entitlements),
+- **Automation privacy capability** (`packaging/agent/csec.entitlements`): the
+  signed launcher has the Calendar hardened-runtime entitlement required when
+  its supervised descendants use EventKit-backed Calendar or Reminders tools.
+  The bundle declares legacy and current Calendar/Reminders purpose strings.
+  Access remains denied until the user grants ConvenientSecurity permission in
+  System Settings. That TCC permission covers csec's responsible-process
+  identity across commands; it is not scoped to an automation job or secret
+  reference set.
+- **Signing order** (`build-agent.sh`): sign `csec` (secondary, only the Calendar
+  automation entitlement),
   sign standalone `csec-rootd` with identifier
   `com.alexspeller.convenient-security.rootd` and no entitlements, then sign the
   bundle — which signs `csecd` (the main executable) *with* the keychain

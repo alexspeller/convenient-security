@@ -62,6 +62,14 @@ its remaining ordinary environment. Users who cannot accept that boundary must
 not enroll it. Ordinary access remains time-bounded and unchanged. See
 [`automation.md`](automation.md).
 
+macOS attributes privacy access made by a supervised descendant to the signed
+`csec` launcher. The release launcher therefore carries the Calendar hardened-
+runtime entitlement needed by EventKit-backed Calendar and Reminders tools. A
+separate user-granted TCC decision is still required, but once granted it is an
+OS-level permission for csec's responsible-process identity rather than a
+per-job capability. Automation enrollment constrains secret references, command
+identity, overlap, interval, and runtime; it cannot subdivide that TCC grant.
+
 `csec session` makes a wider boundary explicit for callers that want one without
 the review window choosing it. The daemon records the
 signed launcher's kernel PID, process start time, and audit session before the

@@ -19,6 +19,15 @@ trigger environment. That still launches only the stored command, but because
 the command and its inputs are deliberately mutable, enrollment must treat such
 a process as able to exercise the registered job on demand.
 
+On macOS, privacy access used by a supervised command is attributed to the
+signed `csec` launcher. The release launcher carries the hardened-runtime
+Calendar entitlement so explicitly enrolled jobs may use EventKit-backed
+Calendar and Reminders tools, but it receives no access automatically: the user
+must separately approve ConvenientSecurity in System Settings. That TCC grant
+applies to any command launched under csec's responsible-process identity, not
+only to one automation job. Enrollment still limits which secret references a
+job can receive; it does not narrow an OS privacy grant by job name.
+
 ## Register and schedule a job
 
 Use the signed installed launcher for both enrollment and execution:

@@ -24,6 +24,17 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <!-- csec is the TCC-responsible process for explicitly enrolled automation
+         commands that it supervises. Keep both legacy (macOS 13) and current
+         full-access purpose keys because the supported OS range spans both. -->
+    <key>NSCalendarsUsageDescription</key>
+    <string>ConvenientSecurity runs explicitly enrolled automation that may read and update your calendars.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>ConvenientSecurity runs explicitly enrolled automation that may read and update your calendars.</string>
+    <key>NSRemindersUsageDescription</key>
+    <string>ConvenientSecurity runs explicitly enrolled automation that may read and update your reminders.</string>
+    <key>NSRemindersFullAccessUsageDescription</key>
+    <string>ConvenientSecurity runs explicitly enrolled automation that may read and update your reminders.</string>
     <!-- Background agent: no Dock icon or menu bar if the bundle is ever opened. -->
     <key>LSUIElement</key>
     <true/>
