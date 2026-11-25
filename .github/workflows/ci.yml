@@ -48,7 +48,7 @@ jobs:
       # the bridge's Go, mise's release binary checked against its published
       # SHA-256 (mise runs the XcodeGen pinned in .tool-versions) and ripgrep.
       - if: ${{ !github.event.repository.private }}
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: bridge/go.mod
           cache-dependency-path: bridge/go.sum
