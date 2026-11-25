@@ -1,0 +1,62 @@
+#!/bin/bash
+set -euo pipefail
+
+# Puts `csec` on PATH: LINK (/usr/local/bin/csec, a directory in the default
+# /etc/paths) becomes a symlink to TARGET, the installed app's launcher. csec
+# resolves the link to the launcher inside the app, so it behaves exactly as
+# the app's own copy. A LINK that is already this symlink is left as it is;
+# anything else there (another tool's csec, a link to a development build) is
+# never replaced, and this says so and still succeeds: PATH is a convenience
+# and must not fail the install. `csec setup` and `csec doctor` report it.
+
+if [ "$#" -ne 2 ]; then
+  echo "usage: link-command LINK TARGET" >&2
+  exit 64
+fi
+
+link="$1"
+target="$2"
+for path in "$link" "$target"; do
+  case "$path" in
+    /*) ;;
+    *)
+      echo "link-command: paths must be absolute" >&2
+      exit 1
+      ;;
+  esac
+done
+
+as_root=0
+[ "$(/usr/bin/id -u)" -ne 0 ] || as_root=1
+
+directory="$(/usr/bin/dirname "$link")"
+if [ ! -e "$directory" ] && [ ! -L "$directory" ]; then
+  if [ "$as_root" -eq 1 ]; then
+    /usr/bin/install -d -o root -g wheel -m 0755 "$directory"
+  else
+    /bin/mkdir -p -m 0755 "$directory"
+  fi
+fi
+[ -d "$directory" ] && [ ! -L "$directory" ] || {
+  echo "link-command: $directory is not a directory; csec was not put on PATH" >&2
+  exit 0
+}
+
+if [ -L "$link" ]; then
+  if [ "$(/usr/bin/readlink "$link")" = "$target" ]; then
+    echo "link-command: $link already links to $target"
+    exit 0
+  fi
+  echo "link-command: $link links somewhere else; left as it is" >&2
+  exit 0
+fi
+if [ -e "$link" ]; then
+  echo "link-command: $link is another file; left as it is" >&2
+  exit 0
+fi
+
+/bin/ln -s -- "$target" "$link"
+if [ "$as_root" -eq 1 ]; then
+  /usr/sbin/chown -h root:wheel "$link"
+fi
+echo "link-command: linked $link to $target"

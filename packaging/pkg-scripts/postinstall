@@ -1,0 +1,167 @@
+#!/bin/bash
+set -eu
+
+# Installer scripts run as root. Keep the language-client bridge outside the
+# admin-group-writable /Applications directory so same-uid malware cannot swap
+# the path Ruby executes before csecd gets a chance to authenticate it.
+bridge_root="/Library/Application Support/ConvenientSecurity"
+app="/Applications/ConvenientSecurity.app"
+script_directory="$(cd "$(dirname "$0")" && pwd)"
+# The team and identifier the package was built under: build-pkg.sh puts the
+# identity file and its reader beside these scripts.
+. "$script_directory/identity.sh"
+csec_identity_load "$script_directory/identity.xcconfig"
+root_label="$csec_identifier.rootd"
+root_helper="/Library/PrivilegedHelperTools/$root_label"
+root_plist="/Library/LaunchDaemons/$root_label.plist"
+# What `csec setup` installs from with no checkout: the guarded installers it
+# runs through sudo, and the sudo review's module and helper; and the
+# uninstaller `csec uninstall --all` runs through sudo.
+libexec="$bridge_root/libexec"
+sudo_payload="$bridge_root/sudo-review"
+setup_payload_files=(
+  "$libexec/install-codex-hook.sh"
+  "$libexec/install-sudo-review.sh"
+  "$libexec/sudo-review-policy.sh"
+  "$libexec/identity.sh"
+  "$libexec/identity.xcconfig"
+  "$sudo_payload/pam_csec_sudo.so"
+  "$sudo_payload/csec-sudo-review"
+  "$libexec/uninstall-csec.sh"
+)
+command_link="/usr/local/bin/csec"
+
+# By the time postinstall runs, the installer has already written the new
+# helper over the old one while the KeepAlive job keeps running, and launchd
+# would exec whatever is on disk at its next restart or at boot. A preinstall
+# cannot verify the payload (it is not extracted yet), so any failure from
+# here on stops the job and disables it; the next successful install's reload
+# enables it again.
+stop_unverified_root_helper() {
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "Convenient Security postinstall failed; stopping the root helper until a verified install" >&2
+    "$script_directory/reload-launch-daemon" --stop /bin/launchctl "$root_label" "$root_plist" || true
+  fi
+  exit "$status"
+}
+trap stop_unverified_root_helper EXIT
+[ ! -L "$bridge_root" ] && [ -d "$bridge_root/bin" ] \
+  && [ ! -L "$bridge_root/bin" ] && [ -f "$bridge_root/bin/csec" ] \
+  && [ ! -L "$bridge_root/bin/csec" ] || {
+    echo "Convenient Security bridge payload has an unsafe path shape" >&2
+    exit 1
+  }
+for directory in "$libexec" "$sudo_payload"; do
+  [ ! -L "$directory" ] && [ -d "$directory" ] || {
+    echo "Convenient Security setup payload has an unsafe path shape" >&2
+    exit 1
+  }
+done
+for payload_file in "${setup_payload_files[@]}"; do
+  [ ! -L "$payload_file" ] && [ -f "$payload_file" ] || {
+    echo "Convenient Security setup payload has an unsafe path shape" >&2
+    exit 1
+  }
+done
+[ ! -L "$app" ] && [ -d "$app" ] || {
+  echo "Convenient Security app payload has an unsafe path shape" >&2
+  exit 1
+}
+[ ! -L "$root_helper" ] && [ -f "$root_helper" ] \
+  && [ ! -L "$root_plist" ] && [ -f "$root_plist" ] || {
+    echo "Convenient Security root-helper payload has an unsafe path shape" >&2
+    exit 1
+  }
+/usr/sbin/chown -R root:wheel "$bridge_root"
+/bin/chmod 0755 "$bridge_root" "$bridge_root/bin" "$bridge_root/bin/csec"
+/bin/chmod 0755 "$libexec" "$sudo_payload" \
+  "$libexec/install-codex-hook.sh" "$libexec/install-sudo-review.sh" \
+  "$libexec/uninstall-csec.sh" \
+  "$sudo_payload/pam_csec_sudo.so" "$sudo_payload/csec-sudo-review"
+/bin/chmod 0644 "$libexec/sudo-review-policy.sh" "$libexec/identity.sh" "$libexec/identity.xcconfig"
+/usr/sbin/chown root:wheel "$root_helper" "$root_plist"
+/bin/chmod 0755 "$root_helper"
+/bin/chmod 0644 "$root_plist"
+
+for protected_path in \
+  / \
+  /Library \
+  "/Library/Application Support" \
+  "$bridge_root" \
+  "$bridge_root/bin" \
+  "$bridge_root/bin/csec" \
+  "$libexec" \
+  "$sudo_payload" \
+  "${setup_payload_files[@]}" \
+  /Library/PrivilegedHelperTools \
+  "$root_helper" \
+  /Library/LaunchDaemons \
+  "$root_plist"; do
+  owner="$(/usr/bin/stat -f %u "$protected_path")"
+  mode="$(/usr/bin/stat -f %Lp "$protected_path")"
+  if [ "$owner" != "0" ] || [ $((8#$mode & 022)) -ne 0 ]; then
+    echo "Convenient Security bridge path is not independently protected: $protected_path" >&2
+    exit 1
+  fi
+done
+
+# The app itself is still live-code authenticated on every connection, but root
+# ownership also prevents in-place modification of its signed contents.
+/usr/sbin/chown -R root:wheel "$app"
+
+/usr/bin/codesign --verify --strict "$bridge_root/bin/csec"
+/usr/bin/codesign --verify --deep --strict "$app"
+/usr/bin/codesign --verify --strict "$root_helper"
+/usr/bin/plutil -lint "$root_plist" >/dev/null
+
+product_requirement="$csec_product_requirement"
+/usr/bin/codesign --verify --strict \
+  -R="$product_requirement and identifier \"$csec_identifier.csec\"" \
+  "$bridge_root/bin/csec"
+/usr/bin/codesign --verify --deep --strict \
+  -R="$product_requirement and identifier \"$csec_identifier\"" \
+  "$app"
+/usr/bin/codesign --verify --strict \
+  -R="$product_requirement and identifier \"$root_label\"" \
+  "$root_helper"
+/usr/bin/codesign --verify --strict \
+  -R="$product_requirement and identifier \"$csec_identifier.sudo-review\"" \
+  "$sudo_payload/csec-sudo-review"
+/usr/bin/codesign --verify --strict \
+  -R="$product_requirement and identifier \"$csec_identifier.sudo-pam\"" \
+  "$sudo_payload/pam_csec_sudo.so"
+
+# Record the verified helper's and bridge's exact bytes in a root-owned
+# receipt, so a persistence watch can tell this upgrade from someone else
+# replacing either; both are launch targets it senses (the bridge through
+# any LaunchAgent that runs csec). The receipt sits beside the bridge, under parents
+# checked above.
+install_receipt="$bridge_root/install-receipt.json"
+"$script_directory/write-install-receipt" "$install_receipt" "$root_helper" "$bridge_root/bin/csec"
+receipt_owner="$(/usr/bin/stat -f %u "$install_receipt")"
+receipt_mode="$(/usr/bin/stat -f %Lp "$install_receipt")"
+if [ -L "$install_receipt" ] || [ ! -f "$install_receipt" ] \
+    || [ "$receipt_owner" != "0" ] || [ "$receipt_mode" != "644" ]; then
+  echo "Convenient Security install receipt is not root-owned 0644: $install_receipt" >&2
+  exit 1
+fi
+
+# Upgrade from the service manager's perspective only after every new path and
+# signature passes. bootout completes asynchronously, so the bounded helper
+# waits out launchd's removal transaction before loading the fixed plist.
+"$script_directory/reload-launch-daemon" /bin/launchctl "$root_label" "$root_plist"
+
+# The root helper is current; now every logged-in user's csecd, which would
+# otherwise keep running the replaced code until something restarted it. It
+# never fails the install (the payload above is verified); `csec doctor`
+# repairs whatever it could not.
+"$script_directory/restart-user-agents" /bin/launchctl /bin/ps /usr/bin/sudo /dev/console \
+  "$csec_identifier" "$app/Contents/MacOS/csecd" "$app/Contents/MacOS/csec" || true
+
+# Last, and never fatal: the helper is already verified and loaded, and a
+# missing PATH entry only means typing the launcher's full path.
+"$script_directory/link-command" "$command_link" "$app/Contents/MacOS/csec" ||
+  echo "Convenient Security could not put csec on PATH at $command_link" >&2
+
+exit 0

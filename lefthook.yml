@@ -1,0 +1,5 @@
+pre-commit:
+  commands:
+    no-todos:
+      tags: style
+      run: bin/check-staged-todos

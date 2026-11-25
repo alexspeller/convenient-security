@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A full run holds its runner for about an hour, so a commit a newer one has
+# superseded is not built on its own: the newer run's tree covers it. Per ref,
+# GitHub keeps the running run and cancels any older pending one; a push to a
+# pull request also stops its running one, but a running main run finishes, so
+# main keeps a complete result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# A public repository runs both jobs on GitHub-hosted macOS (docs/development.md,
+# "GitHub CI"). A private one runs them on its own self-hosted Mac, because
+# GitHub bills private hosted macOS minutes at ten times Linux's. A self-hosted
+# runner has its Mac's tools and sign-ins, and a pull request runs its own copy
+# of this file, so no condition here can keep a fork's code off it: never
+# register a self-hosted runner on a public repository. Only there, Dependabot's
+# pull requests, which carry third-party releases nobody has run yet, are not
+# built either.
+jobs:
+  swift-ruby-and-node:
+    if: ${{ !github.event.repository.private || (github.actor != 'dependabot[bot]' && github.event.pull_request.user.login != 'dependabot[bot]') }}
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'xcode-27' }}
+    # bin/ci takes about 55 minutes with no wait for the simulator (23 of them
+    # the iPhone UI tests), and the Build and test step lets the UI tests wait
+    # 30 more for a shared simulator admission. The rest is headroom for a
+    # loaded Mac or a cold Simulator base's first boot.
+    timeout-minutes: 120
+    steps:
+      # bin/release-manifest.py numbers a build by its commit count, so it and
+      # its tests refuse a shallow clone.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+      # A self-hosted Mac brings its own Go, mise and ripgrep; a hosted VM gets
+      # the bridge's Go, mise's release binary checked against its published
+      # SHA-256 (mise runs the XcodeGen pinned in .tool-versions) and ripgrep.
+      - if: ${{ !github.event.repository.private }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: bridge/go.mod
+          cache-dependency-path: bridge/go.sum
+      - name: Install mise and ripgrep
+        if: ${{ !github.event.repository.private }}
+        env:
+          MISE_VERSION: v2026.10.17
+          MISE_SHA256: 9e27709db5eb1e900d83149418d3067309f2a5004d4994d94246ab658ba4a3ce
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mise-bin"
+          curl --fail --silent --show-error --location --output "$RUNNER_TEMP/mise-bin/mise" \
+            "https://github.com/jdx/mise/releases/download/$MISE_VERSION/mise-$MISE_VERSION-macos-arm64"
+          echo "$MISE_SHA256  $RUNNER_TEMP/mise-bin/mise" | shasum -a 256 -c -
+          chmod +x "$RUNNER_TEMP/mise-bin/mise"
+          echo "$RUNNER_TEMP/mise-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/mise-bin/mise" install aqua:yonaskolb/XcodeGen
+          command -v rg >/dev/null || brew install ripgrep
+      # Runner bash steps do not read ~/.zshenv, where a Mac whose Command Line
+      # Tools are newer than its Xcode points SDKROOT at the selected Xcode's
+      # SDK: the /usr/bin shims' default SDK then breaks cgo and SwiftPM.
+      - name: Use the selected Xcode's SDK
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts
+      - name: Toolchain report
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+          ruby --version
+          node --version
+          npm --version
+          rg --version
+      - name: Build and test
+        # A shared simulator admission otherwise waits up to a day while the
+        # Mac is loaded. When it has not started in 30 minutes, bin/ci still
+        # runs every other check, then fails saying the UI tests did not run.
+        # A hosted VM needs no admission (bin/ci-ios-simulator.py).
+        env:
+          CSEC_CI_SIMULATOR_WAIT_S: 1800
+        run: bin/ci
+
+  node-minimum:
+    if: ${{ !github.event.repository.private || (github.actor != 'dependabot[bot]' && github.event.pull_request.user.login != 'dependabot[bot]') }}
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'xcode-27' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run test:unit --workspace=clients/node

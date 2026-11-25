@@ -1,0 +1,20 @@
+// The Apple team and identifier csec is built and signed under: the one place
+// to change them for a build under your own Apple developer account
+// (docs/guide/build-it-yourself.md). Every other name derives from these two:
+// the components' signing identifiers and bundle IDs (CSEC_IDENTIFIER plus
+// .csec, .rootd, .sudo-review, .sudo-pam, .opbridge, .pkg, .approval and the
+// others), the Keychain access group (CSEC_TEAM_ID.CSEC_IDENTIFIER), the
+// CloudKit container (iCloud.CSEC_IDENTIFIER), and the LaunchAgent,
+// LaunchDaemon, Keychain item and log names.
+//
+// Read by Xcode (ios/project.yml includes this file), by
+// packaging/lib/identity.sh for the build stages and the scripts the package
+// ships, by Fastlane and by the tests. Swift reads the generated
+// agent/Sources/CSECBuildIdentity/BuildIdentity.swift, which the build stages
+// rewrite from this file and bin/ci holds to it. Keep the format: comment
+// lines, blank lines and `NAME = value` lines only.
+
+// The 10-character Apple team ID (developer.apple.com, Membership details).
+CSEC_TEAM_ID = 8RS6GD89Y7
+// The reverse-DNS identifier prefix, registered as App IDs under that team.
+CSEC_IDENTIFIER = com.alexspeller.convenient-security

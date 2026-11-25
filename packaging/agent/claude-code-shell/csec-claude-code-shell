@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "${0%/Resources/claude-code-shell/csec-claude-code-shell}/MacOS/csec" ai --claude-code-shell "$@"

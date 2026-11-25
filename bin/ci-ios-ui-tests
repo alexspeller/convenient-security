@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# The foreground command inside bin/ci-ios-simulator.py's clone lease.
+set -euo pipefail
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ios_scratch=$1
+ios_device_description=$2
+ios_simulator="${SIMULATOR_RUN_UDID:?run through bin/ci-ios-simulator.py}"
+echo "Simulator: $ios_device_description ($ios_simulator)"
+ios_xcodebuild=(xcodebuild)
+if [ "${SIMULATOR_RUN_SET:?}" != default ]; then
+  ios_xcodebuild+=("-DVTSimulatorSetLocation=$SIMULATOR_RUN_SET")
+fi
+ios_bounded() {
+  local limit=$1
+  shift
+  /usr/bin/perl -e 'alarm shift; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n"' "$limit" "$@"
+}
+# macOS 27.2's AMFI kills Xcode 26's DTServiceHub, which resumes the
+# suspended test runner, so under Xcode 26 every run ends "hung before
+# establishing connection" after about sixteen minutes. The build below stays
+# on the selected Xcode, the shipping toolchain and SDK; the tests run on the
+# newest Xcode 27 or later installed beside it. A caller's DEVELOPER_DIR is
+# their choice and stays.
+ios_test_xcodebuild=("${ios_xcodebuild[@]}")
+ios_xcode_version() {
+  /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$1/Contents/version.plist" 2>/dev/null
+}
+ios_selected_developer="$(xcode-select -p 2>/dev/null || true)"
+ios_selected_version="$(ios_xcode_version "${ios_selected_developer%/Contents/Developer}" || true)"
+if [ -z "${DEVELOPER_DIR:-}" ] && [ -n "$ios_selected_version" ] && [ "${ios_selected_version%%.*}" -lt 27 ]; then
+  ios_test_xcode=
+  ios_test_version=
+  for ios_candidate in "${CSEC_CI_XCODE_SEARCH:-/Applications}"/Xcode*.app; do
+    [ -d "$ios_candidate/Contents/Developer" ] || continue
+    ios_candidate_version=$(ios_xcode_version "$ios_candidate") || continue
+    [ "${ios_candidate_version%%.*}" -ge 27 ] 2>/dev/null || continue
+    if [ -z "$ios_test_version" ] ||
+        [ "$(printf '%s\n%s\n' "$ios_test_version" "$ios_candidate_version" | sort -V | /usr/bin/tail -n 1)" = "$ios_candidate_version" ]; then
+      ios_test_xcode=$ios_candidate
+      ios_test_version=$ios_candidate_version
+    fi
+  done
+  if [ -n "$ios_test_xcode" ]; then
+    echo "UI tests run on $ios_test_xcode (Xcode $ios_test_version); the build used the selected Xcode $ios_selected_version"
+    ios_test_xcodebuild=(env "DEVELOPER_DIR=$ios_test_xcode/Contents/Developer" "${ios_xcodebuild[@]}")
+  else
+    IFS=. read -r ios_macos_major ios_macos_minor _ <<<"$(sw_vers -productVersion).0"
+    if [ "$ios_macos_major" -gt 27 ] || { [ "$ios_macos_major" -eq 27 ] && [ "$ios_macos_minor" -ge 2 ]; }; then
+      echo "macOS $(sw_vers -productVersion) refuses the selected Xcode $ios_selected_version's DTServiceHub, so its UI tests would hang before the runner connects: install Xcode 27 or later beside it in ${CSEC_CI_XCODE_SEARCH:-/Applications} or set DEVELOPER_DIR" >&2
+      exit 1
+    fi
+  fi
+fi
+# Signed ad hoc ("Sign to Run Locally"), which needs no team or profile:
+# the app's Keychain records need the entitlements an unsigned build lacks.
+ios_bounded 900 "${ios_xcodebuild[@]}" -quiet -jobs 2 \
+  -project "$repo_root/ios/ConvenientSecurityApproval.xcodeproj" \
+  -scheme ConvenientSecurityApproval \
+  -configuration Debug \
+  -destination "id=$ios_simulator" \
+  -derivedDataPath "$ios_scratch/DerivedData" \
+  build-for-testing CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= \
+  SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
+ios_uitest_log="$ios_scratch/ui-tests.log"
+# Each test is stopped after five minutes, and the whole run after an hour:
+# the run's bound catches a wedged Simulator or xcodebuild between tests. It
+# sits well above a loaded Mac's run: the 40-test suite took 32 minutes at a
+# load average near 250 on 10 CPUs and went past forty at one near 455.
+# A test's bound only catches one that wedges, so it is well above the
+# slowest test's time on a loaded Mac: the mailbox tests that set up, pair
+# and relaunch take a minute or more unloaded, and went past two minutes at
+# load averages of 160 to 250 on 10 CPUs.
+if ! ios_bounded 3600 "${ios_test_xcodebuild[@]}" test-without-building \
+    -project "$repo_root/ios/ConvenientSecurityApproval.xcodeproj" \
+    -scheme ConvenientSecurityApproval \
+    -destination "id=$ios_simulator" \
+    -derivedDataPath "$ios_scratch/DerivedData" \
+    -parallel-testing-enabled NO \
+    -test-timeouts-enabled YES \
+    -default-test-execution-time-allowance 300 \
+    -maximum-test-execution-time-allowance 300 \
+    >"$ios_uitest_log" 2>&1; then
+  # What a test could not find comes with the screen's accessibility tree.
+  grep -E -A120 '^UITEST: ' "$ios_uitest_log" >&2 || true
+  grep -E 'error:|^Test Case .* failed|\*\* TEST' "$ios_uitest_log" >&2 || true
+  /usr/bin/tail -n 30 "$ios_uitest_log" >&2
+  # The scratch log goes with the lease, so a run stopped by its bound says
+  # here how far the suite got.
+  echo "$(grep -c -E '^Test Case .* passed' "$ios_uitest_log" || true) test cases passed before the run ended" >&2
+  echo "iPhone UI tests failed (Simulator: $ios_device_description)" >&2
+  exit 1
+fi
+grep -E '^Test Case .* passed|^[[:space:]]+Executed [0-9]+ tests?,' "$ios_uitest_log" | /usr/bin/tail -n 20

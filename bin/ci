@@ -1,0 +1,2815 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+swift_scratch="${TMPDIR:-/tmp}/convenient-security-swift-cache"
+
+export CLANG_MODULE_CACHE_PATH="$swift_scratch/clang"
+export SWIFTPM_MODULECACHE_OVERRIDE="$swift_scratch/swiftpm"
+# The team and identifier the build is signed under (identity.xcconfig).
+# shellcheck source=../packaging/lib/identity.sh
+. "$repo_root/packaging/lib/identity.sh"
+csec_identity_load "$repo_root/identity.xcconfig"
+
+# One file per `bash -n`: given several, bash parses the first and treats the
+# rest as its arguments.
+for shell_script in \
+  "$repo_root/packaging/bin/build-and-install.sh" \
+  "$repo_root/packaging/bin/build-agent.sh" \
+  "$repo_root/packaging/bin/build-bridge.sh" \
+  "$repo_root/packaging/bin/build-pkg.sh" \
+  "$repo_root/packaging/bin/build-sudo-pam.sh" \
+  "$repo_root/packaging/bin/build-sudo-review.sh" \
+  "$repo_root/packaging/bin/build-spike.sh" \
+  "$repo_root/packaging/bin/install-sudo-review.sh" \
+  "$repo_root/packaging/bin/install-codex-hook.sh" \
+  "$repo_root/packaging/lib/asc-credentials.sh" \
+  "$repo_root/packaging/lib/sudo-review-policy.sh" \
+  "$repo_root/packaging/lib/identity.sh" \
+  "$repo_root/packaging/bin/notarize.sh" \
+  "$repo_root/packaging/bin/provision.sh" \
+  "$repo_root/packaging/bin/sample-sudo-review-activation.sh" \
+  "$repo_root/packaging/pkg-scripts/preinstall" \
+  "$repo_root/packaging/pkg-scripts/postinstall" \
+  "$repo_root/packaging/pkg-scripts/reload-launch-daemon" \
+  "$repo_root/packaging/pkg-scripts/restart-user-agents" \
+  "$repo_root/packaging/pkg-scripts/write-install-receipt" \
+  "$repo_root/packaging/pkg-scripts/link-command" \
+  "$repo_root/packaging/libexec/uninstall-csec.sh" \
+  "$repo_root/packaging/tests/fake-launchctl.sh" \
+  "$repo_root/bin/ci-ios-ui-tests" \
+  "$repo_root/bin/check-staged-todos"; do
+  bash -n "$shell_script"
+done
+
+echo "--- pre-commit guard for staged to-do markers ---"
+# The guard runs in a throwaway repository: a staged binary (a PNG header,
+# not UTF-8, with NULs) must not stop a clean commit, and a marker must be
+# refused in text and in binary content, even after a NUL on its line. The
+# marker is spelled in two halves so this file passes the guard itself.
+todo_marker="TO""DO"
+todo_repo="$(mktemp -d "${TMPDIR:-/tmp}/csec-todo-guard.XXXXXX")"
+todo_guard_status() {
+  local status=0
+  (cd "$todo_repo" && "$repo_root/bin/check-staged-todos") >/dev/null 2>&1 || status=$?
+  echo "$status"
+}
+git -C "$todo_repo" init -q
+printf '\211PNG\r\n\032\n\000\000\000\015IHDR\377\330 binary\n' > "$todo_repo/icon.png"
+printf 'plain text\n' > "$todo_repo/notes.txt"
+git -C "$todo_repo" add icon.png notes.txt
+todo_status="$(todo_guard_status)"
+if [ "$todo_status" != 0 ]; then
+  rm -rf "$todo_repo"
+  echo "bin/check-staged-todos refused a clean commit that stages a binary file (exit $todo_status)" >&2
+  exit 1
+fi
+for todo_case in "text" "binary"; do
+  git -C "$todo_repo" reset -q
+  git -C "$todo_repo" add icon.png notes.txt
+  if [ "$todo_case" = text ]; then
+    printf 'note: %s\n' "$todo_marker" > "$todo_repo/marked.txt"
+    git -C "$todo_repo" add marked.txt
+  else
+    rm -f "$todo_repo/marked.txt"
+    printf '\211\000 %s\n' "$todo_marker" > "$todo_repo/marked.bin"
+    git -C "$todo_repo" add marked.bin
+  fi
+  todo_status="$(todo_guard_status)"
+  if [ "$todo_status" != 1 ]; then
+    rm -rf "$todo_repo"
+    echo "bin/check-staged-todos did not refuse a marker in staged $todo_case content (exit $todo_status, expected 1)" >&2
+    exit 1
+  fi
+done
+rm -rf "$todo_repo"
+
+echo "--- build identity: identity.xcconfig alone names the Apple team and identifier ---"
+python3 "$repo_root/packaging/tests/test-identity.py"
+# Swift cannot read the xcconfig, so it reads a file generated from it. The
+# build stages rewrite that file; a checkout must carry the matching one.
+generated_identity="$repo_root/agent/Sources/CSECBuildIdentity/BuildIdentity.swift"
+if [ "$(/bin/cat "$generated_identity")" != "$(csec_identity_swift)" ]; then
+  echo "$generated_identity does not match identity.xcconfig; rewrite it with:" >&2
+  echo "  bash -c '. packaging/lib/identity.sh && csec_identity_load identity.xcconfig && csec_identity_write_swift ${generated_identity#"$repo_root/"}'" >&2
+  exit 1
+fi
+# Every other file derives the team and identifier, so a build under another
+# team changes one file. Markdown is prose about the official build.
+stray_identity="$(
+  git -C "$repo_root" grep --untracked -n -I -F -e "$csec_team_id" -e "$csec_identifier" -- \
+    ':!identity.xcconfig' ':!agent/Sources/CSECBuildIdentity/BuildIdentity.swift' ':!*.md' || true
+)"
+if [ -n "$stray_identity" ]; then
+  echo "the team ID or identifier is written outside identity.xcconfig; derive it instead:" >&2
+  echo "$stray_identity" >&2
+  exit 1
+fi
+
+echo "--- csec-op-bridge (Go: build, vet, tests) ---"
+go_bin="$(command -v go || true)"
+for candidate in "$HOME"/.local/share/mise/installs/go/*/bin/go; do
+  [ -x "$candidate" ] || continue
+  go_bin="$candidate"
+done
+if [ -n "$go_bin" ] && [ "$("$go_bin" env GOHOSTARCH)" = "$("$go_bin" env GOARCH)" ]; then
+  ( cd "$repo_root/bridge" && CGO_ENABLED=1 "$go_bin" build -o /dev/null ./... \
+      && CGO_ENABLED=1 "$go_bin" vet ./... \
+      && CGO_ENABLED=1 "$go_bin" test ./... )
+else
+  echo "error: no native Go toolchain; install one with: mise install go@1.24" >&2
+  exit 1
+fi
+
+# build-and-install.sh is the one script that installs anything: every shipping
+# component, the sudo integration and the iPhone app included, must appear in
+# its plan, the sudo stages must sit between the app build and the doctor gate,
+# and the iPhone stage must follow it.
+install_plan="$("$repo_root/packaging/bin/build-and-install.sh" --dry-run --refresh-profile)"
+for expected_step in \
+  "merge-base --is-ancestor origin/main HEAD" \
+  "merge-base --is-ancestor INSTALLED_CSECSourceCommit HEAD" \
+  "packaging/bin/provision.sh" \
+  "packaging/bin/notarize.sh --check-auth" \
+  "packaging/bin/build-agent.sh" \
+  "packaging/bin/build-sudo-pam.sh" \
+  "packaging/bin/build-sudo-review.sh" \
+  "packaging/bin/notarize.sh" \
+  "packaging/bin/build-pkg.sh" \
+  "/usr/bin/sudo /usr/sbin/installer" \
+  "/usr/bin/sudo /Library/Application\\ Support/ConvenientSecurity/libexec/install-sudo-review.sh" \
+  "/usr/bin/sudo /Library/Application\\ Support/ConvenientSecurity/libexec/install-codex-hook.sh" \
+  "packaging/bin/install-codex-hook.sh /Library/Application\\ Support/ConvenientSecurity/libexec/install-codex-hook.sh" \
+  "packaging/bin/install-sudo-review.sh /Library/Application\\ Support/ConvenientSecurity/libexec/install-sudo-review.sh" \
+  "packaging/lib/sudo-review-policy.sh /Library/Application\\ Support/ConvenientSecurity/libexec/sudo-review-policy.sh" \
+  "packaging/lib/identity.sh /Library/Application\\ Support/ConvenientSecurity/libexec/identity.sh" \
+  "identity.xcconfig /Library/Application\\ Support/ConvenientSecurity/libexec/identity.xcconfig" \
+  "packaging/build/sudo-pam/pam_csec_sudo.so /Library/Application\\ Support/ConvenientSecurity/sudo-review/pam_csec_sudo.so" \
+  "packaging/build/sudo-review/csec-sudo-review /Library/Application\\ Support/ConvenientSecurity/sudo-review/csec-sudo-review" \
+  "/usr/bin/readlink /usr/local/bin/csec" \
+  "/Applications/ConvenientSecurity.app/Contents/MacOS/csec hook-config codex --system" \
+  "packaging/build/ConvenientSecurity.app/Contents/Resources/ai-guard/op /Applications/ConvenientSecurity.app/Contents/Resources/ai-guard/op" \
+  "packaging/build/ConvenientSecurity.app/Contents/Resources/claude-code-shell/csec-claude-code-shell /Applications/ConvenientSecurity.app/Contents/Resources/claude-code-shell/csec-claude-code-shell" \
+  "packaging/build/codex-hooks.json /private/etc/codex/hooks.json" \
+  "packaging/build/sudo-review/csec-sudo-review /usr/local/libexec/csec-sudo-review" \
+  "packaging/build/sudo-pam/pam_csec_sudo.so /usr/local/lib/pam/pam_csec_sudo.so" \
+  "check_install_receipt" \
+  "/usr/bin/codesign --display --entitlements - --xml /Applications/ConvenientSecurity.app" \
+  "/Applications/ConvenientSecurity.app/Contents/MacOS/csec doctor" \
+  "/Applications/ConvenientSecurity.app/Contents/MacOS/csec doctor --runtime" \
+  "/Applications/ConvenientSecurity.app/Contents/MacOS/csec restore" \
+  "/Applications/ConvenientSecurity.app/Contents/MacOS/csec status" \
+  "-- xcodegen generate --quiet --spec" \
+  "/usr/bin/xcodebuild -quiet -jobs 2 -project" \
+  "-destination generic/platform=iOS -derivedDataPath" \
+  "-allowProvisioningUpdates -allowProvisioningDeviceRegistration" \
+  "/usr/bin/codesign --force --sign XCODE_SIGNING_IDENTITY_SHA1 --entitlements" \
+  "--timestamp=none --generate-entitlement-der" \
+  "/usr/bin/xcrun devicectl list devices --json-output" \
+  "/usr/bin/xcrun devicectl device install app --device" \
+  "/usr/bin/xcrun devicectl device info apps --device"; do
+  if [[ "$install_plan" != *"$expected_step"* ]]; then
+    echo "build-and-install dry run omitted: $expected_step" >&2
+    exit 1
+  fi
+done
+# One App Store Connect key delivery per install: the app's and the package's
+# notarizations, with the package built between them, are one notarize.sh run,
+# and nothing else in the plan notarizes or builds the package on its own.
+notarize_plan="$(printf '%s\n' "$install_plan" | rg '^\+ \S+/packaging/bin/(notarize|build-pkg)\.sh( |$)' || true)"
+if ! printf '%s\n' "$notarize_plan" | rg -q '^\+ \S+/packaging/bin/notarize\.sh --check-auth$' ||
+    ! printf '%s\n' "$notarize_plan" |
+      rg -q '^\+ \S+/packaging/bin/notarize\.sh \S+/ConvenientSecurity\.app --build-package \S+/packaging/bin/build-pkg\.sh \S+/ConvenientSecurity\.pkg$' ||
+    [ "$(printf '%s\n' "$notarize_plan" | wc -l | tr -d ' ')" != 2 ]; then
+  echo "build-and-install must notarize the app and the package under one key delivery:" >&2
+  printf '%s\n' "$notarize_plan" >&2
+  exit 1
+fi
+# The privileged stages run the package's own copies of the guarded
+# installers, the ones `csec setup` runs on a Mac with no checkout, so every
+# install here exercises a buyer's path; the copies are checked against the
+# checkout above.
+if ! printf '%s\n' "$install_plan" |
+    rg -q '^\+ /usr/bin/sudo /Library/Application\\ Support/ConvenientSecurity/libexec/install-sudo-review\.sh$'; then
+  echo "build-and-install must run the package's guarded sudo-integration installer through sudo" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$install_plan" |
+    rg -q '^\+ /usr/bin/sudo /Library/Application\\ Support/ConvenientSecurity/libexec/install-codex-hook\.sh$'; then
+  echo "build-and-install must run the package's guarded managed-Codex-hook installer through sudo" >&2
+  exit 1
+fi
+if [[ "$install_plan" == *"sudo /Applications/ConvenientSecurity.app/Contents/MacOS/csec install"* ]]; then
+  echo "build-and-install must not register the per-user agent with sudo" >&2
+  exit 1
+fi
+# The checkout is checked for every commit on origin/main, and for the commit
+# the installed csec was built from, before anything is built, so an unpulled
+# or older checkout never installs an older csec over a newer one.
+# The sudo stage follows the package install (the module's redactor is the
+# installed csec), after runtime repair but before the complete doctor gate.
+# The installed csecd's CloudKit signature is checked with the payloads. The
+# iPhone app is built; its notification extension and then the app are
+# re-signed without get-task-allow; both signatures are checked (CloudKit, and
+# no get-task-allow); and the app is installed and read back only once the Mac
+# side has passed doctor and status.
+ruby -e '
+  plan = ARGV.fetch(0)
+  order = ["merge-base --is-ancestor origin/main HEAD",
+           "merge-base --is-ancestor INSTALLED_CSECSourceCommit HEAD", "notarize.sh --check-auth",
+           "build-agent.sh", "build-sudo-pam.sh", "build-sudo-review.sh",
+           "/usr/sbin/installer", "csec doctor --runtime\n", "csec restore\n",
+           "/usr/bin/sudo /Library/Application\\ Support/ConvenientSecurity/libexec/install-codex-hook.sh\n",
+           "/usr/bin/sudo /Library/Application\\ Support/ConvenientSecurity/libexec/install-sudo-review.sh\n",
+           "/Applications/ConvenientSecurity.app/Contents/MacOS/csecd\n",
+           "--entitlements - --xml /Applications/ConvenientSecurity.app\n",
+           "check_install_receipt", "hook-config codex --system\n",
+           "/private/etc/codex/hooks.json\n", "csec doctor\n", "csec status\n",
+           "-- xcodegen generate", "/usr/bin/xcodebuild",
+           %r{^\+ /usr/bin/codesign --display --extract-certificates=\S+ --entitlements - --xml \S+/ConvenientSecurityApprovalNotifications\.appex$},
+           %r{^\+ /usr/bin/codesign --force --sign \S+ .*--generate-entitlement-der \S+/ConvenientSecurityApprovalNotifications\.appex$},
+           %r{^\+ /usr/bin/codesign --display --extract-certificates=\S+ --entitlements - --xml \S+/Debug-iphoneos/ConvenientSecurityApproval\.app$},
+           %r{^\+ /usr/bin/codesign --force --sign \S+ .*--generate-entitlement-der \S+/Debug-iphoneos/ConvenientSecurityApproval\.app$},
+           %r{^\+ /usr/bin/codesign --display --entitlements - --xml \S+/ConvenientSecurityApprovalNotifications\.appex$},
+           %r{^\+ /usr/bin/codesign --display --entitlements - --xml \S+/Debug-iphoneos/ConvenientSecurityApproval\.app$},
+           "devicectl list devices", "devicectl device install app",
+           "devicectl device info apps", "Dry run complete"]
+  positions = order.map { |step| plan.index(step) or abort "build-and-install dry run omitted: #{step}" }
+  abort "build-and-install stages are out of order" unless positions == positions.sort
+' "$install_plan"
+python3 "$repo_root/packaging/tests/test-build-and-install.py"
+python3 "$repo_root/packaging/tests/test-uninstall-csec.py"
+python3 "$repo_root/packaging/tests/test-profile-preflight.py"
+python3 "$repo_root/packaging/tests/test-asc-credentials.py"
+python3 "$repo_root/bin/test-ci-ios-simulator.py"
+python3 "$repo_root/bin/test-publish-snapshot.py"
+python3 "$repo_root/bin/test-check-claude-release.py"
+python3 "$repo_root/packaging/tests/test-release-packaging.py"
+python3 "$repo_root/bin/test-release-manifest.py"
+# VERSION is the release being built; a release is tagged vMAJOR.MINOR.PATCH,
+# and the next one must not number below the newest tag (a checkout without
+# the tags skips this).
+python3 - "$repo_root" <<'PY'
+import re
+import subprocess
+import sys
+
+root = sys.argv[1]
+pattern = re.compile(r"^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$")
+with open(f"{root}/VERSION") as handle:
+    text = handle.read()
+version = text.strip()
+if text != version + "\n" or not pattern.match(version):
+    sys.exit(f"VERSION must be one MAJOR.MINOR.PATCH line, not {text!r}")
+tags = subprocess.run(["git", "-C", root, "tag", "--list", "v*"], check=True, text=True,
+                      stdout=subprocess.PIPE).stdout.split()
+released = [tuple(map(int, tag[1:].split("."))) for tag in tags if pattern.match(tag[1:])]
+if released and tuple(map(int, version.split("."))) < max(released):
+    newest = ".".join(map(str, max(released)))
+    sys.exit(f"VERSION {version} is below the newest release tag v{newest}")
+PY
+skip_sudo_plan="$("$repo_root/packaging/bin/build-and-install.sh" --dry-run --skip-sudo)"
+# --skip-sudo leaves the installed integration alone, but the package still
+# carries the sudo payload csec setup installs from, so it is still built.
+if [[ "$skip_sudo_plan" == *"/usr/bin/sudo /Library/Application\ Support/ConvenientSecurity/libexec/install-sudo-review.sh"* ]] ||
+    [[ "$skip_sudo_plan" == *" /usr/local/lib/pam/pam_csec_sudo.so"* ]] ||
+    [[ "$skip_sudo_plan" != *"packaging/bin/build-sudo-pam.sh"* ]] ||
+    [[ "$skip_sudo_plan" != *"packaging/bin/build-sudo-review.sh"* ]]; then
+  echo "build-and-install --skip-sudo must omit the sudo install stage and still build the package's sudo payload" >&2
+  exit 1
+fi
+if [[ "$skip_sudo_plan" != *"install-codex-hook.sh"* ]]; then
+  echo "build-and-install --skip-sudo must still install the managed Codex hook" >&2
+  exit 1
+fi
+skip_iphone_plan="$("$repo_root/packaging/bin/build-and-install.sh" --dry-run --skip-iphone)"
+if [[ "$skip_iphone_plan" == *"xcodegen"* ]] || [[ "$skip_iphone_plan" == *"xcodebuild"* ]] ||
+    [[ "$skip_iphone_plan" == *"devicectl"* ]]; then
+  echo "build-and-install --skip-iphone must omit the iPhone stage" >&2
+  exit 1
+fi
+if [[ "$skip_iphone_plan" != *"/usr/bin/sudo /Library/Application\ Support/ConvenientSecurity/libexec/install-sudo-review.sh"* ]] ||
+    [[ "$skip_iphone_plan" != *"/Applications/ConvenientSecurity.app/Contents/MacOS/csec status"* ]]; then
+  echo "build-and-install --skip-iphone must still install and verify the Mac" >&2
+  exit 1
+fi
+# The package ships its own uninstaller (csec uninstall --all), and the
+# install verifies the installed copy is this checkout's.
+if [[ "$skip_iphone_plan" != *"/packaging/libexec/uninstall-csec.sh /Library/Application\ Support/ConvenientSecurity/libexec/uninstall-csec.sh"* ]]; then
+  echo "build-and-install must verify the installed package uninstaller" >&2
+  exit 1
+fi
+# The sudo integration's removal is the guarded sudo stage in reverse, run
+# through sudo, and builds or installs nothing else.
+uninstall_sudo_plan="$("$repo_root/packaging/bin/build-and-install.sh" --dry-run --uninstall-sudo)"
+if ! printf '%s\n' "$uninstall_sudo_plan" |
+      rg -q '^\+ /usr/bin/sudo \S+/packaging/bin/install-sudo-review\.sh --uninstall$' ||
+    printf '%s\n' "$uninstall_sudo_plan" |
+      rg -q '/packaging/bin/(build-[a-z-]+|notarize|provision|install-codex-hook)\.sh|/usr/sbin/installer|devicectl|csec (doctor|restore)'; then
+  echo "build-and-install --uninstall-sudo must run the guarded removal through sudo and nothing else" >&2
+  exit 1
+fi
+only_iphone_plan="$("$repo_root/packaging/bin/build-and-install.sh" --dry-run --only-iphone)"
+if [[ "$only_iphone_plan" == *"notarize.sh"* ]] || [[ "$only_iphone_plan" == *"installer"* ]] ||
+    [[ "$only_iphone_plan" == *"csec doctor"* ]] ||
+    [[ "$only_iphone_plan" == *"csec restore"* ]] ||
+    [[ "$only_iphone_plan" != *"devicectl device install app"* ]]; then
+  echo "build-and-install --only-iphone must run the iPhone stage and nothing else" >&2
+  exit 1
+fi
+# The managed Codex hook path is named by the setup/doctor inspection, the root
+# stage, and the payload verification; they must agree.
+if ! rg -F -q 'codexSystemHookPath = "/etc/codex/hooks.json"' \
+      "$repo_root/agent/Sources/ConvenientSecurity/SetupOnboarding.swift" ||
+    ! rg -F -q 'destination_directory="/private/etc/codex"' \
+      "$repo_root/packaging/bin/install-codex-hook.sh" ||
+    ! rg -F -q 'installed_codex_hook="/private/etc/codex/hooks.json"' \
+      "$repo_root/packaging/bin/build-and-install.sh"; then
+  echo "the Codex hook inspection, installer, and payload verification must agree on /etc/codex/hooks.json" >&2
+  exit 1
+fi
+# The package's setup payload is named by setup and doctor (PackagePayload),
+# staged by build-pkg.sh, verified by postinstall, recognised by the sudo
+# installer as its installed self, and run and checked by build-and-install;
+# they must agree, and the sudo payload's signing identifiers with them.
+package_payload_swift="$repo_root/agent/Sources/ConvenientSecurity/PackagePayload.swift"
+if ! rg -F -q 'supportDirectory = "/Library/Application Support/ConvenientSecurity"' "$package_payload_swift" ||
+    ! rg -F -q 'codexHookInstaller = supportDirectory + "/libexec/install-codex-hook.sh"' "$package_payload_swift" ||
+    ! rg -F -q 'sudoReviewInstaller = supportDirectory + "/libexec/install-sudo-review.sh"' "$package_payload_swift" ||
+    ! rg -F -q 'sudoModule = supportDirectory + "/sudo-review/pam_csec_sudo.so"' "$package_payload_swift" ||
+    ! rg -F -q 'sudoHelper = supportDirectory + "/sudo-review/csec-sudo-review"' "$package_payload_swift" ||
+    ! rg -F -q 'commandLinkPath = "/usr/local/bin/csec"' "$package_payload_swift" ||
+    ! rg -F -q 'support="$stage/Library/Application Support/ConvenientSecurity"' "$repo_root/packaging/bin/build-pkg.sh" ||
+    ! rg -F -q 'cp "$here/bin/install-codex-hook.sh" "$support/libexec/install-codex-hook.sh"' "$repo_root/packaging/bin/build-pkg.sh" ||
+    ! rg -F -q 'cp "$here/bin/install-sudo-review.sh" "$support/libexec/install-sudo-review.sh"' "$repo_root/packaging/bin/build-pkg.sh" ||
+    ! rg -F -q 'cp "$here/lib/sudo-review-policy.sh" "$support/libexec/sudo-review-policy.sh"' "$repo_root/packaging/bin/build-pkg.sh" ||
+    ! rg -F -q 'cp "$identity_library" "$support/libexec/identity.sh"' "$repo_root/packaging/bin/build-pkg.sh" ||
+    ! rg -F -q 'cp "$identity_file" "$support/libexec/identity.xcconfig"' "$repo_root/packaging/bin/build-pkg.sh" ||
+    ! rg -F -q '"$libexec/identity.xcconfig"' "$repo_root/packaging/pkg-scripts/postinstall" ||
+    ! rg -F -q 'cp "$sudo_module" "$support/sudo-review/pam_csec_sudo.so"' "$repo_root/packaging/bin/build-pkg.sh" ||
+    ! rg -F -q 'cp "$sudo_helper" "$support/sudo-review/csec-sudo-review"' "$repo_root/packaging/bin/build-pkg.sh" ||
+    ! rg -F -q 'libexec="$bridge_root/libexec"' "$repo_root/packaging/pkg-scripts/postinstall" ||
+    ! rg -F -q 'sudo_payload="$bridge_root/sudo-review"' "$repo_root/packaging/pkg-scripts/postinstall" ||
+    ! rg -F -q 'package_support="/Library/Application Support/ConvenientSecurity"' "$repo_root/packaging/bin/install-sudo-review.sh" ||
+    ! rg -F -q 'if [[ "$script_directory" == "$package_support/libexec" ]]; then' "$repo_root/packaging/bin/install-sudo-review.sh" ||
+    ! rg -F -q 'source_module="$package_support/sudo-review/pam_csec_sudo.so"' "$repo_root/packaging/bin/install-sudo-review.sh" ||
+    ! rg -F -q 'source_helper="$package_support/sudo-review/csec-sudo-review"' "$repo_root/packaging/bin/install-sudo-review.sh" ||
+    ! rg -F -q 'installed_support="/Library/Application Support/ConvenientSecurity"' "$repo_root/packaging/bin/build-and-install.sh"; then
+  echo "setup, doctor, build-pkg, postinstall, the sudo installer and build-and-install must agree on the package's setup payload" >&2
+  exit 1
+fi
+for signed_payload in \
+    "$repo_root/packaging/bin/build-pkg.sh" \
+    "$repo_root/packaging/pkg-scripts/postinstall" \
+    "$repo_root/packaging/bin/install-sudo-review.sh"; do
+  if ! rg -F -q 'identifier \"$csec_identifier.sudo-pam\"' "$signed_payload"; then
+    echo "$signed_payload must require the PAM module's product signing identifier" >&2
+    exit 1
+  fi
+done
+if ! rg -F -q 'module_identifier="$csec_identifier.sudo-pam"' \
+    "$repo_root/packaging/bin/build-sudo-pam.sh"; then
+  echo "build-sudo-pam.sh must sign the module as $csec_identifier.sudo-pam" >&2
+  exit 1
+fi
+if [ -e "$repo_root/packaging/bin/install-sudo-pam.sh" ]; then
+  echo "install-sudo-pam.sh was folded into install-sudo-review.sh; do not add independent install scripts" >&2
+  exit 1
+fi
+
+# Every signed build carries the CloudKit entitlement, but SwiftPM builds
+# (cs-selftest, cs-e2e, a locally run csecd) have none. Constructing CKContainer
+# without it is a process-terminating programmer error on macOS, not a
+# throwable availability failure, so startup must use the entitlement gate.
+if ! rg -F -q 'CloudKitRemoteApprovalRelay.makeIfEntitled(' \
+  "$repo_root/agent/Sources/csecd/AgentRuntime.swift"; then
+  echo "csecd must gate optional CloudKit relay construction from signed entitlements" >&2
+  exit 1
+fi
+# One entitlements file signs csecd, remote-approval capable in every build.
+# The opt-in switch and its per-environment entitlement files are gone.
+remote_approval_opt_in="$(
+  rg -l 'CSEC_REMOTE_APPROVAL' "$repo_root/packaging" "$repo_root/bin" -g '!ci' || true
+)"
+if [ -n "$remote_approval_opt_in" ] ||
+    [ -n "$(/usr/bin/find "$repo_root/packaging/agent" -name 'csecd.*.entitlements' -print)" ]; then
+  echo "csecd is signed with packaging/agent/csecd.entitlements alone; remove the remote-approval opt-in:" >&2
+  echo "$remote_approval_opt_in" >&2
+  exit 1
+fi
+postinstall_requirement_checks="$(
+  rg -F -c -- '-R="$product_requirement and identifier' \
+    "$repo_root/packaging/pkg-scripts/postinstall" || true
+)"
+if [ "$postinstall_requirement_checks" != "5" ]; then
+  echo "postinstall must pass each codesign test requirement as one -R=<requirement> argument" >&2
+  exit 1
+fi
+if ! rg -F -q 'reload-launch-daemon" /bin/launchctl' \
+  "$repo_root/packaging/pkg-scripts/postinstall"; then
+  echo "postinstall must use the bounded LaunchDaemon reload helper" >&2
+  exit 1
+fi
+# A persistence watch that reads it credits a changed root helper or bridge only
+# against this root-owned receipt; without it every csec install reads as
+# malware drift.
+if ! rg -F -q 'write-install-receipt" "$install_receipt" "$root_helper" "$bridge_root/bin/csec"' \
+  "$repo_root/packaging/pkg-scripts/postinstall"; then
+  echo "postinstall must record the installed root helper and bridge in its install receipt" >&2
+  exit 1
+fi
+
+# Reproduce the launchd upgrade race deterministically: bootout returns while
+# the old job is still visible, then the first bootstrap is rejected even after
+# print stops finding it. The reload must wait, retry, and kickstart once.
+(
+  launchd_test_root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/csec-launchd-test.XXXXXX")"
+  trap '/bin/rm -rf "$launchd_test_root"' EXIT
+  echo loaded >"$launchd_test_root/state"
+  export CSEC_FAKE_LAUNCHCTL_STATE="$launchd_test_root"
+  "$repo_root/packaging/pkg-scripts/reload-launch-daemon" \
+    "$repo_root/packaging/tests/fake-launchctl.sh" \
+    com.example.csec.synthetic \
+    /tmp/com.example.csec.synthetic.plist
+  [ "$(/bin/cat "$launchd_test_root/state")" = "loaded" ]
+  [ "$(/bin/cat "$launchd_test_root/bootstrap-attempts")" = "2" ]
+  [ "$(/bin/cat "$launchd_test_root/kickstarts")" = "1" ]
+)
+
+# A failed postinstall leaves the new, unverified helper on disk, so its EXIT
+# trap must stop the job and disable it (a reboot must not load it either), and
+# the next successful install's reload must enable it again before bootstrap.
+if ! rg -F -q 'trap stop_unverified_root_helper EXIT' \
+    "$repo_root/packaging/pkg-scripts/postinstall" \
+  || ! rg -F -q 'reload-launch-daemon" --stop /bin/launchctl "$root_label" "$root_plist"' \
+    "$repo_root/packaging/pkg-scripts/postinstall"; then
+  echo "postinstall must stop and disable the root helper when any step fails" >&2
+  exit 1
+fi
+(
+  launchd_test_root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/csec-launchd-test.XXXXXX")"
+  trap '/bin/rm -rf "$launchd_test_root"' EXIT
+  echo loaded >"$launchd_test_root/state"
+  export CSEC_FAKE_LAUNCHCTL_STATE="$launchd_test_root"
+  "$repo_root/packaging/pkg-scripts/reload-launch-daemon" --stop \
+    "$repo_root/packaging/tests/fake-launchctl.sh" \
+    com.example.csec.synthetic \
+    /tmp/com.example.csec.synthetic.plist
+  case "$(/bin/cat "$launchd_test_root/state")" in
+    unloaded | unloaded-transient) ;;
+    *) echo "reload-launch-daemon --stop left the job loaded" >&2; exit 1 ;;
+  esac
+  [ "$(/bin/cat "$launchd_test_root/disabled")" = "yes" ]
+  [ ! -e "$launchd_test_root/bootstrap-attempts" ]
+  [ ! -e "$launchd_test_root/kickstarts" ]
+  "$repo_root/packaging/pkg-scripts/reload-launch-daemon" \
+    "$repo_root/packaging/tests/fake-launchctl.sh" \
+    com.example.csec.synthetic \
+    /tmp/com.example.csec.synthetic.plist
+  [ "$(/bin/cat "$launchd_test_root/disabled")" = "no" ]
+  [ "$(/bin/cat "$launchd_test_root/state")" = "loaded" ]
+  [ "$(/bin/cat "$launchd_test_root/kickstarts")" = "1" ]
+)
+
+# The package puts csec on PATH last and never fatally: by then the root
+# helper is verified and loaded, and a failed link must not stop it. The link
+# is made when the name is free, kept when it is already csec's, and anything
+# else holding the name (another tool, a link to a development build) is
+# never replaced.
+if ! rg -F -q '"$script_directory/link-command" "$command_link" "$app/Contents/MacOS/csec" ||' \
+    "$repo_root/packaging/pkg-scripts/postinstall" ||
+  ! rg -F -q 'command_link="/usr/local/bin/csec"' "$repo_root/packaging/pkg-scripts/postinstall" ||
+  ! rg -F -q 'command_link="/usr/local/bin/csec"' "$repo_root/packaging/bin/build-and-install.sh"; then
+  echo "postinstall must link /usr/local/bin/csec through link-command without failing the install" >&2
+  exit 1
+fi
+(
+  link_test_root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/csec-link-test.XXXXXX")"
+  trap '/bin/rm -rf "$link_test_root"' EXIT
+  link_command="$repo_root/packaging/pkg-scripts/link-command"
+  launcher="/Applications/ConvenientSecurity.app/Contents/MacOS/csec"
+  # A missing directory is created, then the name linked.
+  "$link_command" "$link_test_root/usr/local/bin/csec" "$launcher" >/dev/null
+  [ "$(/usr/bin/readlink "$link_test_root/usr/local/bin/csec")" = "$launcher" ]
+  # Already csec's: kept.
+  "$link_command" "$link_test_root/usr/local/bin/csec" "$launcher" | rg -q 'already links'
+  [ "$(/usr/bin/readlink "$link_test_root/usr/local/bin/csec")" = "$launcher" ]
+  # A link elsewhere and a regular file are left alone, and neither fails.
+  /bin/ln -s /opt/other/csec "$link_test_root/usr/local/bin/other-link"
+  "$link_command" "$link_test_root/usr/local/bin/other-link" "$launcher" 2>&1 | rg -q 'left as it is'
+  [ "$(/usr/bin/readlink "$link_test_root/usr/local/bin/other-link")" = /opt/other/csec ]
+  echo 'another tool' >"$link_test_root/usr/local/bin/other-file"
+  "$link_command" "$link_test_root/usr/local/bin/other-file" "$launcher" 2>&1 | rg -q 'left as it is'
+  [ "$(/bin/cat "$link_test_root/usr/local/bin/other-file")" = 'another tool' ]
+  # A relative path is refused before anything is touched.
+  if "$link_command" relative/csec "$launcher" 2>/dev/null; then
+    echo "link-command accepted a relative path" >&2
+    exit 1
+  fi
+)
+python3 "$repo_root/packaging/tests/test-distribution.py"
+
+# Policy review hops from the socket handler to MainActor. A top-level await
+# makes Swift run this entry point as one async main-actor job; blocking that job
+# in NSApplication.run() then prevents every review window from appearing.
+csecd_entrypoint="$repo_root/agent/Sources/csecd/main.swift"
+if rg -q '^await\b' "$csecd_entrypoint"; then
+  echo "csecd main.swift must stay synchronous; move async startup into AgentRuntime.swift" >&2
+  exit 1
+fi
+csecd_event_loops="$(rg -c '^application\.run\(\)$' "$csecd_entrypoint" || true)"
+csecd_detached_starts="$(
+  rg -F -c 'Task.detached(priority: .userInitiated)' "$csecd_entrypoint" || true
+)"
+if [ "$csecd_event_loops" != "1" ] || [ "$csecd_detached_starts" != "1" ]; then
+  echo "csecd must start its async runtime separately from the synchronous AppKit loop" >&2
+  exit 1
+fi
+trusted_review="$repo_root/agent/Sources/ConvenientSecurity/TrustedAccessReviewSession.swift"
+sudo_review="$repo_root/agent/Sources/ConvenientSecurity/SudoAuthorizationReview.swift"
+if rg -q 'authorizeButton|authorizePressed' "$trusted_review" "$sudo_review"; then
+  echo "embedded Touch ID must not be gated by a preliminary authorize button" >&2
+  exit 1
+fi
+# Every control an approval panel builds is registered with its grace period
+# where it is built, so a new button or selector cannot slip past the typing
+# guard: the two counts must stay equal in each panel file.
+for panel in "$trusted_review" "$sudo_review"; do
+  built="$(rg -c 'NSButton\(|NSPopUpButton\(' "$panel" || true)"
+  registered="$(rg -c 'interactiveControls\.append\(' "$panel" || true)"
+  if [ -z "$built" ] || [ "$built" != "$registered" ]; then
+    echo "$(basename "$panel"): every control must be appended to interactiveControls where it is built (${built:-0} built, ${registered:-0} registered)" >&2
+    exit 1
+  fi
+done
+# A Touch ID prompt cancelled behind the lock screen is never a human decision —
+# the panel is not reachable — so every approval panel must route its failure
+# through ScreenLockState and re-present on a rebuilt context after unlock,
+# rather than denying or falling through to a password prompt.
+for panel in "$trusted_review" "$sudo_review"; do
+  if ! rg -q 'ScreenLockState\.action\(' "$panel" ||
+    ! rg -q 'rebuildAuthenticationContext\(' "$panel"; then
+    echo "$(basename "$panel"): a prompt cancelled while the screen is locked must wait for unlock and re-present on a fresh context" >&2
+    exit 1
+  fi
+  # One wait text, which PromptUnlockRecheckProbe looks for on every surface.
+  if ! rg -q 'statusLabel\.stringValue = ScreenLockState\.waitingForUnlockText' "$panel"; then
+    echo "$(basename "$panel"): the unlock wait must say ScreenLockState.waitingForUnlockText" >&2
+    exit 1
+  fi
+done
+# Touch ID reaches only the key panel, and the evaluation registered last owns
+# the sensor, stranding the others for good (ReviewFocusRecovery). So every
+# approval panel routes its key changes through ReviewFocusRecovery; when it is
+# key again after losing key it holds its controls back at once behind a guard
+# whose focus step never activates the process (two armed panels that each took
+# the focus back would trade it forever), and one run-loop turn later, if it is
+# still key, it renews Touch ID on a rebuilt context (after the requester check,
+# on the csecd surfaces). A callback from an evaluation the panel has replaced is
+# dropped by generation.
+for panel in "$trusted_review" "$sudo_review"; do
+  ruby -e '
+    source = File.read(ARGV.fetch(0))
+    name = File.basename(ARGV.fetch(0))
+    body = ->(signature) { source[/#{Regexp.escape(signature)} \{\n.*?\n    }\n/m] }
+    in_order = ->(text, steps, what) {
+      positions = steps.map { |step| text.index(step) }
+      abort "#{name}: #{what} must run, in order: #{steps.join(" ")}" unless
+        positions.all? && positions == positions.sort
+    }
+    resign = body.("func windowDidResignKey(_ notification: Notification)")
+    abort "#{name}: windowDidResignKey must follow ReviewFocusRecovery.onResignKey" unless
+      resign && resign.include?("ReviewFocusRecovery.onResignKey(") &&
+      resign.include?("ReviewFocusRecovery.clickToResumeText")
+    become = body.("func windowDidBecomeKey(_ notification: Notification)")
+    abort "#{name}: windowDidBecomeKey is missing" unless become
+    in_order.(become, ["ReviewFocusRecovery.onBecomeKey(", "== .rearm",
+      "PromptInteractionGrace.refocusIfStillKey(", "grace.begin()",
+      "DispatchQueue.main.async", "renewAfterBecomingKey()"], "windowDidBecomeKey")
+    renew = body.("private func renewAfterBecomingKey()")
+    abort "#{name}: renewAfterBecomingKey is missing" unless renew
+    access = name == "TrustedAccessReviewSession.swift"
+    # The state reset comes before the rebuild: the replaced evaluation reports
+    # a cancellation, which would otherwise close the panel as a failure.
+    steps = ["ReviewFocusRecovery.onBecomeKey(", "window.isKeyWindow",
+             access ? "state = .selecting" : "state = .ready",
+             "rebuildAuthenticationContext()", "beginAuthentication()"]
+    steps.insert(2, "AccessReviewRequester.isAlive(") if access
+    in_order.(renew, steps, "the deferred Touch ID renewal")
+    abort "#{name}: regaining key must never activate the process" if
+      (become + renew).match?(/activateAndFocus|activate\(/)
+    begin_auth = body.("private func beginAuthentication()")
+    abort "#{name}: every evaluation must take a new generation, report it, and reset the focus flags" unless
+      begin_auth && begin_auth.include?("authenticationGeneration += 1") &&
+      begin_auth.include?("generation: generation") &&
+      begin_auth.include?("lostKeyWhileArmed = false") &&
+      begin_auth.include?("armedWhileNotKey = !window.isKeyWindow")
+    finished = body.("private func authenticationFinished(success: Bool, error: (any Error)?, generation: Int)")
+    abort "#{name}: a callback from a replaced evaluation must be dropped (ReviewFocusRecovery.isCurrent)" unless
+      finished && finished.include?("ReviewFocusRecovery.isCurrent(") &&
+      finished.include?("currentGeneration: authenticationGeneration")
+    # A system cancel is never the human deciding: the panel stays up and
+    # renews Touch ID through the shared rule, never failing the review.
+    abort "#{name}: a system cancel must keep the panel up (systemCancelled())" unless
+      finished.include?(".systemCancelled") && finished.include?("systemCancelled()")
+    cancelled = body.("private func systemCancelled()")
+    abort "#{name}: systemCancelled is missing" unless cancelled
+    in_order.(cancelled, ["ReviewFocusRecovery.onSystemCancel(", "window.isKeyWindow",
+      "renewedAfterSystemCancelWhileKey", "ReviewFocusRecovery.clickToResumeText",
+      "renewedAfterSystemCancelWhileKey = true", "DispatchQueue.main.async", "renewAfterSystemCancel()"],
+      "the recovery after a system cancel")
+    abort "#{name}: a system cancel must never fail the review" if
+      cancelled.match?(/finish\(|finishDenied\(/)
+    renew_cancel = body.("private func renewAfterSystemCancel()")
+    abort "#{name}: renewAfterSystemCancel is missing" unless renew_cancel
+    steps = ["state == .authenticating", "window.isKeyWindow",
+             access ? "state = .selecting" : "state = .ready",
+             "rebuildAuthenticationContext()", "beginAuthentication()"]
+    steps.insert(2, "AccessReviewRequester.isAlive(") if access
+    in_order.(renew_cancel, steps, "the renewal after a system cancel")
+    abort "#{name}: renewing after a system cancel must never activate the process" if
+      (cancelled + renew_cancel).match?(/activateAndFocus|activate\(/)
+    abort "#{name}: every key change must reset renewedAfterSystemCancelWhileKey" unless
+      resign.include?("renewedAfterSystemCancelWhileKey = false") &&
+      become.include?("renewedAfterSystemCancelWhileKey = false")
+  ' "$panel"
+done
+# Every LAContext an approval panel authenticates with — the first one and the
+# one an unlock retry rebuilds — comes from ReviewAuthenticationContext, so the
+# Touch-ID-reuse invariant is stated once for all three surfaces instead of being
+# re-decided, or silently inherited from the OS default, per panel. A panel that
+# built its own context would opt out of it without saying so.
+for panel in "$trusted_review" "$sudo_review"; do
+  if rg -q 'LAContext\(\)' "$panel" ||
+    ! rg -q 'ReviewAuthenticationContext\.make\(for:' "$panel"; then
+    echo "$(basename "$panel"): every approval context must come from ReviewAuthenticationContext.make(for:)" >&2
+    exit 1
+  fi
+done
+# A panel nobody answers closes on its own (the sudo review's PAM deadline, a
+# coding agent's request wait), and says so first (`ReviewDeadline`). Every
+# panel draws that line through the one ReviewDeadlineCountdown, started when
+# the panel is presented and stopped when it finishes, and none writes its own
+# countdown copy, so the three surfaces cannot drift apart. The access panel
+# takes the request's own deadline, and the sudo helper hands its panel the
+# moment it will close the review.
+for panel in "$trusted_review" "$sudo_review"; do
+  ruby -e '
+    source = File.read(ARGV.fetch(0))
+    name = File.basename(ARGV.fetch(0))
+    abort "#{name}: the deadline line must be a ReviewDeadlineCountdown, started when presented and stopped when finished" unless
+      source.include?("ReviewDeadlineCountdown(") && source.include?("deadlineCountdown?.start()") &&
+      source.include?("deadlineCountdown?.stop()")
+    abort "#{name}: a panel must not write its own deadline copy" if source.match?(/Closes in|nobody answers/)
+  ' "$panel"
+done
+# A Mac that cannot take a touch (no fingerprint, a lockout, the lid closed):
+# every panel draws its status line from the one ReviewTouchIDUnavailable, so
+# what it says about the phone cannot drift between surfaces, and polls for
+# Touch ID coming back with the one TouchIDAvailabilityWatch, arming it on a
+# fresh context through the shared rule and stopping the watch when it
+# finishes. Touch ID going away under an armed evaluation goes through the
+# one after-failure rule, which asks again rather than trusting the code. The
+# access panel learns of the phone leg the way the mirror binds it
+# (ReviewPhoneStatus.current), and the mirror marks it when the phone gives up.
+for panel in "$trusted_review" "$sudo_review"; do
+  ruby -e '
+    source = File.read(ARGV.fetch(0))
+    name = File.basename(ARGV.fetch(0))
+    abort "#{name}: the Touch-ID-unavailable line must come from ReviewTouchIDUnavailable.statusText" unless
+      source.include?("ReviewTouchIDUnavailable.statusText(")
+    abort "#{name}: a panel must not write its own Touch-ID-unavailable copy" if
+      source.match?(/"Touch ID is unavailable/)
+    abort "#{name}: a panel up without Touch ID must poll for it with TouchIDAvailabilityWatch and stop it when finished" unless
+      source.include?("TouchIDAvailabilityWatch(") && source.scan("stopTouchIDWatch()").length >= 3
+    polled = source[/private func touchIDPolled\(available: Bool\) \{\n.*?\n    }\n/m]
+    abort "#{name}: touchIDPolled is missing" unless polled
+    steps = ["ReviewTouchIDUnavailable.onPoll(", "case .arm:", "stopTouchIDWatch()",
+             "biometricsAvailable = true", "rebuildAuthenticationContext()", "beginAuthentication()"]
+    positions = steps.map { |step| polled.index(step, polled.index("ReviewTouchIDUnavailable.onPoll(") || 0) }
+    abort "#{name}: Touch ID coming back must arm, in order: #{steps.join(" ")}" unless
+      positions.all? && positions == positions.sort
+    abort "#{name}: Touch ID coming back must not arm behind the lock screen" unless
+      polled.include?("ScreenLockState.isScreenLocked")
+    finished = source[/private func authenticationFinished\(success: Bool, error: \(any Error\)\?, generation: Int\) \{\n.*?\n    }\n/m]
+    abort "#{name}: authenticationFinished is missing" unless finished
+    abort "#{name}: a failed armed evaluation must ask again through ReviewTouchIDUnavailable.afterFailure and wait without Touch ID once it has gone" unless
+      finished.include?("ReviewTouchIDUnavailable.afterFailure(") &&
+      finished.include?("ReviewTouchIDUnavailable.isAvailableNow(") && finished.include?("touchIDLost()")
+  ' "$panel"
+done
+if ! rg -q 'phone: ReviewPhoneStatus\.current' "$trusted_review" ||
+  ! rg -q 'ReviewPhoneStatus\.\$current\.withValue\(phone\)' "$repo_root/agent/Sources/ConvenientSecurity/RemoteApprovalPolicyReview.swift" ||
+  ! rg -q 'phone\.markUnavailable\(\)' "$repo_root/agent/Sources/ConvenientSecurity/RemoteApprovalPolicyReview.swift"; then
+  echo "the mirror must tell the access panel about its phone leg (ReviewPhoneStatus.current) and mark it when the phone gives up" >&2
+  exit 1
+fi
+if ! rg -q 'ReviewDeadline\(HumanWait\.current\)' "$trusted_review" ||
+  ! rg -q 'deadline: deadline\.closing' "$repo_root/agent/Sources/csec-sudo-review/main.swift"; then
+  echo "the access panel must show its request's deadline, and the sudo helper the moment it closes the review" >&2
+  exit 1
+fi
+# The phone's card shows the same deadline in the same words (csec-0.69): the
+# Mac panels and the card take their line from the one ReviewDeadlineText, the
+# mirror freezes the request's own deadline into the phone copy, and the sudo
+# helper sends csecd the moment its panel closes.
+ruby -e '
+  root = ARGV.fetch(0)
+  card = File.read("#{root}/ios/ConvenientSecurityApproval/ApprovalCardView.swift")
+  mac = File.read("#{root}/agent/Sources/ConvenientSecurity/ReviewDeadline.swift")
+  abort "ApprovalCardView.swift: the deadline line must come from ReviewDeadlineText, redrawn on its schedule" unless
+    card.include?("ReviewDeadlineText.line(closesAt:") && card.include?("ReviewDeadlineText.changes(closesAt:")
+  copy = /"(Closes in|If nobody answers|Closing: nobody)/
+  abort "ApprovalCardView.swift: the card must not write its own deadline copy" if card.match?(copy)
+  abort "ReviewDeadline.swift: the Mac line must be ReviewDeadlineText'\''s" unless
+    mac.include?("ReviewDeadlineText.line(") && !mac.match?(copy)
+' "$repo_root"
+if ! rg -q 'deadline: ReviewDeadline\(HumanWait\.current\)' "$repo_root/agent/Sources/ConvenientSecurity/RemoteApprovalPolicyReview.swift" ||
+  ! rg -q 'closing: deadline\.closing' "$repo_root/agent/Sources/csec-sudo-review/main.swift" ||
+  ! rg -q 'closesAtMilliseconds: request\.phoneDeadline\(\)' "$repo_root/agent/Sources/ConvenientSecurity/SudoRemoteReview.swift"; then
+  echo "the phone copy must carry the deadline the Mac panel shows: the request's HumanWait, the sudo helper's closing moment" >&2
+  exit 1
+fi
+# The reviewer demo (csec-0.39.17) ships in every build and must stay apart
+# from real approvals: its file names nothing that reaches the mailbox,
+# iCloud, the Keychain, the phone's keys or the app's model, its sample
+# requests are unsigned, and the card it shares with the paired list reads
+# no model from the environment, so it decides only through the host it is
+# given (`ApprovalCardHost`).
+ruby -e '
+  root = ARGV.fetch(0)
+  demo = File.read("#{root}/ios/ConvenientSecurityApproval/DemoMode.swift")
+  card = File.read("#{root}/ios/ConvenientSecurityApproval/ApprovalCardView.swift")
+  forbidden = %w[
+    ApprovalViewModel PhoneMailbox PhoneIdentityStore PhoneAuthorization PhoneDecisionKeys
+    PhoneApprovalIdentity PinnedMacRecords SecureEnclave SecKey SecItem kSec CloudKit
+    SimulatedMailbox SimulatedMac SimulatorFixture FrozenDecision SignedRemoteApprovalResponse
+    RemoteUnlockCrypto CryptoKit EnvironmentObject UserDefaults FileManager URLSession
+  ]
+  code = demo.lines.reject { |line| line.lstrip.start_with?("//") }.join
+  forbidden.each do |name|
+    abort "DemoMode.swift: the demo must not reach #{name}" if code.match?(/\b#{name}/)
+  end
+  abort "DemoMode.swift: the demo must not reach CloudKit (CK types)" if code.match?(/\bCK[A-Z]/)
+  abort "DemoMode.swift: the demo must not sign anything" if code.match?(/\.signed\(|signature\(for/)
+  abort "DemoMode.swift: the demo requests must be unsigned" unless
+    code.include?("SignedRemoteApprovalRequest(request: request, signatureDER: Data())")
+  abort "DemoMode.swift: the demo must be the cards\x27 host" unless
+    code.include?("final class DemoApprovals: ApprovalCardHost") && code.include?("ApprovalCard(item: item, host: demo)")
+  abort "ApprovalCardView.swift: the card must decide only through the host it is given" if
+    card.match?(/EnvironmentObject|ApprovalViewModel/)
+' "$repo_root"
+
+# A review names its secrets the way the provider that holds them describes
+# them (`SecretProvider.reviewDescription`), drawn as one tree by every surface
+# that lists secrets: the Mac panel's release, automation, SSH and restore
+# layouts and the phone card all fold it through `ReviewSecretTree`, so they
+# cannot drift apart. None of the display code may parse a reference or test a
+# scheme itself, so a new backend is drawn without a change here. The sudo
+# panel lists no secrets.
+secret_display_files=(
+  "$trusted_review"
+  "$repo_root/agent/Sources/ConvenientSecurity/ReviewDisplay.swift"
+  "$repo_root/agent/Sources/CSECRemoteApproval/ReviewSecret.swift"
+  "$repo_root/ios/ConvenientSecurityApproval/ApprovalCardView.swift"
+)
+for display in "${secret_display_files[@]}"; do
+  if rg -q '"op"|"csec"|op://|csec://|\.scheme\b|path\.split' "$display"; then
+    echo "$(basename "$display"): secret display code must draw providers' descriptions, never parse a reference or test a scheme" >&2
+    exit 1
+  fi
+done
+if ! rg -q 'ReviewSecretTree\(' "$trusted_review" ||
+  ! rg -q 'ReviewSecretTree\(' "$repo_root/ios/ConvenientSecurityApproval/ApprovalCardView.swift"; then
+  echo "the Mac panel and the phone card must both draw secrets through ReviewSecretTree" >&2
+  exit 1
+fi
+# The phone's pairing line: its card draws it, its signed answer says whether
+# it was shown, and csecd accepts that answer, all by the one shared rule
+# `RemoteApprovalReview.pairingLineApplies`, so what the reader saw, what the
+# phone signed and what pairs cannot drift apart.
+for line_rule in \
+  "$repo_root/ios/ConvenientSecurityApproval/ApprovalCardView.swift" \
+  "$repo_root/ios/ConvenientSecurityApproval/FrozenDecision.swift" \
+  "$repo_root/agent/Sources/CSECRemoteApproval/RemoteApprovalProtocol.swift"; do
+  if ! rg -q 'review\.pairingLineApplies\(' "$line_rule"; then
+    echo "$(basename "$line_rule"): the pairing line is drawn, signed and accepted only by RemoteApprovalReview.pairingLineApplies" >&2
+    exit 1
+  fi
+done
+# The secret-access and SSH signing reviews share one class, so each names its
+# own surface there; the sudo helper names its own.
+if ! rg -q 'for: \.sudo' "$sudo_review" ||
+  ! rg -q '\.sshSigning' "$trusted_review" ||
+  ! rg -q '\.secretAccess' "$trusted_review"; then
+  echo "each approval surface must build its context for its own ReviewAuthenticationContext.Surface" >&2
+  exit 1
+fi
+# Reuse is zero everywhere, not only on the review panels: a nonzero
+# touchIDAuthenticationAllowableReuseDuration accepts a biometric match the
+# device lock screen already took, so an authorization raised soon after unlock
+# would succeed with no finger on the sensor and nothing read.
+nonzero_reuse="$(
+  rg -n 'touchIDAuthenticationAllowableReuseDuration\s*=[^=]' \
+    "$repo_root/agent/Sources" "$repo_root/ios" "$repo_root/packaging" |
+    rg -v '=\s*0\s*$' || true
+)"
+if [ -n "$nonzero_reuse" ]; then
+  echo "Touch ID reuse must stay 0; a lock-screen match is not a decision:" >&2
+  echo "$nonzero_reuse" >&2
+  exit 1
+fi
+# Grant coverage, the scope roots a review offers and the terminal line walk
+# lineage parents, so a job a coding agent's tool shell detached stays inside
+# the tree that started it (SessionLineage, DESIGN.md §Detached jobs), and csecd
+# records each trusted caller's session on schemes and access, before the tool
+# shell can exit. A kernel-parent walk on any of these paths drops the link
+# without failing anything else: the detached job's ssh would ask once per
+# connection again.
+lineage_sources="$repo_root/agent/Sources/ConvenientSecurity"
+lineage_records="$(rg -c 'SessionLineage\.shared\.record\(from: caller\.pid\)' \
+  "$repo_root/agent/Sources/csecd/AgentRuntime.swift" || true)"
+if rg -q 'ProcessAncestry\.descends\(' "$lineage_sources" ||
+  ! rg -q 'guard let next = lineageParent\(of: current\)' "$lineage_sources/ProcessInspection.swift" ||
+  ! rg -q 'lineageParent: \{ SessionLineage\.shared\.parent\(of: \$0\) \}' "$lineage_sources/ProcessInspection.swift" ||
+  ! rg -q 'parent: \{ SessionLineage\.shared\.parent\(of: \$0\) \}' "$lineage_sources/TerminalSessionContext.swift" ||
+  rg -q 'inspection\.parent\(of:' "$lineage_sources/GrantScope.swift" ||
+  [ "${lineage_records:-0}" != "2" ]; then
+  echo "grant coverage, scope roots and the terminal line must walk SessionLineage parents, and csecd must record callers' sessions on schemes and access" >&2
+  exit 1
+fi
+# Keyboard focus after the grace period rests on each panel's keyboard sink
+# (PromptKeyboardSink), never on a control: with Full Keyboard Access on, Space
+# presses any focused button, so a focused Deny or Use Password turned a
+# resumed sentence into a denial, and a focused radio or popup would reshape
+# the grant. The sink is installed exactly once, before any variant branches,
+# and nothing may replace the content view or point the initial focus
+# elsewhere afterwards; refusesFirstResponder would only hide the symptom on
+# one control.
+for panel in "$trusted_review" "$sudo_review"; do
+  sink_installs="$(rg -c '^\s*let contentView = PromptKeyboardSink\.install\(in: window\)$' "$panel" || true)"
+  if [ "${sink_installs:-0}" != "1" ] ||
+    rg -q 'window\.(initialFirstResponder|contentView)\s*=[^=]|refusesFirstResponder' "$panel"; then
+    echo "$(basename "$panel"): keyboard focus must rest on the PromptKeyboardSink installed once as the content view, for every variant" >&2
+    exit 1
+  fi
+done
+# A command a panel asks the human to verify is shown whole (ReviewCommandText,
+# csec-0.58): as tall as the screen allows, with a scroller that cannot fade and
+# a cue when it still scrolls. Both panel classes draw commands only through it,
+# never a fixed-height text box of their own.
+for panel in "$trusted_review" "$sudo_review"; do
+  if ! rg -q 'ReviewCommandText\(' "$panel" || rg -q 'NSTextView\(' "$panel"; then
+    echo "$(basename "$panel"): show commands through ReviewCommandText, not a text view of the panel's own" >&2
+    exit 1
+  fi
+done
+# Lists (secrets, restored approvals, the SSH details) are shown whole the same
+# way (ReviewFittedList, csec-lz39), and each panel fits all of its long views
+# to the screen together (ReviewScreenFit), so an opened command cannot push
+# the buttons off the screen past a list sized alone. Neither panel class builds
+# a scroll view of its own: that is how fixed-height peepholes with scrollers
+# that show only while scrolling came back for lists after commands.
+for panel in "$trusted_review" "$sudo_review"; do
+  if rg -q 'NSScrollView\(' "$panel" || ! rg -q 'ReviewScreenFit\.fit\(' "$panel"; then
+    echo "$(basename "$panel"): show long lists and commands through ReviewFittedList/ReviewCommandText, fitted by ReviewScreenFit, not a scroll view of the panel's own" >&2
+    exit 1
+  fi
+done
+# A panel a developer check put on screen says TEST (ReviewTestBanner): both
+# panel classes draw the one shared banner first, before any variant branches,
+# and title the window through it, so no surface can show a test panel bare.
+# Only test entry points may turn the marker on: a real request dressed as a
+# test would invite a careless touch. The sudo helper is a production binary,
+# so its write must sit in a `#if DEBUG` block, which a release helper lacks.
+for panel in "$trusted_review" "$sudo_review"; do
+  banner_rows="$(rg -c '^\s*if let testBanner = ReviewTestBanner\.view\(width: Self\.innerWidth\) \{$' "$panel" || true)"
+  if [ "${banner_rows:-0}" != "1" ] ||
+    ! rg -U -q 'root\.addArrangedSubview\(testBanner\)\n\s*\}\n\s*root\.addArrangedSubview\(makeHeader\(\)\)' "$panel" ||
+    ! rg -q '^\s*window\.title = ReviewTestBanner\.title\("Convenient Security"\)$' "$panel"; then
+    echo "$(basename "$panel"): the panel must draw ReviewTestBanner first, above its header, and title the window through it" >&2
+    exit 1
+  fi
+done
+banner_writers="$(rg -l 'ReviewTestBanner\.isShown\s*=[^=]' "$repo_root/agent/Sources" | sed "s|^$repo_root/agent/Sources/||" | sort | tr '\n' ' ')"
+if [ "$banner_writers" != "cs-review-preview/main.swift cs-selftest/ReviewTestBannerTests.swift csec-sudo-review/main.swift " ]; then
+  echo "only cs-review-preview, the debug sudo probes and their self-test may mark panels as tests (ReviewTestBanner.isShown), not: $banner_writers" >&2
+  exit 1
+fi
+ruby -e '
+  lines = File.readlines(ARGV[0])
+  writes = lines.each_index.select { |i| lines[i] =~ /ReviewTestBanner\.isShown\s*=[^=]/ }
+  abort "csec-sudo-review: mark the test panel exactly once" unless writes.size == 1
+  directive = lines[0...writes[0]].reverse.find { |line| line =~ /^\s*#(if|else|elseif|endif)\b/ }
+  abort "csec-sudo-review: only a #if DEBUG block may mark the panel as a test" unless directive&.strip == "#if DEBUG"
+' "$repo_root/agent/Sources/csec-sudo-review/main.swift"
+# The typing guard's length is decided once, in PromptInteractionGrace: at
+# least defaultDelay and then until the keyboard counter reads
+# requiredKeyboardIdle (the quiet period plus the counter's half-second step,
+# so steady typing never satisfies it). A panel that passed its own delay,
+# threshold or keyboard clock would opt out of that without saying so.
+for panel in "$trusted_review" "$sudo_review"; do
+  if rg -q 'PromptInteractionGrace\([^)]*(delay|requiredKeyboardIdle|keyboardIdle):' "$panel" ||
+    rg -U -q 'PromptInteractionGrace\(\n[^)]*(delay|requiredKeyboardIdle|keyboardIdle):' "$panel"; then
+    echo "$(basename "$panel"): approval panels must use PromptInteractionGrace's own delay, keyboard threshold and keyboard clock" >&2
+    exit 1
+  fi
+done
+grace_source="$repo_root/agent/Sources/ConvenientSecurity/PromptInteractionGrace.swift"
+if ! rg -q 'CGEventSource\.secondsSinceLastEventType\(\.hidSystemState, eventType: \.keyDown\)' "$grace_source" ||
+  ! rg -U -q 'func graceElapsed\(_ timer: Timer\) \{\n(.*\n){0,3}\s*let idle = keyboardIdle\(\)' "$grace_source" ||
+  ! rg -q 'requiredKeyboardIdle: TimeInterval =\s*$' "$grace_source" ||
+  ! rg -q '^\s*keyboardQuietPeriod \+ keyboardCounterStep$' "$grace_source" ||
+  ! rg -q 'idle < requiredKeyboardIdle \{' "$grace_source"; then
+  echo "PromptInteractionGrace must hold every prompt until the HID keyboard has been quiet" >&2
+  exit 1
+fi
+# The grace period's begin() is what orders the panel front; Touch ID must still
+# start in the same breath, never after a button, a key press, or the grace.
+if ! rg -U -q \
+  'grace\.begin\(\)\n\s*window\.displayIfNeeded\(\)\n\s*beginAuthentication\(\)' \
+  "$trusted_review"; then
+  echo "trusted review must activate Touch ID when its rendered window becomes visible" >&2
+  exit 1
+fi
+if ! rg -U -q \
+  'grace\.begin\(\)\n\s*window\.displayIfNeeded\(\)\n\s*beginAuthentication\(\)' \
+  "$sudo_review"; then
+  echo "sudo review must activate Touch ID when its rendered window becomes visible" >&2
+  exit 1
+fi
+# Only PromptInteractionGrace may activate the process or make a prompt key, so
+# no prompt can take a keystroke before its grace period has elapsed. The sudo
+# helper's entry point owns that process, so it is held to the same rule.
+sudo_helper="$repo_root/agent/Sources/csec-sudo-review/main.swift"
+if rg -q 'makeKeyAndOrderFront|activate\(ignoringOtherApps' \
+  "$trusted_review" "$sudo_review" "$sudo_helper"; then
+  echo "approval panels must leave activation and key focus to PromptInteractionGrace" >&2
+  exit 1
+fi
+# macOS charges an Apple event to the sender's responsible application, which
+# for the sudo helper is whatever ran sudo: a tab lookup from the helper would
+# make Ghostty or Terminal.app ask to control iTerm2 mid-sudo. csecd names the
+# sudo's tab under its own Automation grant (`sudo_terminal`).
+if rg -n 'TerminalSessionInspector\.live|TerminalTitleQuery|OSAScriptRunner|NSAppleScript|osascript' \
+  "$sudo_review" "$sudo_helper"; then
+  echo "the sudo helper must send no Apple event; csecd names its terminal tab (sudo_terminal)" >&2
+  exit 1
+fi
+if ! rg -q 'SudoDelegationClient\.installed\.terminal\(\)' "$sudo_helper"; then
+  echo "the sudo helper must take its terminal tab from csecd (sudo_terminal)" >&2
+  exit 1
+fi
+# The same charge makes a test's tab lookup a request from whatever launched
+# the test: under a CI runner, macOS asks the runner for Automation control of
+# iTerm2, and the consent sheet stays modal in iTerm2, blocking its Apple
+# events and Python API, until someone answers it. The live inspector reads the
+# environment of the pid it is given, so a test's synthetic caller pid that
+# happens to be a real iTerm2 shell is enough. So no inspector parameter
+# defaults to the live one; csecd passes it explicitly, and the only test that
+# asks a real terminal is cs-selftest's live check, which runs only inside an
+# iTerm2 session, where iTerm2 itself is the one asking.
+if rg -n 'TerminalSessionInspector\s*=\s*\.live' "$repo_root/agent/Sources"; then
+  echo "a TerminalSessionInspector parameter must not default to .live; its caller chooses" >&2
+  exit 1
+fi
+live_terminal_users="$(rg -l \
+  'TerminalSessionInspector\.live|terminalInspection:\s*\.live|TerminalTitleQuery\.run\(|OSAScriptRunner' \
+  "$repo_root/agent/Sources" -g '!**/ConvenientSecurity/**' -g '!**/csecd/**' | sort | tr '\n' ' ' || true)"
+if [ "$live_terminal_users" != "$repo_root/agent/Sources/cs-selftest/TerminalSessionTests.swift " ]; then
+  echo "only csecd and cs-selftest's live terminal check may ask a real terminal for its tab; found: $live_terminal_users" >&2
+  exit 1
+fi
+# Exit zero is the PAM module's only approval signal, and AppKit ends a process
+# that agrees to quit with exit(0); logout or any process of the user can ask.
+# So no panel class owns the application's termination, and the sudo helper
+# runs every AppKit loop through runApplication, whose delegate exits 69 on
+# either quit callback before AppKit can exit.
+if rg -n 'NSApplicationDelegate|application\.delegate|NSApp\.delegate|\.terminate(Now|Later|Cancel)' \
+  "$trusted_review" "$sudo_review"; then
+  echo "approval panels must not own the application's termination; the sudo helper's runApplication does" >&2
+  exit 1
+fi
+ruby -e '
+  helper = File.read(ARGV[0])
+  abort "csec-sudo-review: a quit must never reach AppKit'"'"'s exit(0) (no terminate reply)" if helper.match?(/\.terminate(Now|Later|Cancel)/)
+  delegate = helper[/^private final class UnsuccessfulTermination: NSObject, NSApplicationDelegate \{\n.*?\n}\n/m] or
+    abort "csec-sudo-review: UnsuccessfulTermination is missing"
+  abort "csec-sudo-review: UnsuccessfulTermination exits with the Use Password status" unless
+    delegate.include?("SudoReviewOutcome.usePassword(deniedOnPhone: false).exitStatus")
+  should = delegate[/func applicationShouldTerminate\(.*?\n  }\n/m]
+  will = delegate[/func applicationWillTerminate\(.*?\n  }\n/m]
+  abort "csec-sudo-review: both quit callbacks exit unsuccessful themselves" unless
+    should && will && [should, will].all? { |body| body.include?("exit(Self.status)") }
+  run = helper[/^private func runApplication\(\) \{\n.*?\n}\n/m] or abort "csec-sudo-review: runApplication is missing"
+  assign = run.index("application.delegate = UnsuccessfulTermination.shared")
+  loop = run.index("application.run()")
+  abort "csec-sudo-review: runApplication installs UnsuccessfulTermination before AppKit runs" unless assign && loop && assign < loop
+  abort "csec-sudo-review: every AppKit loop runs through runApplication" unless
+    helper.scan(/\.run\(\)/).size == 1 && helper.scan(/\.delegate = /).size == 1
+' "$sudo_helper"
+
+# Under PAM the helper's stderr is /dev/null, so the live review and its panel
+# write their trail through SudoReviewLog, which also reaches the unified log,
+# value-free and readable (privacy public). The module writes all of its own
+# stage lines through its one sink, which the C tests read.
+ruby -e '
+  helper, panel, log, pam = ARGV.map { |path| File.read(path) }
+  live = helper[/^guard CommandLine\.arguments\.count == 1 else \{\n.*\z/m] or abort "csec-sudo-review: the live review entry is missing"
+  abort "csec-sudo-review: a live review refuses through reject (SudoReviewLog), never fail or bare stderr" if
+    live.match?(/\bfail\(|FileHandle\.standardError/)
+  watch = helper[/^private func runWatchingParent\(.*?\n}\n/m] or abort "csec-sudo-review: runWatchingParent is missing"
+  abort "csec-sudo-review: the parent watch records the exit, a parent exit and the deadline" unless
+    [".exiting(status: status)", ".parentExited", ".deadlinePassed"].all? { |event| watch.include?("SudoReviewLog.record(#{event}") } &&
+    !watch.match?(/\bfail\(/)
+  abort "SudoAuthorizationReview.swift: the sudo panel logs through SudoReviewLog, not bare stderr" if
+    panel.include?("FileHandle.standardError")
+  abort "SudoReviewLog.swift: one notice-level, privacy-public unified-log write" unless
+    log.scan(/logger\.\w+\(/).size == 1 && log.include?("logger.notice(\"\\(line, privacy: .public)\")")
+  abort "pam_csec_sudo.c: every stage line goes through csec_liveness_write" unless
+    pam.scan("os_log_with_type(").size == 1 &&
+    pam[/^csec_liveness_write\(const char \*line\)\n\{.*?\n\}\n/m].to_s.include?("os_log_with_type(")
+' "$sudo_helper" "$sudo_review" "$repo_root/agent/Sources/ConvenientSecurity/SudoReviewLog.swift" \
+  "$repo_root/packaging/sudo/pam_csec_sudo.c"
+
+# The 1Password adapter's unified-log lines are readable by any process that
+# can run log show and are copied into every sysdiagnose, so what they show in
+# the clear is csec's own words, counts, timings and opaque tags
+# (OnePasswordDiagnostics). Anything else is private: a new .public
+# interpolation fails here until it is added to this list, and so does a
+# bridge event (logged public) or the selection summary naming anything.
+ruby -e '
+  allowed = [
+    "Self.tag(ref)", "Self.tag(account)", "Self.tag(optimistic)", "self.tag(forUserID: accountID)",
+    "accounts.map { Self.tag($0) }.joined(separator: \", \")", "tag", "entry.event", "selection.summary",
+    "OnePasswordDiagnostics.kind(of: error)",
+    "Int(self.configuration.keepaliveInterval)", "Int(self.configuration.authorizationNoticeDelay)", "deadline", "String(format: \"%.2f\", took)",
+    "vaults.count", "vaults?.count ?? 0", "live.count", "self.backends.count", "self.refusedAccounts.count",
+    "itemListed", "decided ? \"remembered decision\" : \"only signed-in account\"",
+    "reason", "Self.displaySafe(reason)", "why", "slow",
+  ]
+  event_allowed = %w[generation id op Int(bound) process.processIdentifier how pending requestGeneration]
+  interpolations = lambda do |text|
+    found = []
+    at = 0
+    while (start = text.index("\\(", at))
+      depth = 0
+      stop = start + 1
+      loop do
+        depth += 1 if text[stop] == "("
+        depth -= 1 if text[stop] == ")"
+        break if depth.zero? || stop >= text.size
+        stop += 1
+      end
+      found << text[(start + 2)...stop]
+      at = stop
+    end
+    found
+  end
+  ARGV.each do |path|
+    source = File.read(path)
+    name = File.basename(path)
+    interpolations.call(source).each do |inner|
+      next unless inner.end_with?(", privacy: .public")
+      expression = inner.delete_suffix(", privacy: .public")
+      abort "#{name}: \\(#{expression}, privacy: .public) is not on bin/ci'"'"'s list of value-free 1Password log fields; log it .private, or name it by OnePasswordDiagnostics tag" unless
+        allowed.include?(expression)
+    end
+    source.scan(/(?<!func )\breport\(\s*([^"\s][^,)]*)/).each do |(argument)|
+      abort "#{name}: a bridge event is a string literal in csec'"'"'s words; anything else goes in its private detail (found report(#{argument}))" unless
+        argument == "OnePasswordBridgeDiagnostic.stderr"
+    end
+    source.scan(/\breport\(\s*"((?:[^"\\]|\\.)*)"/).each do |(literal)|
+      interpolations.call(literal).each do |expression|
+        abort "#{name}: bridge event \"#{literal}\" is logged public; \\(#{expression}) belongs in its private detail" unless
+          event_allowed.include?(expression)
+      end
+    end
+    if (summary = source[/^        var summary: String \{\n.*?^        \}\n/m])
+      abort "#{name}: the selection summary is logged public, so it names accounts by OnePasswordDiagnostics tag, never by label" if
+        summary.match?(/\blabel\b|displaySafe/)
+    end
+  end
+' "$repo_root"/agent/Sources/OnePasswordAdapter/*.swift
+
+# Only PAM's root parent may submit a real sudo review, before input can block
+# and again before the helper contacts csecd or presents either copy. Synthetic
+# live probes must not leave another entry in the installed release binary.
+ruby -e '
+  helper = File.read(ARGV.fetch(0))
+  production = helper[/^let originalParent = getppid\(\)\n.*?^runReview\(originalParent: originalParent, review: review, deadline: deadline\)$/m] or
+    abort "sudo helper: production entry is missing"
+  guards = production.enum_for(:scan, /SudoReviewParentTrust\.isTrusted\(originalParent: originalParent\)/).map { Regexp.last_match.begin(0) }
+  input = production.index("let frame = readBoundedStandardInput()")
+  decode = production.index("let review = SudoAuthorizationReviewWire.decode(frame)")
+  abort "sudo helper: authenticate root parent before input and recheck after decoding" unless
+    guards.length == 2 && input && decode && guards[0] < input && guards[1] > decode
+  debug = helper.scan(/^#if DEBUG\n(.*?)^#endif/m).flatten.join("\n")
+  %w[--grace-probe --typing-probe --focus-probe --unlock-probe --deadline-probe --no-touch-id-probe --phone-probe --synthetic-review-probe].each do |mode|
+    literal = Regexp.new(Regexp.escape(%Q{"#{mode}"}))
+    abort "sudo helper: #{mode} must be debug-only" unless debug.scan(literal).length == 1 && helper.scan(literal).length == 1
+  end
+' "$sudo_helper"
+# The audit/doctor inspection and the PAM module must name the same helper and
+# identifier, or an HA-G11 "pass" would stop meaning "the module will hand off".
+sudo_inspection="$repo_root/agent/Sources/ConvenientSecurity/SudoIntegrationInspection.swift"
+# Both derive the identifier from identity.xcconfig's CSEC_IDENTIFIER.
+literal=/usr/local/libexec/csec-sudo-review
+if ! rg -F -q "\"$literal\"" "$sudo_inspection" ||
+    ! rg -F -q 'helperIdentifier = CSECBuildIdentity.named("sudo-review")' "$sudo_inspection"; then
+  echo "SudoIntegrationInspection.swift does not name $literal and the build identity's .sudo-review" >&2
+  exit 1
+fi
+if ! rg -F -q "\"$literal\"" "$repo_root/packaging/sudo/pam_csec_sudo.c" ||
+    ! rg -F -q '#define CSEC_SUDO_REVIEW_IDENTIFIER CSEC_IDENTIFIER ".sudo-review"' \
+      "$repo_root/packaging/sudo/pam_csec_sudo.c"; then
+  echo "pam_csec_sudo.c does not name $literal and the build identity's .sudo-review" >&2
+  exit 1
+fi
+# The module path lives in the installer's PAM line and the linker install name.
+if ! rg -F -q '"/usr/local/lib/pam/pam_csec_sudo.so"' "$sudo_inspection" ||
+    ! rg -F -q 'sufficient     /usr/local/lib/pam/pam_csec_sudo.so"' \
+      "$repo_root/packaging/bin/install-sudo-review.sh" ||
+    ! rg -F -q 'install_name,/usr/local/lib/pam/pam_csec_sudo.so' \
+      "$repo_root/packaging/bin/build-sudo-pam.sh"; then
+  echo "the sudo inspection, installer, and module build must agree on the PAM module path" >&2
+  exit 1
+fi
+# csecd answers the sudo review helper's phone leg only for the helper's live
+# code identity (ProductCodeRole.sudoReviewHelper), so the identifier csecd
+# checks is the one the PAM module checks and the build signs, and an installed
+# helper carries the product team's Developer ID signature.
+peer_identity="$repo_root/agent/Sources/CSECRootProtocol/PeerIdentity.swift"
+sudo_review_build="$repo_root/packaging/bin/build-sudo-review.sh"
+if ! rg -F -q 'sudoReviewHelperIdentifier = CSECBuildIdentity.named("sudo-review")' "$peer_identity" ||
+  ! rg -F -q 'teamIdentifier = CSECBuildIdentity.teamIdentifier' "$peer_identity" ||
+  ! rg -F -q 'team_identifier="$csec_team_id"' "$sudo_review_build" ||
+  ! rg -F -q 'helper_identifier="$csec_identifier.sudo-review"' "$sudo_review_build" ||
+  ! rg -F -q -- '--test-requirement="=anchor apple generic and certificate leaf[subject.OU]' "$sudo_review_build" ||
+  ! rg -F -q 'signing=(--timestamp --sign "$SIGN_IDENTITY")' "$sudo_review_build"; then
+  echo "the sudo review helper must be signed by the product team as the identity csecd admits (ProductCodeRole.sudoReviewHelper)" >&2
+  exit 1
+fi
+# The helper races its panel against the paired phone, and its phone leg takes
+# csecd's answer, which ends a root authentication, only from the product
+# agent in a release build; csecd admits only the launcher and that helper.
+sudo_remote="$repo_root/agent/Sources/ConvenientSecurity/SudoRemoteReview.swift"
+if ! rg -q 'await SudoReviewRace\.run\(' "$sudo_helper" ||
+  ! rg -q 'SudoRemoteReviewClient\.installed' "$sudo_helper" ||
+  ! rg -U -q '#else\n\s*let trust: AgentServerTrustPolicy = \.requireProductAgent\n\s*#endif' "$sudo_remote" ||
+  ! rg -q 'let clientTrustPolicy: SocketPeerTrustPolicy = \.requireProductClients$' \
+    "$repo_root/agent/Sources/csecd/AgentRuntime.swift"; then
+  echo "the sudo review helper must race its panel against the phone through a csecd it authenticates, and csecd must admit only the launcher and that helper" >&2
+  exit 1
+fi
+# A phone decision closes the losing panel on every surface. The access and SSH
+# panels close through cancel() (checked below); the sudo panel closes through
+# its task's cancellation, which the helper uses both when its sudo exits and
+# when the phone answered first, and which must close the window and
+# invalidate the panel's LAContext.
+ruby -e '
+  source = File.read(ARGV.fetch(0))
+  present = source[/public static func present\(\n.*?\n    }\n/m]
+  gone = source[/private func requesterGone\(\) \{\n.*?\n    }\n/m]
+  finish = source[/private func finish\(_ outcome: SudoAuthorizationReviewOutcome\) \{\n.*?\n    }\n/m]
+  abort "SudoAuthorizationReview.swift: cancelling a sudo review (its sudo exited, or the phone answered first) " \
+    "must close the panel and invalidate its LAContext" unless
+    present && present.include?("withTaskCancellationHandler") && present.include?("session.requesterGone()") &&
+    gone && gone.include?("finish(.usePassword)") &&
+    finish && finish.include?("context.invalidate()") && finish.include?("closeWindow()")
+' "$sudo_review"
+plutil -lint \
+  "$repo_root/packaging/agent/Info.plist" \
+  "$repo_root/packaging/agent/csecd.entitlements" \
+  "$repo_root/packaging/agent/LaunchAgents/csecd.plist" \
+  "$repo_root/ios/ConvenientSecurityApproval/Info.plist" \
+  "$repo_root/ios/ConvenientSecurityApproval/ConvenientSecurityApproval.entitlements" \
+  "$repo_root/ios/ConvenientSecurityApproval/ConvenientSecurityApproval.production.entitlements" \
+  "$repo_root/ios/ConvenientSecurityApprovalNotifications/Info.plist" \
+  "$repo_root/ios/ConvenientSecurityApprovalNotifications/ConvenientSecurityApprovalNotifications.entitlements" \
+  "$repo_root/packaging/root/LaunchDaemons/rootd.plist"
+# Remote approval works only while the Mac and the phone use one CloudKit
+# database. A Developer ID Mac reaches only Production, so csecd, the
+# dev-signed Debug app build-and-install.sh installs on the phone, and the
+# Release (App Store) app are all Production, in the one container the relay and
+# the phone's pairing check name. The iPhone targets' entitlements take the
+# environment from CSEC_CLOUDKIT_ENVIRONMENT, which ios/project.yml sets to
+# Production for every target (checked below); a Development build is only the
+# one-off subscription bootstrap. A development profile allows only the
+# development push environment, so Debug uses it; Release uses production. The
+# notification extension receives no push itself and reads the pinned Macs
+# through the app's own Keychain access group.
+python3 - "$repo_root" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+# The templates name the container through the identity: csecd's through
+# build-agent.sh's placeholder, the iPhone targets' through the build setting
+# identity.xcconfig gives Xcode.
+mac_container = "iCloud.@CSEC_IDENTIFIER@"
+ios_container = "iCloud.$(CSEC_IDENTIFIER)"
+problems = []
+ios_environment = "$(CSEC_CLOUDKIT_ENVIRONMENT)"
+extension = "ios/ConvenientSecurityApprovalNotifications/ConvenientSecurityApprovalNotifications.entitlements"
+for path, environment, push, container in [
+    ("packaging/agent/csecd.entitlements", "Production", None, mac_container),
+    ("ios/ConvenientSecurityApproval/ConvenientSecurityApproval.entitlements", ios_environment, "development",
+     ios_container),
+    ("ios/ConvenientSecurityApproval/ConvenientSecurityApproval.production.entitlements", ios_environment,
+     "production", ios_container),
+    (extension, ios_environment, None, ios_container),
+]:
+    entitlements = plistlib.loads((root / path).read_bytes())
+    expected = {
+        "com.apple.developer.icloud-container-environment": environment,
+        "com.apple.developer.icloud-container-identifiers": [container],
+        "com.apple.developer.icloud-services": ["CloudKit"],
+        "com.apple.developer.icloud-container-development-container-identifiers": None,
+        "aps-environment": push,
+    }
+    for key, value in expected.items():
+        if entitlements.get(key) != value:
+            problems.append(f"{path}: {key} is {entitlements.get(key)!r}, expected {value!r}")
+app_group = "$(AppIdentifierPrefix)$(CSEC_IDENTIFIER).approval"
+groups = plistlib.loads((root / extension).read_bytes()).get("keychain-access-groups")
+if groups != [app_group]:
+    problems.append(f"{extension}: keychain-access-groups is {groups!r}, expected exactly [{app_group!r}]")
+for path in ["agent/Sources/CSECRemoteApprovalCloudKit/CloudKitRemoteApprovalRelay.swift",
+             "ios/ConvenientSecurityApproval/PhoneIdentityStore.swift"]:
+    if "CSECBuildIdentity.cloudKitContainer" not in (root / path).read_text():
+        problems.append(f"{path} does not name the CloudKit container CSECBuildIdentity.cloudKitContainer")
+for problem in problems:
+    print(f"Mac and iPhone CloudKit entitlements must stay aligned: {problem}", file=sys.stderr)
+sys.exit(1 if problems else 0)
+PY
+# The CloudKit schema deployed to the container (packaging/cloudkit, imported
+# with cktool and deployed to Production in the CloudKit Console) must define
+# every record type the relay reads or writes, with deviceID and — for every
+# type but the alert, which carries no envelope — payload, and index the
+# request type's record name: the phone lists pending requests with a query,
+# and Production creates no record type or index on the fly.
+python3 - "$repo_root" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+relay = (root / "agent/Sources/CSECRemoteApprovalCloudKit/CloudKitRemoteApprovalRelay.swift").read_text()
+schema = (root / "packaging/cloudkit/remote-approval.ckdb").read_text()
+constants = dict(re.findall(r'static let (\w+RecordType) = "([^"]+)"', relay))
+types = {name: body for name, body in re.findall(r'RECORD TYPE (\w+) \((.*?)\);', schema, re.S)}
+problems = []
+if not constants:
+    problems.append("no record-type constants found in CloudKitRemoteApprovalRelay.swift")
+for constant, record_type in sorted(constants.items()):
+    body = types.get(record_type)
+    if body is None:
+        problems.append(f"{constant} = {record_type} is not in packaging/cloudkit/remote-approval.ckdb")
+        continue
+    fields = ("deviceID",) if constant == "alertRecordType" else ("payload", "deviceID")
+    for field in fields:
+        if not re.search(rf"^\s*{field}\s", body, re.M):
+            problems.append(f"{record_type} lacks the {field} field")
+request = constants.get("requestRecordType")
+if request and request in types and not re.search(r'"___recordID"\s+REFERENCE\s+QUERYABLE', types[request]):
+    problems.append(f"{request} must index ___recordID as QUERYABLE")
+for problem in problems:
+    print(f"CloudKit schema: {problem}", file=sys.stderr)
+sys.exit(1 if problems else 0)
+PY
+# project.yml is the one source of the app's entitlements per configuration,
+# its version and build number (Info.plist reads both), and the bundle
+# identifier build-and-install.sh reads back from the phone.
+ruby -ryaml -e '
+  project = YAML.safe_load(File.read(ARGV.fetch(0)))
+  target = project.dig("targets", "ConvenientSecurityApproval") or abort "ios/project.yml: target is missing"
+  configs = target.dig("settings", "configs")
+  expected = {
+    "Debug" => "ConvenientSecurityApproval/ConvenientSecurityApproval.entitlements",
+    "Release" => "ConvenientSecurityApproval/ConvenientSecurityApproval.production.entitlements",
+  }
+  actual = configs&.transform_values { |settings| settings["CODE_SIGN_ENTITLEMENTS"] }
+  abort "iOS build configurations must select matching CloudKit entitlements" unless actual == expected
+  base = target.dig("settings", "base") || {}
+  project_base = project.dig("settings", "base") || {}
+  abort "ios/project.yml: MARKETING_VERSION must be set once, in the project settings.base" unless
+    project_base["MARKETING_VERSION"].is_a?(String) && !project_base["MARKETING_VERSION"].empty?
+  abort "ios/project.yml: CURRENT_PROJECT_VERSION must be one quoted integer (build-and-install.sh appends its stamp)" unless
+    project_base["CURRENT_PROJECT_VERSION"].is_a?(String) && project_base["CURRENT_PROJECT_VERSION"].match?(/\A[0-9]+\z/)
+  properties = target.dig("info", "properties") || {}
+  abort "ios/project.yml: Info.plist must read the version and build number from the build settings" unless
+    properties["CFBundleShortVersionString"] == "$(MARKETING_VERSION)" &&
+    properties["CFBundleVersion"] == "$(CURRENT_PROJECT_VERSION)"
+  abort "ios/project.yml: the app must answer ITSAppUsesNonExemptEncryption: false (ios/README.md, App Store release)" unless
+    properties["ITSAppUsesNonExemptEncryption"] == false
+  abort "ios/project.yml: settings.base.CSEC_CLOUDKIT_ENVIRONMENT must be Production" unless
+    project.dig("settings", "base", "CSEC_CLOUDKIT_ENVIRONMENT") == "Production"
+  project.fetch("targets").each do |name, spec|
+    settings = [spec.dig("settings", "base") || {}] + (spec.dig("settings", "configs") || {}).values
+    %w[CSEC_CLOUDKIT_ENVIRONMENT MARKETING_VERSION CURRENT_PROJECT_VERSION].each do |key|
+      abort "ios/project.yml: #{name} must not override #{key}" if settings.any? { |values| values.key?(key) }
+    end
+  end
+  extension = project.dig("targets", "ConvenientSecurityApprovalNotifications") or
+    abort "ios/project.yml: the notification extension target is missing"
+  abort "ios/project.yml: the app must embed the notification extension" unless
+    (target["dependencies"] || []).any? { |dependency| dependency["target"] == "ConvenientSecurityApprovalNotifications" }
+  extension_properties = extension.dig("info", "properties") || {}
+  abort "ios/project.yml: the extension Info.plist must read the version and build number from the build settings" unless
+    extension_properties["CFBundleShortVersionString"] == "$(MARKETING_VERSION)" &&
+    extension_properties["CFBundleVersion"] == "$(CURRENT_PROJECT_VERSION)"
+  # Both name the identifier from identity.xcconfig through their own
+  # variable: $(CSEC_IDENTIFIER) in the project, $csec_identifier in the
+  # installer. The rest of the identifier must be the same.
+  installer_bundle_id = File.read(ARGV.fetch(1))[/^ios_bundle_id="([^"]+)"$/, 1]
+  abort "build-and-install.sh must verify the bundle identifier ios/project.yml builds" unless
+    installer_bundle_id &&
+    installer_bundle_id == base["PRODUCT_BUNDLE_IDENTIFIER"].to_s.sub("$(CSEC_IDENTIFIER)", "$csec_identifier")
+' "$repo_root/ios/project.yml" "$repo_root/packaging/bin/build-and-install.sh"
+
+echo "--- iPhone app (XcodeGen, then unsigned iOS Simulator and device builds) ---"
+# When the UI tests' simulator admission never starts within
+# CSEC_CI_SIMULATOR_WAIT_S (the M1 is loaded), the stage leaves this marker and
+# the remaining checks still run, so their results are not lost; bin/ci fails
+# at the end. The subshell cannot set a variable here.
+ios_admission_scratch="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/csec-ios-admission.XXXXXX")"
+ios_ui_not_admitted="$ios_admission_scratch/not-admitted"
+# Generate the project with the XcodeGen pinned in .tool-versions and compile
+# both destinations: the Simulator build is the DEBUG && simulator test backend,
+# the device build is the Secure Enclave path the installed app runs. The
+# generated project is untracked; the generated Info.plist is tracked, so
+# generation must reproduce it byte for byte. Neither build is signed; the UI
+# tests that follow build once more, signed ad hoc for the Simulator.
+if ! command -v mise >/dev/null 2>&1; then
+  echo "error: mise is required; it runs the XcodeGen pinned in .tool-versions" >&2
+  exit 1
+fi
+(
+  # The app's and the notification extension's Info.plist, both tracked.
+  ios_info_plists=(
+    "ConvenientSecurityApproval/Info.plist"
+    "ConvenientSecurityApprovalNotifications/Info.plist"
+  )
+  ios_scratch="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/csec-ios-ci.XXXXXX")"
+  for ios_plist in "${ios_info_plists[@]}"; do
+    /bin/mkdir -p "$ios_scratch/tracked/$(dirname "$ios_plist")"
+    cp "$repo_root/ios/$ios_plist" "$ios_scratch/tracked/$ios_plist"
+  done
+  # Whatever happens, leave the tracked plist as it was. The shared lifetime
+  # runner reaps the tests and confirms Shutdown before clone deletion.
+  ios_cleanup() {
+    for ios_plist in "${ios_info_plists[@]}"; do
+      /usr/bin/cmp -s "$ios_scratch/tracked/$ios_plist" "$repo_root/ios/$ios_plist" ||
+        cp "$ios_scratch/tracked/$ios_plist" "$repo_root/ios/$ios_plist"
+    done
+    /bin/rm -rf "$ios_scratch"
+  }
+  trap ios_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  mise exec -C "$repo_root" -- xcodegen generate --quiet --spec "$repo_root/ios/project.yml"
+  for ios_plist in "${ios_info_plists[@]}"; do
+    if ! /usr/bin/cmp -s "$ios_scratch/tracked/$ios_plist" "$repo_root/ios/$ios_plist"; then
+      /usr/bin/diff -u "$ios_scratch/tracked/$ios_plist" "$repo_root/ios/$ios_plist" >&2 || true
+      echo "xcodegen does not reproduce the tracked ios/$ios_plist (diff above; the tracked file is left unchanged): set Info.plist keys in ios/project.yml info.properties, regenerate, and commit the generated file" >&2
+      exit 1
+    fi
+  done
+  for ios_destination in "generic/platform=iOS Simulator" "generic/platform=iOS"; do
+    xcodebuild -quiet -jobs 2 \
+      -project "$repo_root/ios/ConvenientSecurityApproval.xcodeproj" \
+      -scheme ConvenientSecurityApproval \
+      -configuration Debug \
+      -destination "$ios_destination" \
+      -derivedDataPath "$ios_scratch/DerivedData" \
+      build CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
+  done
+  # The Release device build is what TestFlight distribution ships
+  # (csec-vo4.14): it compiles with warnings as errors too, and carries no
+  # Simulator-only code either.
+  xcodebuild -quiet -jobs 2 \
+    -project "$repo_root/ios/ConvenientSecurityApproval.xcodeproj" \
+    -scheme ConvenientSecurityApproval \
+    -configuration Release \
+    -destination "generic/platform=iOS" \
+    -derivedDataPath "$ios_scratch/DerivedData" \
+    build CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
+
+  # The Simulator test backend and the UI tests' hooks (launch arguments, the
+  # counters, the fixtures) compile only under DEBUG &&
+  # targetEnvironment(simulator). The installed app is a Debug device build,
+  # so DEBUG alone would ship them: their strings must be in the Simulator
+  # build and nowhere in the device build.
+  ios_products="$ios_scratch/DerivedData/Build/Products"
+  for ios_marker in \
+    "--csec-simulator-erase-identity" \
+    "--csec-simulator-seed-legacy-identity" \
+    "--csec-simulator-refuse-subscription" \
+    "--csec-simulator-refuse-settled-subscription" \
+    "--csec-simulator-seed-undecodable-identity" \
+    "--csec-simulator-seed-mismatched-identity" \
+    "--csec-simulator-refuse-keychain-reads" \
+    "--csec-simulator-mailbox" \
+    "--csec-simulator-icloud-signed-out" \
+    "--csec-simulator-open-alert-for-hidden-request" \
+    "Simulated mailbox: " \
+    "Stop refusing Keychain reads (Simulator)" \
+    "Simulator counters: Face ID prompts " \
+    "SIMULATOR TEST MODE" \
+    "Inject signed sample request" \
+    "SSH from a script auto mode declined" \
+    "sudo auto mode declined" \
+    "Lookalike Mac"; do
+    if ! grep -r -a -F -q -e "$ios_marker" "$ios_products/Debug-iphonesimulator/ConvenientSecurityApproval.app"; then
+      echo "the Simulator build lacks \"$ios_marker\", so this check cannot see it: update the marker list" >&2
+      exit 1
+    fi
+    for ios_device_build in Debug-iphoneos Release-iphoneos; do
+      if grep -r -a -F -q -e "$ios_marker" "$ios_products/$ios_device_build/ConvenientSecurityApproval.app"; then
+        echo "the $ios_device_build build carries Simulator-only test code (\"$ios_marker\"): gate it with DEBUG && targetEnvironment(simulator)" >&2
+        exit 1
+      fi
+    done
+  done
+
+  # The reviewer demo is the opposite: App Review sees a Release build, so it
+  # must be in every build.
+  for ios_marker in "Try a demo request" "Demo: sample requests"; do
+    for ios_build in Debug-iphonesimulator Debug-iphoneos Release-iphoneos; do
+      if ! grep -r -a -F -q -e "$ios_marker" "$ios_products/$ios_build/ConvenientSecurityApproval.app"; then
+        echo "the $ios_build build lacks the reviewer demo (\"$ios_marker\"): it must not be gated to a configuration" >&2
+        exit 1
+      fi
+    done
+  done
+
+  # App Store requirements the Release build must carry (ios/README.md, "App
+  # Store release"): a privacy manifest in the app and in the extension, and
+  # the export-compliance answer. Both manifests declare no required-reason
+  # API, so neither binary may call one; if one ever does, declare it with an
+  # approved reason and change this list with it.
+  ios_release_app="$ios_products/Release-iphoneos/ConvenientSecurityApproval.app"
+  ios_release_appex="$ios_release_app/PlugIns/ConvenientSecurityApprovalNotifications.appex"
+  if [ "$(/usr/libexec/PlistBuddy -c "Print :ITSAppUsesNonExemptEncryption" "$ios_release_app/Info.plist")" != false ]; then
+    echo "the Release iPhone app must say ITSAppUsesNonExemptEncryption NO (ios/README.md, App Store release)" >&2
+    exit 1
+  fi
+  for ios_bundle in "$ios_release_app/ConvenientSecurityApproval" \
+    "$ios_release_appex/ConvenientSecurityApprovalNotifications"; do
+    ios_manifest="$(dirname "$ios_bundle")/PrivacyInfo.xcprivacy"
+    plutil -lint -s "$ios_manifest" || {
+      echo "$ios_manifest is missing or invalid: every target the App Store build ships needs its privacy manifest" >&2
+      exit 1
+    }
+    if nm -u "$ios_bundle" | grep -E '^_(stat|fstat|lstat|fstatat|getattrlist|fgetattrlist|getattrlistat|getattrlistbulk|statfs|fstatfs|statvfs|fstatvfs|mach_absolute_time)$' >/dev/null ||
+      strings -a "$ios_bundle" | grep -E 'systemUptime|NSUserDefaults|activeInputModes|volumeAvailableCapacity|NSFileSystemFreeSize|NSFileSystemSize|NSFileModificationDate|NSFileCreationDate|contentModificationDate|fileModificationDate|creationDate' >/dev/null; then
+      echo "$(basename "$ios_bundle") now calls a required-reason API: declare it in $ios_manifest (https://developer.apple.com/documentation/bundleresources/describing-use-of-required-reason-api)" >&2
+      exit 1
+    fi
+  done
+
+  echo "--- iPhone app UI tests (throwaway iOS Simulator, simulated Face ID) ---"
+  # ios/ConvenientSecurityApprovalUITests drives the Simulator test mode:
+  # setup and the notification prompt, each kind of card, Face ID matching,
+  # refused and cancelled, the largest text size, long and misleading
+  # metadata. The runner simulates Face ID itself with Darwin notifications
+  # inside the Simulator. A new Simulator per run (the smallest Face ID iPhone
+  # the newest iOS runtime offers), cloned from a base no app was ever
+  # installed on, makes the first setup ask for notification permission,
+  # which the tests then require. Its lease confirms Shutdown before deletion;
+  # legacy/live devices are preserved, and shutdown warm bases are kept.
+  ios_uitest_started="$(date +%s)"
+  ios_choice="$(xcrun simctl list runtimes --json | python3 -c '
+import json, sys
+runtimes = [r for r in json.load(sys.stdin)["runtimes"]
+            if r.get("isAvailable") and r.get("platform") == "iOS"]
+if not runtimes:
+    sys.exit("no iOS Simulator runtime is installed: xcodebuild -downloadPlatform iOS")
+runtime = max(runtimes, key=lambda r: [int(part) for part in r["version"].split(".")])
+runtime_name = runtime["name"]
+supported = {t["name"]: t["identifier"] for t in runtime.get("supportedDeviceTypes", [])}
+# The smallest screens with Face ID first; any Face ID iPhone after them.
+preferred = ["iPhone 13 mini", "iPhone 12 mini", "iPhone 16e", "iPhone 17e"]
+face_id = [name for name in supported if name.startswith("iPhone") and "SE" not in name]
+names = [name for name in preferred if name in supported] + sorted(face_id)
+if not names:
+    sys.exit(f"{runtime_name} offers no iPhone with Face ID")
+print(runtime["identifier"], runtime["buildversion"], supported[names[0]], f"{names[0]}, {runtime_name}", sep="\t")
+')"
+  IFS=$'\t' read -r ios_runtime ios_runtime_build ios_device_type ios_device_description <<<"$ios_choice"
+  # Admission precedes the nonbooting selector. A cold base gets a separate
+  # lease; this command stays alive through build/test, reap and shutdown.
+  ios_uitest_status=0
+  python3 "$repo_root/bin/ci-ios-simulator.py" run \
+    --runtime "$ios_runtime" --runtime-build "$ios_runtime_build" \
+    --device-type "$ios_device_type" -- \
+    "$repo_root/bin/ci-ios-ui-tests" "$ios_scratch" "$ios_device_description" || ios_uitest_status=$?
+  case "$ios_uitest_status" in
+    0) echo "iPhone UI tests passed in $(( $(date +%s) - ios_uitest_started ))s, Simulator included" ;;
+    76)
+      touch "$ios_ui_not_admitted"
+      echo "iPhone UI tests did not start: no simulator admission within CSEC_CI_SIMULATOR_WAIT_S; the remaining checks run, then bin/ci fails" >&2
+      ;;
+    *) exit "$ios_uitest_status" ;;
+  esac
+)
+ruby -c "$repo_root/packaging/fastlane/Fastfile"
+# The spike's sources take the team and identifier from the identity module's
+# files, compiled in; a module's top-level code must be in its main.swift.
+identity_swift_sources=("$repo_root/agent/Sources/CSECBuildIdentity/"*.swift)
+swiftc "$repo_root/packaging/spike/main.swift" "${identity_swift_sources[@]}" \
+  -o "$swift_scratch/keychain-spike-compile-check"
+mkdir -p "$swift_scratch/unentitled-keychain-probe"
+cp "$repo_root/packaging/spike/unentitled-keychain-probe.swift" \
+  "$swift_scratch/unentitled-keychain-probe/main.swift"
+swiftc "$swift_scratch/unentitled-keychain-probe/main.swift" "${identity_swift_sources[@]}" \
+  -o "$swift_scratch/unentitled-keychain-probe-compile-check"
+clang -fsyntax-only -Wall -Wextra -Werror \
+  -I "$repo_root/agent/Sources/CSecuritySupport/include" \
+  "$repo_root/agent/Sources/CSecuritySupport/CSecuritySupport.c"
+clang -fsyntax-only -Wall -Wextra -Werror \
+  -I "$repo_root/agent/Sources/CSECSecretHeuristics/include" \
+  "$repo_root/agent/Sources/CSECSecretHeuristics/CSECSecretHeuristics.c"
+clang -fsyntax-only -Wall -Wextra -Werror \
+  "$repo_root/agent/Sources/cs-file-probe/main.c"
+clang -fsyntax-only -Wall -Wextra -Werror \
+  "$repo_root/agent/Sources/cs-gh-fixture/main.c"
+
+# Every distributed surface must carry the same FSL terms. RubyGems represents
+# licences outside its SPDX allow-list as "Nonstandard"; LICENSE.md is the
+# authoritative identifier and text.
+cmp "$repo_root/LICENSE.md" "$repo_root/clients/ruby/LICENSE.md"
+cmp "$repo_root/LICENSE.md" "$repo_root/clients/node/LICENSE.md"
+(
+  cd "$repo_root/clients/ruby"
+  ruby -e '
+    spec = Gem::Specification.load("convenient_security.gemspec")
+    abort "gem licence metadata is not Nonstandard" unless spec.license == "Nonstandard"
+    abort "gem omits LICENSE.md" unless spec.files.include?("LICENSE.md")
+    abort "gem omits README.md" unless spec.files.include?("README.md")
+    abort "RubyGems MFA is not required" unless spec.metadata["rubygems_mfa_required"] == "true"
+  '
+)
+node -e '
+  const spec = require(process.argv[1]);
+  if (spec.license !== "SEE LICENSE IN LICENSE.md") {
+    throw new Error("npm package licence metadata must point to LICENSE.md");
+  }
+  if (!spec.files.includes("LICENSE.md") || !spec.files.includes("README.md")) {
+    throw new Error("npm package omits its licence or README");
+  }
+' "$repo_root/clients/node/package.json"
+
+# Prove the inherited private-key handoff used by provisioning survives exec
+# while remaining outside argv/environment/disk. The marker is synthetic test data.
+fd_marker="csec-synthetic-inherited-fd"
+exec 9< <(printf %s "$fd_marker")
+ruby -e 'abort "inherited fd handoff failed" unless File.binread(ARGV.fetch(0)) == ARGV.fetch(1)' \
+  /dev/fd/9 "$fd_marker"
+exec 9<&-
+
+# notarytool requires a filesystem path for --key. Prove its narrowly scoped
+# staging helper uses private modes, preserves exact bytes, cleans on success,
+# and removes a partial file when the producer fails. No real key or network is
+# involved.
+(
+  source "$repo_root/packaging/bin/notarize.sh"
+  notary_test_root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/csec-notary-test.XXXXXX")"
+  trap '/bin/rm -rf "$notary_test_root"' EXIT
+  export TMPDIR="$notary_test_root"
+  notary_marker="csec-synthetic-notary-key"
+
+  stage_notary_key_from_command /usr/bin/printf %s "$notary_marker"
+  [ "$(/usr/bin/stat -f %Lp "$notary_key_directory")" = "700" ]
+  [ "$(/usr/bin/stat -f %Lp "$notary_key_file")" = "600" ]
+  [ "$(/bin/cat "$notary_key_file")" = "$notary_marker" ]
+  staged_key_directory="$notary_key_directory"
+  staged_key_file="$notary_key_file"
+  cleanup_notary_key
+  [ ! -e "$staged_key_file" ]
+  [ ! -e "$staged_key_directory" ]
+
+  if stage_notary_key_from_command /bin/sh -c 'printf partial; exit 1'; then
+    echo "notary key staging accepted a failed producer" >&2
+    exit 1
+  fi
+  [ -z "$(/usr/bin/find "$notary_test_root" -mindepth 1 -print -quit)" ]
+)
+
+# A2: protected Keychain stores. The signed unentitled probe must try every item
+# ProtectedStores.swift declares, and no other shipping source may name a
+# protected item's service, so every access goes through the explicit-group,
+# ordered, write-or-delete primitive. Each item is bound to at most one shipping
+# document type (csecd also refuses a second type at runtime), and the
+# substitute-SecItem factory exists for tests only.
+protected_stores="$repo_root/agent/Sources/ConvenientSecurity/ProtectedStores.swift"
+unentitled_probe="$repo_root/packaging/spike/unentitled-keychain-probe.swift"
+protected_item_pairs="$(
+  rg -o --no-filename 'service: CSECBuildIdentity\.named\("([^"]+)"\), account: "([^"]+)"' -r '$1 $2' \
+    "$protected_stores" || true
+)"
+protected_item_count="$(rg -c '= ProtectedItem\($' "$protected_stores" || true)"
+if [ -z "$protected_item_pairs" ] ||
+  [ "$(printf '%s\n' "$protected_item_pairs" | wc -l | tr -d ' ')" != "${protected_item_count:-0}" ]; then
+  echo "ProtectedStores.swift: declare each ProtectedItem's service and account on one line" >&2
+  exit 1
+fi
+while read -r protected_service protected_account; do
+  if ! rg -F -q "(\"$protected_service\", \"$protected_account\")" "$unentitled_probe"; then
+    echo "unentitled-keychain-probe.swift does not try $protected_service/$protected_account" >&2
+    exit 1
+  fi
+  protected_service_users="$(
+    rg -l -F -e "CSECBuildIdentity.named(\"$protected_service\")" \
+      -e "CSECBuildIdentity.identifier).$protected_service\"" \
+      "$repo_root/agent/Sources" -g '!**/cs-selftest/**' |
+      rg -v -F -x "$protected_stores" || true
+  )"
+  if [ -n "$protected_service_users" ]; then
+    echo "only ProtectedStores.swift may name the protected service $protected_service:" >&2
+    echo "$protected_service_users" >&2
+    exit 1
+  fi
+done <<<"$protected_item_pairs"
+protected_binding_declarations="$(
+  { rg -c --no-filename 'static (let|var) protectedItem\b' "$repo_root/agent/Sources" \
+      -g '!**/cs-selftest/**' -g '!**/ConvenientSecurity/ProtectedStores.swift' || true; } |
+    awk '{ total += $1 } END { print total + 0 }'
+)"
+protected_bound_items="$(
+  rg -o --no-filename -r '$1' 'static (?:let|var) protectedItem\b[^.\n]*\.([A-Za-z]+)\b' \
+    "$repo_root/agent/Sources" -g '!**/cs-selftest/**' \
+    -g '!**/ConvenientSecurity/ProtectedStores.swift' || true
+)"
+protected_bound_count="$(printf '%s\n' "$protected_bound_items" | awk 'NF { n++ } END { print n + 0 }')"
+if [ "$protected_bound_count" != "$protected_binding_declarations" ]; then
+  echo "declare each ProtectedDocument's protectedItem on one line as ProtectedItem.<item> or .<item>" >&2
+  exit 1
+fi
+protected_double_bindings="$(printf '%s' "$protected_bound_items" | sort | uniq -d)"
+if [ -n "$protected_double_bindings" ]; then
+  echo "each protected item may be bound by one document type; bound more than once:" >&2
+  echo "$protected_double_bindings" >&2
+  exit 1
+fi
+if rg -l -F 'dataProtectionKeychain(calling:' "$repo_root/agent/Sources" \
+    -g '!**/cs-selftest/**' -g '!**/ConvenientSecurity/ProtectedStores.swift'; then
+  echo "only tests may build protected stores over substitute SecItem functions" >&2
+  exit 1
+fi
+
+# A4: Anthropic's designated requirement for Claude Code is pinned verbatim,
+# exactly once, in PeerIdentity.swift. An edited literal (a dropped anchor or
+# team clause) or a second requirement naming Anthropic's team elsewhere in
+# shipping code would weaken the identity check without failing a test.
+anthropic_requirement='identifier "com.anthropic.claude-code" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = Q6L2SF6YDW'
+peer_identity="$repo_root/agent/Sources/CSECRootProtocol/PeerIdentity.swift"
+pinned_requirements="$(rg -F -c "$anthropic_requirement" "$peer_identity" || true)"
+other_anthropic_requirements="$(
+  rg -l -F 'Q6L2SF6YDW' "$repo_root/agent/Sources" -g '!**/cs-selftest/**' |
+    rg -v -F "$peer_identity" || true
+)"
+if [ "${pinned_requirements:-0}" != "1" ] || [ -n "$other_anthropic_requirements" ]; then
+  echo "Anthropic's Claude Code requirement must appear verbatim exactly once, in PeerIdentity.swift" >&2
+  [ -n "$other_anthropic_requirements" ] && echo "$other_anthropic_requirements" >&2
+  exit 1
+fi
+
+# A1: requester-gone twins, the SSH review turn, and Deny semantics.
+# A review must never outlive its requester. The csec socket and the SSH agent
+# socket both cancel a request whose peer has closed and write nothing after it.
+socket_server="$repo_root/agent/Sources/ConvenientSecurity/SocketServer.swift"
+ssh_agent_server="$repo_root/agent/Sources/ConvenientSecurity/SSHAgentServer.swift"
+for server in "$socket_server" "$ssh_agent_server"; do
+  if ! rg -q 'peerHasClosed\(fd\)' "$server" ||
+    ! rg -q 'work\.cancel\(\)' "$server" ||
+    ! rg -q 'if await requesterGone\.isSet \{ return \}' "$server"; then
+    echo "$(basename "$server"): a request whose peer has closed must be cancelled and never answered" >&2
+    exit 1
+  fi
+done
+# A coding agent's wait on a human (csec-ia3q): both services bind a
+# HumanWait to every request and run it bounded, the UI queue marks a human
+# decision before the deadline can withdraw it and reports a never-shown
+# withdrawal as `.withdrawn`, and the restore panel never inherits the wait of
+# the request that happened to start it.
+agent_service="$repo_root/agent/Sources/ConvenientSecurity/Agent.swift"
+ssh_service="$repo_root/agent/Sources/ConvenientSecurity/SSHSigningService.swift"
+for service in "$agent_service" "$ssh_service"; do
+  if ! rg -q 'let wait = HumanWait\(' "$service" ||
+    ! rg -q 'await wait\.bounding \{' "$service" ||
+    ! rg -q 'HumanWait\.current\?\.effectiveReason\(reason\)' "$service" ||
+    ! rg -q 'DecisionLogRecord\.kind\(for: denial\)' "$service"; then
+    echo "$(basename "$service"): every request must run within its HumanWait and log a withdrawal as withdrawn" >&2
+    exit 1
+  fi
+done
+# Arrival-time orphan checks are shared by access and SSH, including restore
+# waits. Sudo deliberately keeps its own-parent watch/300 s PAM bound: failing
+# it early for sudo's parent would fall through to pam_tid.
+for service in "$agent_service" "$ssh_service"; do
+  if ! rg -q 'caller\.anchored\(using: processInspection[,)]' "$service" ||
+    ! rg -q 'requestAnchor: caller\.requestAnchor' "$service"; then
+    echo "$(basename "$service"): preserve the original parent/scope anchor throughout the request wait" >&2
+    exit 1
+  fi
+done
+if ! rg -q 'requestAnchor\?\.abandonment\(using: inspection\) == nil' "$trusted_review" ||
+  ! rg -q 'requestAnchor\.abandonment\(using: self\.processInspection\)' \
+    "$repo_root/agent/Sources/ConvenientSecurity/HumanWait.swift"; then
+  echo "csecd reviews must poll and recheck the same original request anchor on every layout" >&2
+  exit 1
+fi
+consent_queue="$repo_root/agent/Sources/ConvenientSecurity/ConsentQueue.swift"
+# Both runtime entry points must acquire the same cross-process turn before
+# either Mac/phone leg starts. The daemon's FIFO retains it through auth.
+if ! rg -F -q 'ConsentQueue(presentationLock: .shared)' "$repo_root/agent/Sources/csecd/AgentRuntime.swift" ||
+  ! rg -U -q 'SudoReviewRace\.run\(\n\s*presentationLock: \.shared,' "$sudo_helper" ||
+  ! rg -F -q 'presentationPermit = try await presentationLock?.acquire()' "$consent_queue" ||
+  ! rg -F -q 'presentationPermit?.release()' "$consent_queue" ||
+  ! rg -F -q 'permit = try await presentationLock?.acquire()' "$sudo_remote"; then
+  echo "all approval surfaces must share the cross-process turn around their complete Mac/phone review" >&2
+  exit 1
+fi
+if ! rg -q 'decidedInTime = wait\?\.decide\(\) \?\? true' "$consent_queue" ||
+  ! rg -q 'catch is CancellationError \{ return \.denied\(\.withdrawn\) \}' "$consent_queue" ||
+  ! rg -q 'review\.caller\.requestAnchor\?\.abandonment\(\)' "$consent_queue" ||
+  ! rg -q 'HumanWait\.current\?\.notifyWaiting\(\)' "$consent_queue"; then
+  echo "ConsentQueue.swift: the UI queue must latch decisions, withdraw lost callers (including shared restores), and tell a waiting request's session" >&2
+  exit 1
+fi
+if ! rg -U -q 'HumanWait\.\$current\.withValue\(nil\) \{\n\s*Task \{ await self\.present\(flightID\) \}' \
+  "$repo_root/agent/Sources/ConvenientSecurity/GrantRestoration.swift"; then
+  echo "GrantRestoration.swift: the restore panel must not inherit the HumanWait of the request that started it" >&2
+  exit 1
+fi
+if ! rg -q 'current\.shownWaiter == id' "$repo_root/agent/Sources/ConvenientSecurity/GrantRestoration.swift" ||
+  ! rg -q '!AccessReviewRequester\.isAlive\(waiter\.caller\)' "$repo_root/agent/Sources/ConvenientSecurity/GrantRestoration.swift"; then
+  echo "GrantRestoration.swift: a lost displayed caller must withdraw a shared restore for its surviving waiters" >&2
+  exit 1
+fi
+
+# Neither socket server blocks Swift's cooperative pool on a connection: every
+# socket read and write and every peer code-signature check in serve() runs on
+# the connection's own ConnectionLane, and the csec socket's writer writes on
+# its own queue. A quiet client parked a pool thread per connection, and one
+# per CPU wedged csecd (csec-hvmj).
+ruby -e '
+  ARGV.each do |path|
+    name = File.basename(path)
+    source = File.read(path)
+    serve = source[/private static func serve\(.*?\n    }\n/m] or abort "#{name}: serve is missing"
+    serve.each_line do |line|
+      next unless line =~ /PeerIdentity\.socketPeer\(|readFrame\(|readSSHFrame\(|writeFrame\(|writeSSHFrame\(/
+      abort "#{name}: `#{line.strip}` blocks; run it on the connection lane (ConnectionLane), never on the cooperative pool" unless
+        line.include?(".run")
+    end
+  end
+  writer = File.read(ARGV.fetch(0))
+  abort "SocketServer.swift: ConnectionWriter must write on its own queue, not as an actor on the cooperative pool" if
+    writer.include?("actor ConnectionWriter") || !writer.include?("private final class ConnectionWriter")
+' "$socket_server" "$ssh_agent_server"
+# Concurrent same-shape SSH connections wait behind one review: the signing
+# path takes the review turn before it can reach policyReview.reviewAccess, and
+# re-checks grants and human Denies while holding it. The public entry runs that
+# path (signArrived) within the request's HumanWait.
+ruby -e '
+  source = File.read(ARGV.fetch(0))
+  entry = source[/public func signSSHAuthentication\(.*?\n    }\n/m]
+  sign = source[/private func signArrived\(.*?\n    }\n/m]
+  hold = source[/private func signHoldingReviewTurn\(.*?\n    }\n/m]
+  abort "SSHSigningService: signing must go through signArrived and signHoldingReviewTurn" unless entry && sign && hold
+  bounded = entry.index("await wait.bounding {")
+  abort "SSHSigningService: signArrived must run within the request HumanWait" unless
+    bounded && entry.index("signArrived(") && bounded < entry.index("signArrived(")
+  abort "SSHSigningService: the entry may not take the turn or present a review itself" if
+    entry.include?("reviewTurns.acquire()") || entry.include?("policyReview.reviewAccess(")
+  turn = sign.index("reviewTurns.acquire()")
+  abort "SSHSigningService: take the SSH review turn before the review path" unless
+    turn && sign.index("signHoldingReviewTurn(") && turn < sign.index("signHoldingReviewTurn(")
+  abort "SSHSigningService: only the turn-holding path may present an SSH review" if
+    sign.include?("policyReview.reviewAccess(")
+  review = hold.index("policyReview.reviewAccess(")
+  abort "SSHSigningService: the turn-holding path must present the SSH review" unless review
+  %w[coveringGrantRoot( humanDenials.refuses( requesterIsAlive(].each do |check|
+    at = hold.index(check)
+    abort "SSHSigningService: #{check} must run before the SSH review" unless at && at < review
+  end
+' "$repo_root/agent/Sources/ConvenientSecurity/SSHSigningService.swift"
+# Before an unlock re-present, a csecd review re-checks that its requester is
+# alive. The sudo helper's twin is its parent watch: it closes when the sudo
+# that spawned it exits, and the PAM module reads the Ctrl-C/Ctrl-\ that sudo
+# holds pending and watches the terminal for a hangup.
+ruby -e '
+  body = File.read(ARGV.fetch(0))[/private func handleUnlockSignal\(\) \{.*?\n    }\n/m]
+  alive = body && body.index("AccessReviewRequester.isAlive(")
+  present = body && body.index("beginAuthentication()")
+  abort "TrustedAccessReviewSession.swift: the unlock re-present must re-check that the requester is alive" unless
+    alive && present && alive < present
+' "$trusted_review"
+if ! rg -q 'EVFILT_PROC' "$sudo_review" || ! rg -q 'NOTE_EXIT' "$sudo_review" ||
+  ! rg -q 'SudoReviewParentWatch\.start\(' "$sudo_helper" ||
+  ! rg -U -q '^private func runReview\(\n  originalParent: pid_t, review: SudoAuthorizationReviewRequest, deadline: SudoReviewDeadline\n\) -> Never \{\n  runWatchingParent\(originalParent: originalParent, deadline: deadline\)' "$sudo_helper"; then
+  echo "the sudo review helper must close when the sudo that spawned it exits (EVFILT_PROC NOTE_EXIT)" >&2
+  exit 1
+fi
+pam_module="$repo_root/packaging/sudo/pam_csec_sudo.c"
+if ! rg -q 'CSEC_REVIEW_WAIT_EXPIRED' "$pam_module" ||
+  ! rg -q 'state->expired = true;' "$pam_module" ||
+  ! rg -q 'return csec_review_guard\(pamh\);' "$pam_module" ||
+  ! rg -q 'return PAM_ABORT;' "$pam_module" ||
+  ! rg -F -q 'auth       requisite      /usr/local/lib/pam/pam_csec_sudo.so review_guard' \
+    "$repo_root/packaging/bin/install-sudo-review.sh" ||
+  ! rg -F -q 'replace_sudo_local "$configuration_backup"' \
+    "$repo_root/packaging/bin/install-sudo-review.sh"; then
+  echo "sudo review expiry must latch the requisite guard, and upgrades must restore their exact prior PAM policy on failure" >&2
+  exit 1
+fi
+if ! rg -q 'sigpending\(&pending\)' "$pam_module" ||
+  ! rg -q 'sigismember\(&pending, SIGINT\)' "$pam_module" ||
+  ! rg -q 'sigismember\(&pending, SIGQUIT\)' "$pam_module" ||
+  ! rg -q '\.events = POLLHUP' "$pam_module" ||
+  ! rg -q 'result = csec_supervise_review\(child, tty_watch, deadline\);' "$pam_module"; then
+  echo "pam_csec_sudo.c must end the review on a pending Ctrl-C/Ctrl-\\ and on a terminal hangup" >&2
+  exit 1
+fi
+# Only the human's own Deny is `.human`: the Deny button and closing the window.
+# Cancellation is the requester going away, never a decision.
+if [ "$(rg -c 'finishDenied\(\.human' "$trusted_review" || true)" != "2" ] ||
+  ! rg -U -q 'func cancel\(\) async \{\n\s*finishDenied\(\.requesterGone' "$trusted_review"; then
+  echo "TrustedAccessReviewSession.swift: only Deny and window close are human denials; cancel is requesterGone" >&2
+  exit 1
+fi
+
+# B1: the decision log and csec uninstall. Every log write (a sealed frame, the
+# checkpoint, the usage flush, pruning, a verification's repairs) and every
+# last-run write checks the protected stores' uninstalled state first, so
+# nothing csecd does after `csec uninstall` began (a SIGTERM flush included)
+# can recreate what it deleted. The uninstall_cleanup handler shows its one
+# Touch ID sheet before it enters that state, and enters it before deleting.
+# The checkpoint only moves forward, only past a finding that is durably
+# recorded, and after a full drive flush; decisions frames are fully synced;
+# segment numbers come only from verified segments; reads run off the log
+# actor; the shutdown flush cannot starve the clean mark; and children start
+# with SIGTERM at its default action. Only verified segments count toward a
+# stream's cap, so no planted or unremovable set-aside file can prune real
+# history; junk and foreign files are set aside only after their finding is
+# durable; a damaged segment that cannot be set aside never holds the log (it
+# is remembered, once recorded, and left out of later walks, on a list of
+# csecd's own segments that planted files can never push it off); a pruned segment
+# that cannot be unlinked leaves the live set, so it is not pruned again on
+# every append; every open of an existing name in a sealed record directory
+# is O_NONBLOCK, so a FIFO planted there cannot hold csecd on the open; and
+# the uninstaller never defaults to the real log directory.
+# `csec log` is dispatched and listed in help.
+decision_log="$repo_root/agent/Sources/ConvenientSecurity/DecisionLog.swift"
+decision_log_runtime="$repo_root/agent/Sources/ConvenientSecurity/DecisionLogRuntime.swift"
+agent_runtime="$repo_root/agent/Sources/csecd/AgentRuntime.swift"
+ruby -e '
+  log, runtime, stores, csecd, spawn, sealed = ARGV.map { |path| File.read(path) }
+  def body(source, signature)
+    source[/#{Regexp.escape(signature)}.*?\n    }\n/m] or abort "missing #{signature}"
+  end
+  write = body(log, "private func writeFrame(")
+  abort "DecisionLog.swift: writeFrame must refuse every write once uninstall began" unless
+    write =~ /\A[^\n]*\n(?:[^\n]*\n){0,5}\s*guard state == \.active, !stores\.isUninstalled/
+  ["createExclusive(", "append(sealed.frame"].each do |call|
+    abort "DecisionLog.swift: #{call} may appear only in writeFrame" unless
+      log.scan(call).size == 1 && write.include?(call)
+  end
+  checkpoint = body(log, "private func commitCheckpoint(")
+  prepare = checkpoint.index("checkpointStore.prepare(")
+  abort "DecisionLog.swift: the checkpoint is written only by commitCheckpoint, after the uninstalled check" unless
+    log.scan("checkpointStore.prepare(").size == 1 && prepare &&
+    checkpoint.index("!stores.isUninstalled") && checkpoint.index("!stores.isUninstalled") < prepare
+  abort "DecisionLog.swift: a checkpoint never moves a head back, and follows a full drive flush" unless
+    checkpoint.index("advancesAnchor(") && checkpoint.index("advancesAnchor(") < prepare &&
+    checkpoint.index("fullSynchronize()") && checkpoint.index("fullSynchronize()") < prepare
+  finish = body(log, "private func finishLoad(")
+  hold = finish.index("return holdAtCheckpoint(")
+  abort "DecisionLog.swift: a load commits its checkpoint only after its findings are recorded" unless
+    hold && finish.index("commitCheckpoint()") && hold < finish.index("commitCheckpoint()")
+  abort "DecisionLog.swift: decisions frames are fully synced" unless
+    body(log, "public func record(").include?("sync: stream == .decisions ? .full : .none")
+  abort "DecisionLog.swift: segment numbers come only from verified segments" unless
+    log.scan(/nextNumber = /).size == 1 &&
+    log.include?("next.nextNumber = (next.segments.last?.name.number ?? 0) + 1")
+  abort "DecisionLog.swift: a read scans off the log actor" unless
+    log.include?("public nonisolated func read(")
+  prune = body(log, "private func pruneIfNeeded(")
+  abort "DecisionLog.swift: live pruning is driven by verified segments alone, never set-aside files" unless
+    prune.include?("current.liveBytes > limits.cap(for: stream)") && !prune.include?("totalBytes") &&
+    !log.include?("var totalBytes")
+  held = finish.index("return holdAtCheckpoint(")
+  aside = finish.index("for entry in deferred")
+  abort "DecisionLog.swift: junk and foreign files are set aside only after their finding is recorded" unless
+    aside && held < aside
+  unmovable = finish.index("for entry in chainUnmovable")
+  abort "DecisionLog.swift: a chain segment that cannot be set aside never holds the log, and is remembered only once its finding is recorded" unless
+    !log.include?("setAsideFailed") && unmovable && held < unmovable
+  abort "DecisionLog.swift: only csecd own damaged segments go on the excluded list, after the ones already there, and are never evicted for planted files" unless
+    log.include?("name.fileName, isOwnSegment(name, stream: stream, key: frameKey)") &&
+    finish.include?("var nowExcluded = stillExcluded") &&
+    finish.include?("if entry.ownSegment { nowExcluded.append(digest) } else { nowUnmovable.append(digest) }") &&
+    finish.include?("excludedSegments = Array(Self.orderedUnique(nowExcluded).prefix(DecisionLogCheckpoint.maximumExcludedSegments))") &&
+    log.scan("stillExcluded.append(").size == 1 && log.include?("if excluded { stillExcluded.append(digest) } else { stillUnmovable.append(digest) }")
+  abort "DecisionLog.swift: a pruned segment that cannot be unlinked leaves the live set, so it is pruned once, not on every append" unless
+    prune =~ /if \(try\? directory\.remove\(oldest\.name\.fileName\)\) == nil \{\n\s*unremovable\.insert\(oldest\.name\.fileName\)\n\s*\}\n\s*streams\[stream\]\?\.segments\.removeAll \{ \$0\.name == oldest\.name \}/
+  abort "SealedRecordFile.swift: every open of an existing name is O_NONBLOCK, so a planted FIFO cannot hold csecd on the open" unless
+    sealed.scan("openat(").size == 4 && sealed.scan("openRepairing(").size == 2 &&
+    sealed.include?("openRepairing(directoryFD, name, flags | O_NONBLOCK)") &&
+    sealed.scan(/\bopen\(\$0, /).size == 2 &&
+    sealed.include?("let flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC") &&
+    sealed.lines.grep(/O_CREAT/).all? { |line| line.include?("O_EXCL") }
+  abort "DecisionLogRuntime.swift: the uninstaller must be told which log directory to delete" unless
+    runtime.include?("logDirectory: SealedRecordDirectory,") &&
+    !runtime.include?("logDirectory: SealedRecordDirectory = ")
+  ["public func flushUsageCheckpoint(", "private func pruneIfNeeded("].each do |signature|
+    abort "DecisionLog.swift: #{signature} must check the uninstalled state" unless
+      body(log, signature).include?("!stores.isUninstalled")
+  end
+  ["public func open(", "public func verify("].each do |signature|
+    fn = body(log, signature)
+    guard = fn.index("guard !stores.isUninstalled")
+    abort "DecisionLog.swift: #{signature} must check the uninstalled state before loading" unless
+      guard && fn.index("load(") && guard < fn.index("load(")
+  end
+  loads = log.scan(/await load\(/).size
+  abort "DecisionLog.swift: only open() and verify() may load (and repair) the files" unless
+    loads == body(log, "public func open(").scan(/await load\(/).size +
+      body(log, "public func verify(").scan(/await load\(/).size
+  ["public func start(", "public func markCleanShutdown("].each do |signature|
+    fn = body(runtime, signature)
+    guard = fn.index("stores.isUninstalled")
+    abort "DecisionLogRuntime.swift: #{signature} must not write last-run once uninstall began" unless
+      guard && fn.index("store.prepare(") && guard < fn.index("store.prepare(")
+  end
+  flush = body(runtime, "public static func flush(")
+  abort "DecisionLogRuntime.swift: the SIGTERM flush writes nothing once uninstall began, and marks clean concurrently" unless
+    flush.include?("!stores.isUninstalled") && flush.include?("async let marked")
+  run = body(runtime, "public func run(caller:")
+  order = ["consent.authenticateSettingsChange(", "enterUninstalledState()", "delegation?.forgetForUninstall()",
+           "prepareDeletionOfAll()", "eraseForUninstall()"]
+  positions = order.map { |step| run.index(step) }
+  abort "DecisionLogRuntime.swift: uninstall must authenticate, enter the uninstalled state, drop the " \
+    "settings and pairings the delegation service holds, then delete" unless
+    positions.all? && positions == positions.sort
+  uninstaller = csecd[/let uninstaller = CsecdUninstaller\(.*?\n  \)/m].to_s
+  abort "AgentRuntime.swift: the uninstaller csecd builds must be given the delegation service to clear" unless
+    uninstaller.include?("delegation: delegation")
+  abort "ProtectedStores.swift: every write must be refused once uninstall began" unless
+    stores.include?("if backend.ledger.isUninstalled { throw ProtectedStoreError.uninstalled }") &&
+    stores.include?("if case .write = change, ledger.isUninstalled {")
+  handler = csecd[/case \.uninstallCleanup\(let request\):.*?case let \.completed/m]
+  abort "AgentRuntime.swift: the uninstall_cleanup handler must go through CsecdUninstaller.run" unless
+    handler && handler.include?("uninstaller.run(")
+  abort "AgentRuntime.swift: the SIGTERM handler must catch (never ignore) SIGTERM and run CsecdShutdown.flush" unless
+    csecd.include?("CsecdShutdown.catchTerminationSignal()") && csecd.include?("CsecdShutdown.flush(") &&
+    !csecd.include?("SIG_IGN")
+  abort "CommandExecution.swift: host-audit children start with default signal actions and nothing blocked" unless
+    spawn.include?("POSIX_SPAWN_SETSIGDEF") && spawn.include?("POSIX_SPAWN_SETSIGMASK") &&
+    spawn.include?("posix_spawnattr_setsigdefault(") && spawn.include?("posix_spawnattr_setsigmask(")
+' "$decision_log" "$decision_log_runtime" \
+  "$repo_root/agent/Sources/ConvenientSecurity/ProtectedStores.swift" "$agent_runtime" \
+  "$repo_root/agent/Sources/ConvenientSecurity/HostAudit/CommandExecution.swift" \
+  "$repo_root/agent/Sources/ConvenientSecurity/SealedRecordFile.swift"
+if ! rg -q 'name: "log",' "$repo_root/agent/Sources/ConvenientSecurity/HostAudit/Presentation/CLIHelp.swift" ||
+  ! rg -q '^case "log":' "$repo_root/agent/Sources/csec/main.swift"; then
+  echo "csec log must be dispatched and listed in the help catalog" >&2
+  exit 1
+fi
+# Where a human decided is reported explicitly, never inferred: every human
+# Deny the Mac panel makes says `on: .mac` with when the panel was shown, its
+# approval says `decidedOn: .mac`, the phone's decisions say `.phone`, and the
+# UI queue carries the surface, time to decision and whether the pairing line
+# was shown through its rewrap. A pairing rests on `pairingLineShown`, which
+# only the Mac panel, the phone mirror and the queue's passthrough set.
+panel_review="$repo_root/agent/Sources/ConvenientSecurity/TrustedAccessReviewSession.swift"
+mirrored_review="$repo_root/agent/Sources/ConvenientSecurity/RemoteApprovalPolicyReview.swift"
+queued_review="$repo_root/agent/Sources/ConvenientSecurity/ConsentQueue.swift"
+panel_human_denials="$(rg -c '\.human\(' "$panel_review" || true)"
+panel_mac_denials="$(rg -c '\.human\(decidedAt: \.now, on: \.mac, shownAt: (presentedAt|shownAt)\)' "$panel_review" || true)"
+if [ "${panel_human_denials:-0}" != "3" ] || [ "${panel_mac_denials:-0}" != "3" ] ||
+  ! rg -q 'decidedOn: \.mac$' "$panel_review" ||
+  [ "$(rg -c '\.human\(' "$mirrored_review" || true)" != "1" ] ||
+  ! rg -q '\.human\(decidedAt: receivedAt, on: \.phone\)' "$mirrored_review" ||
+  ! rg -q 'decidedOn: \.phone$' "$mirrored_review" ||
+  ! rg -q 'decisionLatency: approval\.decisionLatency,' "$queued_review" ||
+  ! rg -q 'pairingLineShown: approval\.pairingLineShown,' "$queued_review" ||
+  ! rg -q 'decidedOn: approval\.decidedOn$' "$queued_review"; then
+  echo "review decisions must report their surface (.mac or .phone) explicitly, and the queue must carry it" >&2
+  exit 1
+fi
+line_setters="$(rg -l 'pairingLineShown:' "$repo_root/agent/Sources/ConvenientSecurity" | sort | tr '\n' ' ' || true)"
+allowed_setters="$(printf '%s\n' "$queued_review" "$panel_review" "$repo_root/agent/Sources/ConvenientSecurity/PolicyReview.swift" "$mirrored_review" | sort | tr '\n' ' ')"
+for setter in $line_setters; do
+  case " $allowed_setters " in
+    *" $setter "*) ;;
+    *) echo "only the Mac panel, the phone mirror and the queue may say a pairing line was shown ($setter)" >&2; exit 1 ;;
+  esac
+done
+if ! rg -q 'pairingLineShown: pairingLabel\.map \{ !\$0\.isHidden \} \?\? false,' "$panel_review"; then
+  echo "TrustedAccessReviewSession.swift: the panel reports the pairing line from the label's own visibility" >&2
+  exit 1
+fi
+
+# B3: persisted grants and the restore panel. The restore panel is a variant of
+# the secret-access surface that approves nothing new: its layout carries no
+# control but the fail-safe button (no scope, duration, delegation note or
+# pairing line), and the context its touch evaluates is invalidated once the
+# listed batch is reopened. The grants item has one owner, which alone prepares
+# its writes, and a revocation is written through it before csec revoke gets
+# its reply.
+#
+# Which reviews reach the paired phone is provider-neutral: MirroredPolicyReview
+# asks the remote provider's readiness for every reference the operation touches,
+# a restore section's rows included (passed apart, since a restore reopens from
+# local sealed state only), and never tests a scheme or excludes a restore.
+# Automation enrollment and setup at the Mac (`macOnly`: every settings change
+# but the rules- and hooks-changed acknowledgement) stay on the Mac. A
+# phone approval's remote unlock is dropped once its release is done, and
+# a release mints its grant only after it resolved.
+restore_panel="$repo_root/agent/Sources/ConvenientSecurity/TrustedAccessReviewSession.swift"
+ruby -e '
+  panel, policy, mirror, restoration, agent = ARGV.map { |path| File.read(path) }
+  def body(source, signature)
+    source[/#{Regexp.escape(signature)}.*?\n    }\n/m] or abort "missing #{signature}"
+  end
+  configure = body(panel, "private func configureWindow(")
+  restore_branch = configure[/if review\.isRestoreOnly, let restore = review\.restore \{(.*?)\} else if let ssh = review\.ssh \{/m, 1]
+  abort "TrustedAccessReviewSession.swift: the restore-only layout must be its own first branch of configureWindow" unless restore_branch
+  section = body(panel, "private func makeRestoreSection(") + body(panel, "private static func makeRestoreRow(")
+  [restore_branch, section, body(policy, "public static func restoreOnly(")].each do |shape|
+    abort "a restore-only panel may carry no delegation note, pairing line or launcher pin" if shape =~ /delegat|pairing|launcher|pinned/i
+    abort "a restore-only panel offers no control but its fail-safe button" if shape =~ /NSButton\(|NSPopUpButton\(|makeScope|makeDuration|makeGrantCard/
+  end
+  abort "PolicyReview.swift: a restore-only review carries no credentials" unless
+    body(policy, "public static func restoreOnly(").include?("credentials: [],")
+  abort "TrustedAccessReviewSession.swift: the restore-only fail-safe button must say it forgets" unless
+    panel.include?("if review.isRestoreOnly { return RestoreReviewDetails.forgetButtonTitle }")
+  gate = mirror[/guard review\.automation == nil,.*?else \{/m]
+  abort "RemoteApprovalPolicyReview.swift: MirroredPolicyReview must keep automation enrollment and Mac-only setup on the Mac" unless
+    gate && gate.include?("!review.macOnly")
+  abort "RemoteApprovalPolicyReview.swift: MirroredPolicyReview mirrors by the remote provider readiness, never by a scheme or by excluding restore sections" if
+    gate.include?("restore") || gate.include?("isRestoreOnly") || mirror =~ /\.scheme\b|scheme ==|"op"|"csec"/
+  reachable = body(mirror, "static func remoteReferences(")
+  abort "RemoteApprovalPolicyReview.swift: restore section references count toward the phone readiness" unless
+    reachable.include?("review.restore?.rows") &&
+    body(mirror, "private func phoneReadiness(") =~ /return await remote\.remoteReadiness\(\s*for: references\.resolving, restoring: references\.restoring\s*\)/ &&
+    body(mirror, "public func reviewAccess(").include?("guard case let .ready(unlock) = readiness else {")
+  abort "Agent.swift: the remote unlock of a phone approval is dropped once its release is done" unless
+    agent.include?("if approvedUnlock?.isLocal == false { approvedUnlock?.invalidate() }")
+  policy_access = body(agent, "private func handlePolicyAccess(")
+  resolved = policy_access.rindex("await resolve(")
+  minted = policy_access.index("await grants.add(Grant(")
+  abort "Agent.swift: an approved release mints its grants only after it resolved" unless
+    resolved && minted && resolved < minted
+  reopen = body(restoration, "private func reopen(")
+  warm = reopen.index("resolver.warm(")
+  invalidate = reopen.index("unlock.invalidate()")
+  abort "GrantRestoration.swift: the restore context is invalidated right after the listed batch is warmed" unless
+    warm && invalidate && warm < invalidate
+  abort "Agent.swift: a mixed panel invalidates its context once its release is done" unless
+    agent.include?("if restoreClaim != nil { approvedUnlock?.invalidate() }")
+  grants = body(agent, "public func handleGrants(")
+  abort "Agent.swift: every revocation is persisted before csec revoke gets its reply" unless
+    grants.scan("grantPersistence?.persistNow(").size == 2
+  abort "Agent.swift: csec revoke --all also discards a grants item this csecd could not read" unless
+    grants.scan("grantPersistence?.persistNow(discardingUnreadable: true)").size == 1
+  # A mixed panel approves the new request above its restore section, so that
+  # section never says nothing new is approved; only restore-only panels do.
+  mixed_section = body(panel, "private func makeRestoreSection(")
+  abort "TrustedAccessReviewSession.swift: a mixed panel restore section uses mixedFootnote, never the restore-only footnote" unless
+    mixed_section.include?("restore.mixedFootnote") && !mixed_section.include?("restore.footnote")
+  mixed_copy = policy[/public var mixedFootnote: String \{.*?\n    }\n/m]
+  abort "PolicyReview.swift: the mixed panel note must not say nothing new is approved" if
+    mixed_copy.nil? || mixed_copy.include?("Nothing new")
+  # Every waiter is answered before a restore outcome is logged, so a request
+  # arriving during the log write is never refused by a flight that is over.
+  %w[reopen( forget( requesterWentAway( failed(].each do |name|
+    fn = body(restoration, "private func #{name}")
+    ended = fn.index("endFlight(")
+    logged = fn.index("recordRestore(")
+    abort "GrantRestoration.swift: #{name} must end the flight before it logs the outcome" unless
+      ended && logged && ended < logged
+  end
+' "$restore_panel" \
+  "$repo_root/agent/Sources/ConvenientSecurity/PolicyReview.swift" \
+  "$repo_root/agent/Sources/ConvenientSecurity/RemoteApprovalPolicyReview.swift" \
+  "$repo_root/agent/Sources/ConvenientSecurity/GrantRestoration.swift" \
+  "$repo_root/agent/Sources/ConvenientSecurity/Agent.swift"
+# The remote-unlock scalar inverse runs on the blinding scalar, which together
+# with the phone's answer would give the enrollment's unwrap secret, so it must
+# not branch on it. Its only conditionals are the four documented public ones:
+# the input length, the range check, the self-check of the result, and the bits
+# of the public exponent n - 2. Any other branch construct in `enum Scalar`
+# fails here, so a secret-dependent branch cannot come back unnoticed.
+ruby -e '
+  source = File.read(ARGV.fetch(0))
+  scalar = source[/\n    enum Scalar \{\n(.*?)\n    \}\n/m, 1] or abort "RemoteUnlockCrypto.swift: enum Scalar not found"
+  code = scalar.lines.map { |line| line.sub(%r{//.*}, "") }.join
+  allowed = [
+    "guard data.count == scalarBytes else { throw Failure.invalidScalar }",
+    "guard !isZero(value), lessThan(value, order) else { throw Failure.invalidScalar }",
+    "guard isEqual(multiply(value, result), one) else {",
+    "if bitOf(inverseExponent, bit) == 1 {",
+  ]
+  found = code.lines.map(&:strip).select { |line| line =~ /\b(if|guard|switch|while|case)\b|\?\s|&&|\|\||\b(min|max)\(/ }
+  stray = found - allowed
+  abort "RemoteUnlockCrypto.swift: enum Scalar may branch only on public values; found: #{stray.join(" | ")}" unless stray.empty?
+  abort "RemoteUnlockCrypto.swift: enum Scalar lost a documented public check: #{(allowed - found).join(" | ")}" unless (allowed - found).empty?
+' "$repo_root/agent/Sources/CSECRemoteApproval/RemoteUnlockCrypto.swift"
+# Setup at this Mac never reaches the phone: registering SSH keys and editing
+# or importing into a native store build their reviews `macOnly`, which
+# MirroredPolicyReview keeps local, and host remediation goes to the local
+# panel alone.
+ruby -e '
+  ssh, agent, mirror = ARGV.map { |path| File.read(path) }
+  registration = ssh[/Registering keys is setup at this Mac.*?let what = "register/m]
+  abort "SSHSigningService.swift: SSH key registration must build a macOnly review" unless
+    registration && registration.include?("macOnly: true")
+  edit = agent[/An edit or import is setup at this Mac.*?policyReview\.reviewAccess\(review\)/m]
+  abort "Agent.swift: a native edit or import must build a macOnly review" unless
+    edit && edit.include?("macOnly: true")
+  abort "RemoteApprovalPolicyReview.swift: MirroredPolicyReview must send host remediation to the local panel only" unless
+    mirror =~ /public func reviewHostRemediation\(\s*_ review: HostRemediationReview\s*\) async -> HostRemediationOutcome \{\s*await local\.reviewHostRemediation\(review\)\s*\}/
+' "$repo_root/agent/Sources/ConvenientSecurity/SSHSigningService.swift" \
+  "$repo_root/agent/Sources/ConvenientSecurity/Agent.swift" \
+  "$repo_root/agent/Sources/ConvenientSecurity/RemoteApprovalPolicyReview.swift"
+# A settings change reaches the phone only when it names a phone operation,
+# and only the rules- and hooks-changed acknowledgement does (av-rcqg): every
+# other settings panel, the delegation service's own setup steps included,
+# stays at this Mac.
+phone_operation_sites="$(rg -n --no-heading 'phoneOperationDigest:' "$repo_root/agent/Sources" \
+  -g '!**/cs-selftest/**' -g '!**/cs-e2e/**' || true)"
+phone_operation_builders="$(printf '%s\n' "$phone_operation_sites" |
+  grep -v -E 'PolicyReview\.swift:[0-9]+:[[:space:]]*(public let phoneOperationDigest: Data\?|phoneOperationDigest: Data\? = nil)$' |
+  sed -E 's#^.*/agent/Sources/##; s#:[0-9]+:[[:space:]]*# #' || true)"
+if [ "$phone_operation_builders" != "ConvenientSecurity/ClaudeDelegationService.swift phoneOperationDigest: complete ? acknowledgementDigest(hooks) : nil" ]; then
+  echo "only ClaudeDelegationService.changedRulesReview may give a settings change a phone operation; found: $phone_operation_builders" >&2
+  exit 1
+fi
+if ! ruby -e '
+  source = File.read(ARGV[0])
+  body = source[/public static func changedRulesReview\(.*?\n    \}\n/m]
+  exit(body && body.include?("phoneOperationDigest: complete ? acknowledgementDigest(hooks) : nil") ? 0 : 1)
+' "$repo_root/agent/Sources/ConvenientSecurity/ClaudeDelegationService.swift"; then
+  echo "ClaudeDelegationService.swift: the phone operation must be built in changedRulesReview, only for a complete panel" >&2
+  exit 1
+fi
+# And only the panel those hooks declined on builds it: a setup step reusing
+# its listing would make that step's acknowledgement phone-decidable.
+rules_review_callers="$(rg -n --no-heading -F 'changedRulesReview(' "$repo_root/agent/Sources" \
+  -g '!**/cs-selftest/**' -g '!**/cs-e2e/**' -g '!**/cs-review-preview/**' |
+  sed -E 's#^.*/agent/Sources/##; s#:[0-9]+:[[:space:]]*# #' || true)"
+expected_rules_review_callers="ConvenientSecurity/ClaudeDelegationService.swift let change = Self.changedRulesReview(hooks, acknowledged: document.acknowledgedHooks)
+ConvenientSecurity/ClaudeDelegationService.swift let change = Self.changedRulesReview(hooks, acknowledged: recorded.acknowledgedHooks)
+ConvenientSecurity/ClaudeDelegationService.swift public static func changedRulesReview("
+if [ "$rules_review_callers" != "$expected_rules_review_callers" ]; then
+  echo "only acknowledgeChangedRules and reviewChangedRules may build the rules- and hooks-changed panel; found:" >&2
+  echo "$rules_review_callers" >&2
+  exit 1
+fi
+# Only the settings gate, which read the source, says it is shown whole: a
+# source built anywhere else could otherwise make its panel phone-decidable.
+shown_whole_setters="$(rg -l -F 'shownWhole:' "$repo_root/agent/Sources" \
+  -g '!**/cs-selftest/**' -g '!**/cs-e2e/**' -g '!**/cs-review-preview/**' |
+  sed -E 's#^.*/agent/Sources/##' || true)"
+if [ "$shown_whole_setters" != "ConvenientSecurity/ClaudeSettingsGate.swift" ]; then
+  echo "only ClaudeSettingsGate.swift may mark a hook source shown whole; found: $shown_whole_setters" >&2
+  exit 1
+fi
+# Signing identities, provisioning profiles, keys and packaging/.env stay out
+# of source control: .gitignore keeps them out, and this proves it.
+tracked_signing="$(git -C "$repo_root" ls-files -- '*.mobileprovision' '*.provisionprofile' '*.p12' '*.p8' '*.cer' 'packaging/.env')"
+if [ -n "$tracked_signing" ]; then
+  echo "signing material is tracked by git; remove it and keep it ignored: $tracked_signing" >&2
+  exit 1
+fi
+grants_owner="$repo_root/agent/Sources/ConvenientSecurity/GrantPersistence.swift"
+grants_writers="$(
+  rg -l 'GrantsDocument\.self|store\(for: GrantsDocument' "$repo_root/agent/Sources" -g '!**/cs-selftest/**' |
+    rg -v -F -x "$grants_owner" || true
+)"
+if [ -n "$grants_writers" ] ||
+  rg -q 'ProtectedStores|\.prepare\(' \
+    "$repo_root/agent/Sources/ConvenientSecurity/GrantTable.swift" \
+    "$repo_root/agent/Sources/ConvenientSecurity/SSHSigningService.swift"; then
+  echo "only GrantPersistence may prepare writes to the grants item; the grant tables hand it snapshots:" >&2
+  [ -n "$grants_writers" ] && echo "$grants_writers" >&2
+  exit 1
+fi
+
+# B2: the sealed host-audit baseline. No shipping path reads or writes a
+# plaintext baseline: only the sealed store names the old file, to import it
+# once and to delete it. Every store operation is serialized; the plaintext is
+# imported only from the no-pointer branch after the committed-file check; a
+# write seals a new file, bumps the pointer, renames, and only then deletes
+# the old file, and puts the previous pointer back when its own bump failed;
+# and nothing is sealed or pointed at once uninstall began. With a pointer in
+# place, a directory or file csecd cannot list or read is a finding, never a
+# quiet "unavailable". csecd repairs access (an ACL, a mode) only on its own
+# objects: a sealed file must be a single-link regular file examined through
+# its own descriptor, and B1's mode repair skips a file with a second link, so
+# a hard link planted under csecd's name never changes someone else's file.
+# Every change says what it is for. A save never seals over an unrecorded
+# finding, and
+# every save that does not take is reported. The host-audit service changes
+# the baseline only through the atomic update, and csecd installs the store
+# and hands its erase to uninstall.
+sealed_baseline="$repo_root/agent/Sources/ConvenientSecurity/HostAudit/SealedBaselineStore.swift"
+plaintext_baseline_users="$(
+  rg -l -F 'host-audit-baseline.json' "$repo_root/agent/Sources" -g '!**/cs-selftest/**' |
+    rg -v -F -x "$sealed_baseline" || true
+)"
+if [ -n "$plaintext_baseline_users" ] ||
+  rg -q 'FileBaselineStore' "$repo_root/agent/Sources"; then
+  echo "only SealedBaselineStore.swift may name the plaintext host-audit baseline, and FileBaselineStore is gone:" >&2
+  [ -n "$plaintext_baseline_users" ] && echo "$plaintext_baseline_users" >&2
+  exit 1
+fi
+ruby -e '
+  store, service, context, csecd, sealed = ARGV.map { |path| File.read(path) }
+  def body(source, signature)
+    source[/#{Regexp.escape(signature)}.*?\n    }\n/m] or abort "missing #{signature}"
+  end
+  ["public func open(", "public func load(", "public func save(", "public func update(",
+   "public func eraseForUninstall("].each do |signature|
+    abort "SealedBaselineStore.swift: #{signature} must run through serialized" unless
+      body(store, signature).include?("await serialized {")
+  end
+  resolve = body(store, "private func resolve() async -> Current {")
+  abort "SealedBaselineStore.swift: resolve() must check the uninstalled state first" unless
+    resolve =~ /\A[^\n]*\n\s*guard !stores\.isUninstalled else/
+  abort "SealedBaselineStore.swift: only a missing pointer may lead to an import" unless
+    resolve.include?("case .absent:\n            return await resolveWithoutPointer(key: key)") &&
+    store.scan("await resolveWithoutPointer(").size == 1
+  without = body(store, "private func resolveWithoutPointer(")
+  migrate = without.index("await migrate(key: key)")
+  abort "SealedBaselineStore.swift: the plaintext is imported only after the committed-file check" unless
+    store.scan("await migrate(key:").size == 1 && migrate &&
+    without.index("if !committed.isEmpty {") && without.index("if !committed.isEmpty {") < migrate
+  def guarded_before(fn, call)
+    guard = fn.index("guard !stores.isUninstalled")
+    at = fn.index(call)
+    guard && at && guard < at
+  end
+  write = body(store, "private func writeSealed(")
+  abort "SealedBaselineStore.swift: a sealed file is written only by writeSealed, after the uninstalled check" unless
+    store.scan("writeAtomically(").size == 1 && guarded_before(write, "writeAtomically(")
+  commit = body(store, "private func commitPointer(")
+  abort "SealedBaselineStore.swift: the pointer is written only by commitPointer, after the uninstalled check" unless
+    store.scan("pointerStore.prepare(").size == 1 && guarded_before(commit, "pointerStore.prepare(")
+  seal = body(store, "private func seal(")
+  order = ["guard !stores.isUninstalled", "writeSealed(pending", "commitPointer(pointer)",
+           "directory.rename(pending", "removeEntries(of: listing, except: keep)"]
+  positions = order.map { |step| seal.index(step) }
+  bump = seal.index("commitPointer(pointer)")
+  deletions = seal.enum_for(:scan, /removeEntries\(|directory\.remove\(/).map { Regexp.last_match.begin(0) }
+  abort "SealedBaselineStore.swift: a write seals the new file, bumps the pointer, renames, then deletes the old file" unless
+    positions.all? && positions == positions.sort && seal.scan("removeEntries(").size == 1 &&
+    deletions.all? { |at| at > bump }
+  abort "SealedBaselineStore.swift: a failed bump puts the previous pointer straight back" unless
+    seal.include?("await commitPointer(previous)")
+  inspect = body(store, "private func inspect(")
+  abort "SealedBaselineStore.swift: with a pointer, a listing or read csecd cannot make is a finding, not unavailable" unless
+    inspect.include?("case let .failed(reason):\n            return .finding(.fileUnreadable") &&
+    inspect.include?("} catch {\n            return .finding(.fileUnreadable") &&
+    inspect.scan(".unavailable(").size == 1
+  save = body(store, "private func write(")
+  abort "SealedBaselineStore.swift: a save never seals over an unrecorded finding, and every refusal is reported" unless
+    save.include?("guard reportedTamper?.recorded == true else { return notSaved(change) }") &&
+    !save.include?("return false") && body(store, "private func notSaved(").include?("onNotice(.notSaved(change, ")
+  repair = body(store, "static func restoreOwnFile(")
+  abort "SealedBaselineStore.swift: a sealed file is repaired only as a single-link regular file of this user, through its descriptor" unless
+    repair.include?("owned.type == .regular") && repair.include?("owned.links == 1") &&
+    repair.include?("openat(directoryFD") && repair.include?("O_NOFOLLOW") &&
+    repair.index("owned.links == 1") < repair.index("stripAccessControl(fd:")
+  abort "SealedRecordFile.swift: the mode repair never changes a file with a second link" unless
+    sealed.include?("directory || info.st_nlink == 1 else { return false }") &&
+    sealed.include?("info.st_nlink == 1, fchmod(fd, mode_t(0o600))")
+  updates = service.scan(/await store\.update\(for: \.(\w+)\) \{/).flatten
+  abort "AgentProtocol.swift: the host-audit service changes the baseline only through the atomic update, naming each change" if
+    service =~ /\.save\(/ || updates.sort != ["audit", "reminderStamp", "triage"]
+  abort "Context.swift: the production audit context reads the installed baseline store" unless
+    context.include?("baseline: any BaselineStoring = HostAuditService.baselineStore")
+  abort "AgentRuntime.swift: csecd installs the baseline store and hands its erase to uninstall" unless
+    csecd.include?("HostAuditService.installBaselineStore(store)") &&
+    csecd.include?("await sealedBaseline.eraseForUninstall()") &&
+    csecd.include?("fileCleanups: baselineCleanup")
+' "$sealed_baseline" \
+  "$repo_root/agent/Sources/ConvenientSecurity/HostAudit/AgentProtocol.swift" \
+  "$repo_root/agent/Sources/ConvenientSecurity/HostAudit/Context.swift" \
+  "$repo_root/agent/Sources/csecd/AgentRuntime.swift" \
+  "$repo_root/agent/Sources/ConvenientSecurity/SealedRecordFile.swift"
+
+# C1: delegated approvals' registration. `csec hook claude` registers the exact
+# program with csecd before its rewrite reaches stdout: Claude Code runs nothing
+# until the hook exits, so that order is what puts a registration ahead of the
+# `csec ai` it describes. The registration is best effort, bounded by its own
+# liveness with heartbeats refused (so no csecd heartbeat interval can stretch
+# it) and by one overall deadline that covers the check of csecd's signature
+# (a stalled trustd would otherwise hold the hook into Claude Code's 30 s
+# timeout, which runs the command unwrapped), and never retried, so it can
+# never change what the hook prints. And the
+# Claude hook stays a passthrough rewrite: Claude Code takes an allow from
+# hookSpecificOutput.permissionDecision and from a top-level "decision":
+# "approve", and either would skip the auto-mode classifier whose verdict a
+# delegated approval stands on. So the Claude rewrite is exactly
+# {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": …}}
+# and the file names no other approval key (the selftest pins the same on the
+# output). Its only decision is the worktree escape check's deny.
+ruby -e '
+  main, hook, client = ARGV.map { |path| File.read(path) }
+  run_hook = main[/^func runHook\(.*?\n}\n/m] or abort "csec/main.swift: runHook is missing"
+  lines = run_hook.lines
+  register = lines.index { |line| line.include?("registerAgentCommand(") }
+  output = lines.index { |line| line.include?("FileHandle.standardOutput.write(output)") }
+  abort "csec/main.swift: runHook must register the command before it writes the rewrite to stdout" unless
+    register && output && register < output && run_hook.scan("registerAgentCommand(").size == 1 &&
+    lines[0...register].none? { |line| line.include?("FileHandle.standardOutput.write") }
+  abort "csec/main.swift: runHook must not retry the registration" if run_hook.include?("withCsecdReconnect")
+  abort "AICommandHook.swift: the hook output must register before it returns, ignoring any registrar failure" unless
+    hook =~ /if let registration = rewrite\.registration \{\n\s*try\? register\(registration\)\n\s*\}\n\s*return rewrite\.output\n/
+  registration = client[/public func registerAgentCommand\(.*?\n    }\n/m] or
+    abort "AgentClient.swift: registerAgentCommand is missing"
+  abort "AgentClient.swift: the registration must be bounded by AgentLiveness.agentCommandRegistration" unless
+    registration.include?("liveness: .agentCommandRegistration") && !registration.include?("liveness: liveness")
+  abort "AgentClient.swift: the whole registration, the check of csecd included, must end at AgentLiveness.agentCommandRegistrationDeadline and never send once given up on" unless
+    registration.include?("outcome.wait(seconds: AgentLiveness.agentCommandRegistrationDeadline)") &&
+    registration.include?("cancellation.arm({ connection.interrupt() })") &&
+    registration.include?("cancellation.cancel()")
+  abort "AgentClient.swift: the registration must refuse heartbeats" unless
+    registration.include?(".send(.registerAgentCommand(registration), supportsHeartbeats: false)") &&
+    client =~ /if WireTransport\.isHeartbeat\(data\) \{\n\s*guard supportsHeartbeats else \{\n\s*throw /
+  specific = hook[/static func hookSpecificOutput\(.*?\n    }\n/m] or
+    abort "AICommandHook.swift: hookSpecificOutput is missing"
+  claude = specific[/case \.claude:(.*?)case \.codex:/m, 1] or
+    abort "AICommandHook.swift: hookSpecificOutput must answer .claude before .codex"
+  abort "AICommandHook.swift: the Claude hook must stay a passthrough rewrite with no permissionDecision" if
+    claude.include?("permissionDecision")
+  abort "AICommandHook.swift: the Claude hookSpecificOutput must be exactly the PreToolUse event and updatedInput" unless
+    claude =~ /\A\s*return \[\s*"hookEventName": "PreToolUse",\s*"updatedInput": updatedInput,\s*\]\s*\z/
+  context = hook[/public static func rewriteWithContext\(.*?\n    }\n/m] or
+    abort "AICommandHook.swift: rewriteWithContext is missing"
+  abort "AICommandHook.swift: the hook output must be exactly one top-level hookSpecificOutput" unless
+    context.scan("JSONSerialization.data(").size == 1 &&
+    context.include?("withJSONObject: [\"hookSpecificOutput\": hookSpecificOutput(client: client, updatedInput: updatedInput)],")
+  code = hook.lines.reject { |line| line.strip.start_with?("//") }.join
+  %w["decision" "approve" "behavior" "continue" "async" "updatedPermissions"].each do |key|
+    abort "AICommandHook.swift: #{key} is a Claude Code approval key the hook must never write" if code.include?(key)
+  end
+  # The one decision the Claude hook writes is a deny (the worktree escape
+  # check), which grants nothing: claudeDenial writes exactly that, and
+  # rewriteWithContext calls it once, with the refusal reason.
+  denial = hook[/static func claudeDenial\(.*?\n    }\n/m] or
+    abort "AICommandHook.swift: claudeDenial is missing"
+  abort "AICommandHook.swift: claudeDenial must write exactly a PreToolUse deny with its reason" unless
+    denial.include?("\"permissionDecision\": \"deny\",") && !denial.include?("allow") &&
+    denial.scan("permissionDecision\":").size == 1 && denial.include?("\"hookEventName\": \"PreToolUse\",")
+  abort "AICommandHook.swift: the hook may write permissionDecision only in the Codex output and claudeDenial" unless
+    code.scan("\"permissionDecision\":").size == 2
+  abort "AICommandHook.swift: rewriteWithContext must deny only with the worktree escape refusal" unless
+    context.scan("claudeDenial(").size == 1 && context.include?("claudeDenial(reason: refusal.reason)") &&
+    hook.scan("claudeDenial(").size == 2
+' "$repo_root/agent/Sources/csec/main.swift" \
+  "$repo_root/agent/Sources/ConvenientSecurity/AICommandHook.swift" \
+  "$repo_root/agent/Sources/ConvenientSecurity/AgentClient.swift"
+
+# C3: csecd's delegation service, where Claude Code auto mode may stand in for
+# a panel. (1) No runtime switch: nothing the delegation service, its
+# settings, its declines or the Claude settings gate read comes from the
+# environment or argv (ProcessInfo.processInfo in any form, including an alias
+# of it, a fresh ProcessInfo(), CommandLine, getenv, environ), and csecd
+# builds exactly one service with exactly its protected stores, C1's gate
+# factory, the default release manifest store (whose audited Claude Code list
+# is trusted only once its pinned-key signature verifies) and the early
+# update check: no test seam (the unverified-caller knob, an injected policy
+# version, facts, clocks or a build list) reaches the shipping construction. (2) Warm-only:
+# Agent's heldValue resolves a new reference with resolveWithoutInteraction,
+# and releaseDelegated resolves only through it, telling it which references
+# are new; SSHSigningService's signDelegated resolves its key only with
+# resolveWithoutInteraction; the delegation files never resolve or unlock
+# anything. (3) No mint: they never touch a grant table. (4) Sudo has no
+# delegation (its review helper, the sudo panel and the PAM module never name
+# it), and the access/SSH panel shows the note only in its shared footnote
+# block, never in the automation layout. (5) A pairing is written only on the
+# human-approval path: Agent calls recordHumanApproval once, after the
+# approval completed, on a human surface that showed the pairing line, with
+# the pairing selection, and the sudo review reports its own; the service adds
+# pairings only from there. SSHSigningService writes none: an SSH signing auto
+# mode approved signs with no pairing (csec-0.11).
+delegation_dir="$repo_root/agent/Sources/ConvenientSecurity"
+delegation_files=(
+  "$delegation_dir/ClaudeDelegationService.swift"
+  "$delegation_dir/ClaudeDelegationSSHChain.swift"
+  "$delegation_dir/LauncherScript.swift"
+  "$delegation_dir/DelegationPolicy.swift"
+  "$delegation_dir/DelegationDecline.swift"
+  "$delegation_dir/ClaudeSettingsGate.swift"
+)
+if rg -n 'ProcessInfo\.processInfo|ProcessInfo\(|CommandLine\.|getenv\(|\benviron\b' "${delegation_files[@]}"; then
+  echo "delegated approvals: no environment variable or argument may reach the delegation service or the settings gate" >&2
+  exit 1
+fi
+constructions="$(rg -l 'ClaudeDelegationService\(' "$repo_root/agent/Sources" \
+  --glob '!**/cs-selftest/**' --glob '!**/cs-e2e/**' || true)"
+if [ "$constructions" != "$repo_root/agent/Sources/csecd/AgentRuntime.swift" ]; then
+  echo "delegated approvals: only csecd's AgentRuntime.swift builds a delegation service (found: $constructions)" >&2
+  exit 1
+fi
+ruby -e '
+  runtime = File.read(ARGV.fetch(0))
+  abort "AgentRuntime.swift: csecd builds exactly one delegation service" unless
+    runtime.scan("ClaudeDelegationService(").size == 1
+  arguments = runtime[/ClaudeDelegationService\((.*?)\n\s*\)/m, 1] or
+    abort "AgentRuntime.swift: the delegation service construction is missing"
+  arguments = arguments.split(",").map(&:strip).reject(&:empty?)
+  expected = ["stores: protectedStores", "gate: makeClaudeSettingsGate()", "consent: delegationSettingsConsent",
+    "decisionLog: decisionLog", "terminalInspection: .live", "manifestStore: ReleaseManifestStore()",
+    "uncheckedBuildSeen: { ReleaseUpdateSchedule.checkSoon() }",
+    "credentialStore: KeychainClaudeCredentialStore.shared"]
+  abort "AgentRuntime.swift: csecd builds the delegation service over its protected stores, the settings " \
+    "gate factory, the live terminal inspector, the default signed release manifest store, the early " \
+    "update check and the Keychain credential store, with no other argument " \
+    "(got #{arguments.inspect})" unless arguments == expected
+  # The services built before the mirror take the settings panel over the
+  # local reviewer csecd built on the consent queue (their settings changes
+  # are Mac-only, so the mirror would hand them to that reviewer anyway),
+  # falling back to the queued bare sheet, and nothing else.
+  settings = runtime[/^\s*let settingsConsent = SettingsChangeConsent\((.*?)\n\s*\)$/m, 1] or
+    abort "AgentRuntime.swift: csecd builds settingsConsent as one SettingsChangeConsent"
+  abort "AgentRuntime.swift: the settings consent is SettingsChangeConsent over the consent csecd built and " \
+    "its local reviewer on the consent queue (got #{settings.inspect})" unless
+    settings.split(/,\s*(?=review:)/).map(&:strip) ==
+      ["underlying: consent", "review: QueuedPolicyReview(underlying: TrustedPolicyReview(), queue: consentQueue)"]
+  # The delegation service takes the same panel over the mirrored reviewer csecd built
+  # on that queue, so the paired phone can answer the rules- and hooks-changed
+  # acknowledgement (av-rcqg); the mirror keeps every Mac-only change local.
+  mirrored = runtime[/^\s*let delegationSettingsConsent = SettingsChangeConsent\((.*?)\n\s*\)$/m, 1] or
+    abort "AgentRuntime.swift: csecd builds delegationSettingsConsent as one SettingsChangeConsent"
+  abort "AgentRuntime.swift: the delegation settings consent is SettingsChangeConsent over the consent csecd " \
+    "built and its mirrored policy reviewer (got #{mirrored.inspect})" unless
+    mirrored.split(/,\s*(?=review:)/).map(&:strip) == ["underlying: consent", "review: policyReview"]
+  policy = runtime[/^\s*let policyReview: PolicyReviewProvider = (QueuedPolicyReview\(.*?\n\s*\))$/m, 1] or
+    abort "AgentRuntime.swift: csecd builds policyReview as one QueuedPolicyReview"
+  abort "AgentRuntime.swift: policyReview is the mirrored reviewer on the consent queue (got #{policy.inspect})" unless
+    policy.gsub(/\s+/, " ") ==
+      "QueuedPolicyReview( underlying: MirroredPolicyReview(local: TrustedPolicyReview(), remote: remoteApproval), " \
+      "queue: consentQueue )"
+  abort "AgentRuntime.swift: csecd builds exactly two settings consents" unless
+    runtime.scan("SettingsChangeConsent(").size == 2
+  abort "AgentRuntime.swift: only the delegation service takes the mirrored settings consent" unless
+    runtime.scan("consent: delegationSettingsConsent").size == 1
+' "$repo_root/agent/Sources/csecd/AgentRuntime.swift"
+# Every Touch ID csecd asks for on a setup step (backups, a restore, phone
+# pairing, machine identities, removing an SSH key or an automation job,
+# deleting stored files, the uninstall cleanup, host fixes, auto-mode settings)
+# is csecd's settings panel, typing-guarded like every approval: Apple's bare
+# sheet took a Space typed as it appeared as its Deny (csec-0.60). So only the
+# consent providers (the fallback for a provider with no panel) ask for a bare
+# sheet, only the Touch ID owners evaluate a policy, and csecd hands every
+# service the settings consent except the two that never ask for one.
+bare_sheet_callers="$(rg -n '\.authenticate(Explaining)?\((\s*$|reason:)' \
+  "$repo_root/agent/Sources/ConvenientSecurity" "$repo_root/agent/Sources/csecd" \
+  --glob '!**/ConvenientSecurity/Consent.swift' --glob '!**/ConvenientSecurity/ConsentQueue.swift' \
+  --glob '!**/ConvenientSecurity/BiometricConsent.swift' --glob '!**/ConvenientSecurity/SettingsChangeConsent.swift' || true)"
+if [ -n "$bare_sheet_callers" ]; then
+  echo "settings panel: a csecd step asks for Apple's bare Touch ID sheet; use approveSettingsChange:" >&2
+  echo "$bare_sheet_callers" >&2
+  exit 1
+fi
+policy_evaluators="$(rg -l 'evaluatePolicy\(' "$repo_root/agent/Sources/ConvenientSecurity" "$repo_root/agent/Sources/csecd" | sort | tr '\n' ' ')"
+if [ "$policy_evaluators" != "$repo_root/agent/Sources/ConvenientSecurity/BiometricConsent.swift $repo_root/agent/Sources/ConvenientSecurity/SudoAuthorizationReview.swift $repo_root/agent/Sources/ConvenientSecurity/TrustedAccessReviewSession.swift " ]; then
+  echo "settings panel: only the consent sheet and the two review panels evaluate a Touch ID policy (found: $policy_evaluators)" >&2
+  exit 1
+fi
+ruby -e '
+  runtime = File.read(ARGV.fetch(0))
+  plain = runtime.enum_for(:scan, /\bconsent: consent\b/).map do
+    runtime[0...Regexp.last_match.begin(0)].scan(/(\w+)\(\s*\n/).flatten.last
+  end
+  abort "AgentRuntime.swift: only the grant restoration and the Agent take the plain consent; every other " \
+    "service asks through settingsConsent (got #{plain.inspect})" unless plain == ["GrantRestoration", "Agent", "Agent"]
+' "$repo_root/agent/Sources/csecd/AgentRuntime.swift"
+if rg -n 'resolver\.resolve\(|unlock:' "$delegation_dir"/ClaudeDelegation*.swift; then
+  echo "delegated approvals: the delegation service never resolves or unlocks anything" >&2
+  exit 1
+fi
+ruby -e '
+  agent, ssh, resolver = ARGV.map { |path| File.read(path) }
+  def body(source, signature)
+    source[/#{Regexp.escape(signature)}.*?\n    }\n/m] or abort "missing #{signature}"
+  end
+  held = body(agent, "private func heldValue(")
+  abort "Agent.swift: heldValue must resolve a reference new to the request with no csec unlock" unless
+    held.include?("if isNew { return await resolver.resolveForDelegation(ref) }")
+  # A new reference is served warm, or else fetched only from a provider
+  # that needs no csec unlock (1Password), never with an unlock or a csec
+  # prompt: a reference behind the csec touch stays warm-only.
+  for_delegation = body(resolver, "public func resolveForDelegation(")
+  without_unlock = body(resolver, "public func resolveWithoutCsecUnlock(")
+  abort "SecretResolver.swift: resolveForDelegation must try warm first, then fetch only from a provider " \
+    "that needs no csec unlock, with no unlock" unless
+    for_delegation.include?("if let held = await resolveWithoutInteraction(ref) { return .value(held) }") &&
+    for_delegation.include?("!(await provider.requiresUnlockToResolve(ref))") &&
+    !for_delegation.include?("unlock:") && for_delegation.scan("resolveWithoutCsecUnlock(ref)").size == 1 &&
+    for_delegation.index("requiresUnlockToResolve") < for_delegation.index("resolveWithoutCsecUnlock(ref)") &&
+    without_unlock.scan("unlock:").size == 1 && without_unlock.include?("try await resolve(ref, unlock: nil)")
+  release = body(agent, "private func releaseDelegated(")
+  abort "Agent.swift: releaseDelegated resolves only through heldValue" if
+    release =~ /resolver\.resolve|unlock:/ || !release.include?("heldValue(")
+  new_reference = "heldValue(ref, isNew: newReferenceURIs.contains(ref.uri))"
+  abort "Agent.swift: releaseDelegated must tell heldValue which references are new to the request" unless
+    release.scan("heldValue(").size == 1 && release.scan(new_reference).size == 1
+  signing = body(ssh, "private func signDelegated(")
+  abort "SSHSigningService.swift: signDelegated resolves its key only warm-only" if
+    signing =~ /resolver\.resolve\(|unlock:/ || signing.scan(/resolver\.resolve\w*\(/).size != 1 ||
+    signing.scan("resolver.resolveWithoutInteraction(reference)").size != 1
+  # A delegated request that went to the restore panel resolves nothing on
+  # the approval made before the wait: it is judged again from the start. It
+  # joins the human-Deny ledger before it waits, and the second judgment
+  # checks the ledger first, so a Deny of an identical request made during
+  # the wait is never overruled by auto mode.
+  [["Agent.swift", release], ["SSHSigningService.swift", signing]].each do |name, text|
+    arrive = text.index("humanDenials.arrive()")
+    wait = text.index("ensureWarmForDelegation(")
+    abort "#{name}: a delegated request must take its Deny-ledger ticket before it waits on the restore panel" unless
+      arrive && wait && arrive < wait && text.include?("return .waitedForRestore(arrival)")
+  end
+  abort "Agent.swift: a delegated release that waited on the restore panel must be judged again, " \
+    "Deny ledger included" unless
+    agent.include?("consentTurn: consentTurn, restoreWait: arrival") &&
+    agent.include?("if let waited = consentTurn ?? restoreWait, let denialShape, humanDenials.refuses(")
+  verdict = body(ssh, "private func delegatedVerdict(")
+  refused = verdict.index("humanDenials.refuses(arrival")
+  abort "SSHSigningService.swift: a delegated signing that waited on the restore panel must check the Deny " \
+    "ledger, then be judged again" unless
+    verdict.include?("mayWaitForRestore = false") && refused &&
+    refused > verdict.index("case let .waitedForRestore(arrival):")
+' "$delegation_dir/Agent.swift" "$delegation_dir/SSHSigningService.swift" "$delegation_dir/SecretResolver.swift"
+if rg -n 'GrantTable|grants\.add|grants\.append' "$delegation_dir"/ClaudeDelegation*.swift; then
+  echo "delegated approvals: delegation mints no grant" >&2
+  exit 1
+fi
+# Delegated sudo lives in csecd and the review helper; the root PAM module
+# only renders sudo's argv and runs the helper, and never names it.
+if rg -n -i 'delegation|delegated|pairing' "$repo_root/packaging/sudo"; then
+  echo "the sudo PAM module never names delegated approvals: csecd judges them for the review helper" >&2
+  exit 1
+fi
+# The helper asks csecd before anything is drawn or mirrored, and an approval
+# there ends the review at once; it reports a pairing only after a Touch ID on
+# its own panel, which always shows the line it was given (a phone approval
+# csecd records itself). The panel shows the note and the line below its
+# footnote, the line never truncated and named for the probes, as the access
+# and SSH panels do.
+ruby -e '
+  helper, panel = ARGV.map { |path| File.read(path) }
+  main = helper[/^private func runReview\(\n  originalParent: pid_t, review: SudoAuthorizationReviewRequest, deadline: SudoReviewDeadline\n\) -> Never \{.*\z/m] or abort "csec-sudo-review: the review body is missing"
+  ask = main.index("await SudoDelegationClient.installed.ask(")
+  approved = main.index("if delegation.decision == .approved {\n      return deadline.decide() ? 0 : SudoReviewDeadline.expiredExitStatus")
+  terminal = main.index("SudoDelegationClient.installed.terminal()")
+  race = main.index("SudoReviewRace.run(")
+  abort "csec-sudo-review: ask csecd about delegation first, and end an approved sudo before any panel or phone request" unless
+    ask && approved && terminal && race && ask < approved && approved < terminal && approved < race &&
+    helper.scan("SudoDelegationClient.installed.ask(").size == 1
+  report = main.index("if outcome == .approved(on: .mac), review.pairingLine != nil {")
+  pair = main.index("SudoDelegationClient.installed.pair(")
+  abort "csec-sudo-review: report a pairing only after a Mac approval of a panel that showed the line" unless
+    report && pair && race < report && report < pair && helper.scan("SudoDelegationClient.installed.pair(").size == 1
+  configure = panel[/    private func configureWindow\(\).*?\n    }\n/m] or abort "SudoAuthorizationReview.swift: configureWindow is missing"
+  note = configure.index("if let delegationNote = review.delegationNote, !delegationNote.isEmpty {")
+  line = configure.index("if let pairingLine = review.pairingLine {")
+  footnote = configure.index("root.addArrangedSubview(footnote)")
+  separator = configure.index("let separator = NSBox()")
+  abort "SudoAuthorizationReview.swift: the delegation note, then the pairing line, follow the footnote" unless
+    note && line && footnote && separator && footnote < note && note < line && line < separator
+  drawn = configure[line...separator]
+  abort "SudoAuthorizationReview.swift: the pairing line is never truncated and carries the probes'"'"' identifier" unless
+    drawn.include?("line.maximumNumberOfLines = 0") &&
+    drawn.include?("line.identifier = PromptInteractionGraceProbe.pairingLineIdentifier")
+' "$repo_root/agent/Sources/csec-sudo-review/main.swift" "$delegation_dir/SudoAuthorizationReview.swift"
+ruby -e '
+  panel, agent, ssh, service = ARGV.map { |path| File.read(path) }
+  def body(source, signature)
+    source[/#{Regexp.escape(signature)}.*?\n    }\n/m] or abort "missing #{signature}"
+  end
+  configure = body(panel, "private func configureWindow(")
+  footnote = configure[/      if review\.automation == nil \{\n        let footnote = NSTextField\(.*?\n      \}\n/m] or
+    abort "TrustedAccessReviewSession.swift: the shared footnote block is missing"
+  abort "TrustedAccessReviewSession.swift: the delegation note and pairing line belong in the shared footnote block, never on a restore-only panel" unless
+    footnote.include?("if !review.isRestoreOnly, let delegationNote = review.delegationNote {") &&
+    footnote.include?("if !review.isRestoreOnly, let offer = review.pairingOffer {") &&
+    panel.scan("review.delegationNote").size == 1
+  panel.scan(/private (?:static )?func makeAutomation\w*\(.*?\n    }\n/m).each do |automation|
+    abort "TrustedAccessReviewSession.swift: the automation layout never carries a delegation note" if automation =~ /delegation|delegated|pairing/i
+  end
+  access = body(agent, "private func handlePolicyAccess(")
+  approved = access.index("guard case let .approved(approvedUnlock) = outcome else {")
+  pairing = access.index("await delegation.recordHumanApproval(")
+  abort "Agent.swift: a pairing is written once, after the human approval completed" unless
+    approved && pairing && approved < pairing && agent.scan("recordHumanApproval(").size == 1
+  gate = /let surface = approval\.decidedOn,\n\s*approval\.pairingLineShown,\n\s*pairingOffer\.applies\(/
+  abort "Agent.swift: only an approval on a human surface that showed the pairing line pairs" unless
+    access[approved...pairing] =~ gate
+  abort "SSHSigningService.swift: an SSH panel offers and writes no pairing (csec-0.11)" if
+    ssh =~ /recordHumanApproval\(|pairingOffer/
+  abort "ClaudeDelegationService.swift: pairings are added only by recordHumanApproval and recordSudoApproval" unless
+    service.scan("addPairing(").size == 3 &&
+    service.scan(/public func recordHumanApproval\(.*?\n    }\n/m).all? { |fn| fn.include?("await addPairing(") }
+  sudoApproval = body(service, "public func recordSudoApproval(")
+  spent = sudoApproval.index("sudoOffers.removeValue(forKey: process)")
+  added = sudoApproval.index("await addPairing(")
+  abort "ClaudeDelegationService.swift: a sudo pairing needs the offer csecd made to that very helper, spent before it is added, " \
+    "while the helper still serves a root sudo" unless
+    spent && added && spent < added && sudoApproval.include?("sudo.executablePath == SudoChainRule.sudoPath") &&
+    sudoApproval.include?("sudo.effectiveUID == 0")
+' "$trusted_review" "$delegation_dir/Agent.swift" "$delegation_dir/SSHSigningService.swift" \
+  "$delegation_dir/ClaudeDelegationService.swift"
+
+# C2: the Claude settings gate and the settings transaction. csecd evaluates
+# the gate on every delegated request, so it takes every root from its scope
+# and never reads the environment or the command line, and it only reads:
+# nothing in it opens a file for writing or moves one. Enabling checks the
+# request csecd must record before it writes the settings, and writes before it
+# asks csecd; disabling reads csecd's record, reverts, then disables; and
+# disable and uninstall share the one revert, so no second revert path can
+# undo something different.
+ruby -e '
+  gate, onboarding, main, setup = ARGV.map { |path| File.read(path) }
+  code = gate.lines.reject { |line| line.strip.start_with?("//", "///") }.join
+  %w[ProcessInfo getenv( CommandLine. setenv(].each do |token|
+    abort "ClaudeSettingsGate.swift: the gate must not read the environment or argv (#{token})" if code.include?(token)
+  end
+  %w[O_WRONLY O_RDWR O_CREAT O_TRUNC .write(to: createFile( removeItem( moveItem( rename( unlink( renameat(].each do |token|
+    abort "ClaudeSettingsGate.swift: the gate must never write (#{token})" if code.include?(token)
+  end
+  enable = onboarding[/public static func enable\(\n.*?\n    }\n/m] or
+    abort "SetupOnboarding.swift: ClaudeDelegationSetup.enable is missing"
+  lines = enable.lines
+  checked = lines.index { |line| line.include?("guard request.isWellFormed") }
+  applied = lines.index { |line| line.include?("try CodingAgentSetup.apply(configurationPlan)") }
+  asked = lines.index { |line| line.include?("configureDelegation(") }
+  abort "SetupOnboarding.swift: enable must check the request, then write the settings, then ask csecd once" unless
+    checked && applied && asked && checked < applied && applied < asked &&
+    enable.scan("configureDelegation(").size == 1 && lines[asked].include?("try client.configureDelegation(request)")
+  disable = onboarding[/public static func disable\(\n.*?\n    }\n/m] or
+    abort "SetupOnboarding.swift: ClaudeDelegationSetup.disable is missing"
+  lines = disable.lines
+  status = lines.index { |line| line.include?("configureDelegation(.status(") }
+  revert = lines.index { |line| line.include?("revertRecordedSettings(") }
+  off = lines.index { |line| line.include?("configureDelegation(.disable())") }
+  abort "SetupOnboarding.swift: disable must read the record, revert, then disable" unless
+    status && revert && off && status < revert && revert < off
+  uninstall = main[/^func revertClaudeSettingsBeforeUninstall\(\)[^{\n]*\{\n.*?\n}\n/m] or
+    abort "csec/main.swift: revertClaudeSettingsBeforeUninstall is missing"
+  abort "csec/main.swift: uninstall must revert through ClaudeDelegationSetup.revertRecordedSettings" unless
+    uninstall.include?("ClaudeDelegationSetup.revertRecordedSettings(")
+  run = main[/^func runUninstall\(_ arguments: \[String\]\) -> Never \{\n.*?\n}\n/m] or
+    abort "csec/main.swift: runUninstall is missing"
+  preflight = run.index("CompleteUninstall.scriptProblem()")
+  first_revert = run.index("revertClaudeSettingsBeforeUninstall()")
+  cleanup = run.index("uninstallCleanup()")
+  abort "csec/main.swift: uninstall must revert the Claude settings before csecd deletes its record" unless
+    first_revert && cleanup && first_revert < cleanup
+  # --all checks the package uninstaller before changing anything, removes the
+  # fail-closed hooks only after the Touch ID (a refusal changes nothing), and
+  # runs the system part, which deletes the app, only after the agent is
+  # unregistered (SMAppService needs the bundle) and every hook is gone.
+  hooks = run.index("removeCodingAgentHooksForUninstall()")
+  unregister = run.index("LaunchAgentService.uninstall()")
+  held = run.index("guard hooksRemoved else")
+  system = run.index("runSystemUninstaller()")
+  abort "csec/main.swift: uninstall --all must check its uninstaller first, remove the hooks after the cleanup, " \
+        "and run the system part last, only when every hook is gone" unless
+    preflight && hooks && unregister && held && system &&
+    preflight < first_revert && cleanup < hooks && hooks < unregister && unregister < held && held < system
+  abort "csec/SetupCommand.swift: setup must disable through ClaudeDelegationSetup.disable" unless
+    setup.include?("ClaudeDelegationSetup.disable(")
+  [["csec/main.swift", main], ["csec/SetupCommand.swift", setup]].each do |name, text|
+    %w[planRevert planClaudeDelegationRevert planClaudeClassifyAllShellRemoval].each do |token|
+      abort "#{name}: revert through ClaudeDelegationSetup, not #{token} directly" if text.include?(token)
+    end
+  end
+' "$repo_root/agent/Sources/ConvenientSecurity/ClaudeSettingsGate.swift" \
+  "$repo_root/agent/Sources/ConvenientSecurity/SetupOnboarding.swift" \
+  "$repo_root/agent/Sources/csec/main.swift" \
+  "$repo_root/agent/Sources/csec/SetupCommand.swift"
+
+# Treat every Swift compiler warning as an error so a warning cannot silently
+# accumulate on main. This applies package-wide to all current and future
+# targets (no per-target opt-in to forget), gated here in the one build everyone
+# runs before merging. Fix the warning; do not silence this flag.
+swift build --package-path "$repo_root/agent" --jobs 2 -Xswiftc -warnings-as-errors
+python3 "$repo_root/bin/test-ai-sandbox.py"
+python3 "$repo_root/bin/test-output-redaction-lifetime.py"
+# Where Google's tools keep a sign-in made from csec's own credential file:
+# the real gcloud CLI and google-auth, offline, against the debug csec and
+# cs-fake-agent (docs/machine-identity.md states what this checks).
+if ! gcloud_sdk="$(cd "$repo_root" && mise where gcloud)"; then
+  echo "error: the gcloud pinned in .tool-versions is missing; install it with: mise install -C \"$repo_root\" gcloud" >&2
+  exit 1
+fi
+# The SDK's bundled libraries need the pinned Python; the runner's saved PATH
+# can otherwise select macOS's Python 3.9 before the harness writes a report.
+mise exec -C "$repo_root" -- python3 "$repo_root/bin/test-google-token-cache.py" "$gcloud_sdk"
+# A standalone --*-only run reaches a panel suite's first spin of the main run
+# loop with no suspension before it; cs-selftest's run-loop keeper must already
+# be running by then, or that spin never returns. The full run below cannot
+# show this, so run the standalone shape on its own, killed if it hangs.
+/usr/bin/perl -e 'alarm shift; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n"' 120 \
+  "$repo_root/agent/.build/debug/cs-selftest" --main-run-loop-only
+"$repo_root/agent/.build/debug/cs-selftest"
+# cs-e2e drives the Node client from clients/node/dist, which is gitignored build
+# output: build it from source first so the check never runs a stale or missing
+# client.
+npm run build --prefix "$repo_root"
+"$repo_root/agent/.build/debug/cs-e2e"
+for host_mode in ed25519-certificate ed25519 ecdsa rsa rsa-sha1; do
+  CSEC_SSH_E2E_HOST_MODE="$host_mode" \
+    "$repo_root/agent/.build/debug/cs-ssh-e2e"
+done
+# Concurrent ssh share a review; interrupting ssh or killing its waiting parent
+# withdraws that connection's pending review.
+for ssh_scenario in concurrent interrupted orphaned; do
+  CSEC_SSH_E2E_SCENARIO="$ssh_scenario" "$repo_root/agent/.build/debug/cs-ssh-e2e"
+done
+
+# Compile the shipping branches and prove environment-only test controls are
+# absent there. The release self-test does not contact a real agent or vault.
+swift build --package-path "$repo_root/agent" -c release --jobs 2 -Xswiftc -warnings-as-errors
+CSEC_SOCKET="/tmp/csec-release-must-ignore.sock" \
+OP_CLI_PATH="/bin/false" \
+CSEC_ROOT_SOCKET="/tmp/csec-root-release-must-ignore.sock" \
+CSEC_LIVENESS_DEADLINE_SECONDS="0.01" \
+  "$repo_root/agent/.build/release/cs-selftest"
+
+# Build the opt-in sudo PAM integration and exercise its value-free preview,
+# redactor, wire-format, helper-signing, and malformed-input checks.
+"$repo_root/packaging/bin/build-sudo-pam.sh"
+"$repo_root/packaging/bin/build-sudo-review.sh"
+
+# The shipping access-review window must use Apple's context-bound embedded UI;
+# merely importing LocalAuthentication would regress to a second system alert.
+shipping_agent="$repo_root/agent/.build/release/csecd"
+if ! otool -L "$shipping_agent" | rg -q 'LocalAuthenticationEmbeddedUI'; then
+  echo "release csecd does not link the embedded LocalAuthentication UI" >&2
+  exit 1
+fi
+shipping_undefined_symbols="$(nm -u "$shipping_agent")"
+# Do not use `nm | rg -q` here: with pipefail, rg closes the large nm stream
+# after its match and nm's resulting SIGPIPE turns a successful check into 141.
+if [[ "$shipping_undefined_symbols" != *"_OBJC_CLASS_\$_LAAuthenticationView"* ]]; then
+  echo "release csecd does not reference LAAuthenticationView" >&2
+  exit 1
+fi
+
+# The privileged daemon is intentionally built from dedicated minimal modules.
+# A target dependency on the full user agent would silently pull UI, biometric,
+# Keychain, provider, and ServiceManagement implementations into root.
+rootd="$repo_root/agent/.build/release/csec-rootd"
+rootd_links="$(otool -L "$rootd")"
+if printf '%s\n' "$rootd_links" | rg -q \
+  'AppKit|LocalAuthentication|ServiceManagement'; then
+  echo "release csec-rootd links a forbidden user-agent framework" >&2
+  exit 1
+fi
+# Defined symbols catch implementation linked in statically; imported ones catch
+# a call into a system API (Keychain items, Touch ID, AppKit, launch services or
+# a shell) that otool's library list cannot name when the framework is already
+# linked for another reason, as Security is for code-signature checks. Both
+# lists are captured first: under pipefail, `nm | rg -q` can turn a match into
+# nm's SIGPIPE status, which `if` reads as no match.
+rootd_forbidden_symbols='SecItem|SecKeychain|LAContext|NSApplication|SMAppService'
+rootd_forbidden_symbols+='|OnePassword|NativeEncrypted|Biometric'
+rootd_defined_symbols="$(nm -gU "$rootd")"
+rootd_imported_symbols="$(nm -u "$rootd")"
+if rg -q "$rootd_forbidden_symbols" <<<"$rootd_defined_symbols"; then
+  echo "release csec-rootd contains forbidden user-agent implementation symbols" >&2
+  exit 1
+fi
+if rg -q "$rootd_forbidden_symbols|^_(system|popen)\$" <<<"$rootd_imported_symbols"; then
+  echo "release csec-rootd imports a forbidden user-agent or shell symbol" >&2
+  exit 1
+fi
+
+ruby -I"$repo_root/clients/ruby/lib" \
+  "$repo_root/clients/ruby/test/convenient_security_test.rb"
+ruby -I"$repo_root/clients/ruby/lib" \
+  "$repo_root/clients/ruby/test/cross_stack_test.rb"
+npm test --prefix "$repo_root"
+npm run pack:check --prefix "$repo_root"
+
+if [[ -e "$ios_ui_not_admitted" ]]; then
+  rm -r "$ios_admission_scratch"
+  ios_ui_message="the iPhone UI tests did not run: the shared simulator admission did not start within CSEC_CI_SIMULATOR_WAIT_S=${CSEC_CI_SIMULATOR_WAIT_S:-}s. Every other check passed; run CI again when the Mac is less loaded."
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::error title=iPhone UI tests did not run::$ios_ui_message"
+  fi
+  echo "$ios_ui_message" >&2
+  exit 1
+fi
+rm -r "$ios_admission_scratch"

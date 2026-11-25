@@ -1,0 +1,93 @@
+#!/bin/bash
+set -euo pipefail
+
+# Records the exact bytes the package installed, for watchers outside csec
+# (a malware persistence watch, say) that would otherwise treat every csec
+# upgrade of a launch target as unexplained drift. A receipt only counts when
+# root wrote it: the postinstall runs as root into a directory only root can
+# write, so code running as the login user cannot forge one.
+#
+# Writes {"schema": 1, "producer": "csec", "artifacts": {ARTIFACT: sha256, ...}}
+# to RECEIPT, replacing any earlier receipt in one rename so a reader sees
+# either the old receipt or the new one, never a partial file. Every launch
+# target the package installs is named in the same receipt: the watch reads
+# only the latest one.
+
+if [ "$#" -lt 2 ]; then
+  echo "usage: write-install-receipt RECEIPT ARTIFACT..." >&2
+  exit 64
+fi
+
+receipt="$1"
+shift
+
+# The paths go into JSON unescaped, so only plain absolute paths are accepted.
+for path in "$receipt" "$@"; do
+  case "$path" in
+    /*) ;;
+    *)
+      echo "write-install-receipt: paths must be absolute" >&2
+      exit 1
+      ;;
+  esac
+  case "$path" in
+    *[!A-Za-z0-9./_\ -]* | */../* | */./* | *//*)
+      echo "write-install-receipt: unsupported path: $path" >&2
+      exit 1
+      ;;
+  esac
+done
+
+receipt_directory="$(/usr/bin/dirname "$receipt")"
+[ ! -L "$receipt_directory" ] && [ -d "$receipt_directory" ] || {
+  echo "write-install-receipt: receipt directory has an unsafe path shape" >&2
+  exit 1
+}
+[ ! -L "$receipt" ] && { [ ! -e "$receipt" ] || [ -f "$receipt" ]; } || {
+  echo "write-install-receipt: existing receipt has an unsafe path shape" >&2
+  exit 1
+}
+
+# JSON keeps only one value for a repeated key, so a repeat is refused rather
+# than recorded ambiguously.
+entries=""
+seen=$'\n'
+for artifact in "$@"; do
+  [ ! -L "$artifact" ] && [ -f "$artifact" ] || {
+    echo "write-install-receipt: artifact has an unsafe path shape: $artifact" >&2
+    exit 1
+  }
+  case "$seen" in
+    *$'\n'"$artifact"$'\n'*)
+      echo "write-install-receipt: artifact named twice: $artifact" >&2
+      exit 1
+      ;;
+  esac
+  seen="$seen$artifact"$'\n'
+
+  # Hash the file now in place, not the payload the package carried, so the
+  # receipt names what is installed.
+  artifact_hash="$(/usr/bin/shasum -a 256 -- "$artifact")"
+  artifact_hash="${artifact_hash%% *}"
+  case "$artifact_hash" in
+    *[!0-9a-f]* | "")
+      echo "write-install-receipt: could not hash the artifact: $artifact" >&2
+      exit 1
+      ;;
+  esac
+  [ "${#artifact_hash}" -eq 64 ] || {
+    echo "write-install-receipt: could not hash the artifact: $artifact" >&2
+    exit 1
+  }
+  entries="$entries${entries:+, }\"$artifact\": \"$artifact_hash\""
+done
+
+# mktemp creates the file exclusively (0600) beside the receipt, so the final
+# rename stays within one filesystem and is atomic.
+temporary="$(/usr/bin/mktemp "$receipt_directory/.install-receipt.XXXXXX")"
+trap '/bin/rm -f "$temporary"' EXIT
+/usr/bin/printf '{"schema": 1, "producer": "csec", "artifacts": {%s}}\n' "$entries" |
+  /bin/dd of="$temporary" conv=fsync status=none
+/bin/chmod 0644 "$temporary"
+/bin/mv -f "$temporary" "$receipt"
+trap - EXIT

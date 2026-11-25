@@ -1,0 +1,143 @@
+name: ConvenientSecurityApproval
+# Generate with the XcodeGen pinned in ../.tool-versions:
+#   mise exec -- xcodegen generate --spec ios/project.yml
+# The generated .xcodeproj is not tracked. ConvenientSecurityApproval/Info.plist
+# is generator output too: change info.properties below, regenerate, and commit
+# the result (bin/ci fails when the two disagree).
+options:
+  bundleIdPrefix: com.alexspeller
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+packages:
+  convenient-security:
+    path: ../agent
+# The Apple team and identifier (CSEC_TEAM_ID, CSEC_IDENTIFIER) come from the
+# repository's one identity file, which the targets' settings and entitlements
+# read as build settings.
+configFiles:
+  Debug: ../identity.xcconfig
+  Release: ../identity.xcconfig
+settings:
+  base:
+    # The CloudKit environment both targets' entitlements name. Production is
+    # the only one a Developer ID Mac can reach; a build made with
+    # CSEC_CLOUDKIT_ENVIRONMENT=Development exists only to save the phone's
+    # subscriptions in Development once before a schema deploy (see
+    # docs/remote-approval.md, CloudKit schema).
+    CSEC_CLOUDKIT_ENVIRONMENT: Production
+    # The one place the version and build number are set, for the app and the
+    # notification extension alike; each Info.plist reads both.
+    # build-and-install.sh appends a per-build stamp to the build number so it
+    # can tell its build is the one on the phone.
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  ConvenientSecurityApproval:
+    type: application
+    platform: iOS
+    sources:
+      - path: ConvenientSecurityApproval
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(CSEC_IDENTIFIER).approval
+        DEVELOPMENT_TEAM: $(CSEC_TEAM_ID)
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: 5.9
+        TARGETED_DEVICE_FAMILY: "1"
+      configs:
+        # Debug is what build-and-install.sh signs with Apple Development and
+        # installs on the paired iPhone: CloudKit Production (the Mac's only
+        # environment) with the development push environment a development
+        # profile allows. Release is the App Store build: both Production.
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: ConvenientSecurityApproval/ConvenientSecurityApproval.entitlements
+        Release:
+          CODE_SIGN_ENTITLEMENTS: ConvenientSecurityApproval/ConvenientSecurityApproval.production.entitlements
+    dependencies:
+      - package: convenient-security
+        product: CSECRemoteApproval
+      - package: convenient-security
+        product: CSECRemoteApprovalCloudKit
+      - package: convenient-security
+        product: CSECBuildIdentity
+      - target: ConvenientSecurityApprovalNotifications
+    scheme:
+      testTargets:
+        - ConvenientSecurityApprovalUITests
+    info:
+      path: ConvenientSecurityApproval/Info.plist
+      properties:
+        CFBundleDisplayName: Convenient Security
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        NSFaceIDUsageDescription: Confirm approvals mirrored from your paired Mac.
+        UIBackgroundModes:
+          - remote-notification
+        # Export compliance (ios/README.md, "App Store release"): every
+        # cryptographic operation in the app and its extension is Apple's
+        # own (CryptoKit, the Secure Enclave, CloudKit's TLS), which Apple
+        # lists as needing no export documentation. Change this only with
+        # that section, if the app ever brings its own cryptography.
+        ITSAppUsesNonExemptEncryption: false
+  # Rewrites a request alert with the verified request's words: the kind, the
+  # pinned Mac, the command and the requester. It reads the pinned Macs through
+  # the app's own Keychain access group and the request from the private
+  # database. It takes the version and build number from the project settings,
+  # as the app does.
+  ConvenientSecurityApprovalNotifications:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ConvenientSecurityApprovalNotifications
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(CSEC_IDENTIFIER).approval.notifications
+        DEVELOPMENT_TEAM: $(CSEC_TEAM_ID)
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: 5.9
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_ENTITLEMENTS: ConvenientSecurityApprovalNotifications/ConvenientSecurityApprovalNotifications.entitlements
+    dependencies:
+      - package: convenient-security
+        product: CSECRemoteApproval
+      - package: convenient-security
+        product: CSECRemoteApprovalCloudKit
+      - package: convenient-security
+        product: CSECBuildIdentity
+    info:
+      path: ConvenientSecurityApprovalNotifications/Info.plist
+      properties:
+        CFBundleDisplayName: Convenient Security Notifications
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+  # XCUITests of the Simulator test mode: simulated Face ID, the signed sample
+  # requests, and the cards' accessibility. They need the DEBUG && simulator
+  # backend, so they build for the Simulator only. bin/ci runs them on a
+  # throwaway Simulator; see README.md.
+  ConvenientSecurityApprovalUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    # The accessibility audit needs iOS 17; the tests only ever run on the
+    # current Simulator runtime.
+    deploymentTarget: "17.0"
+    sources:
+      - path: ConvenientSecurityApprovalUITests
+    dependencies:
+      - target: ConvenientSecurityApproval
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(CSEC_IDENTIFIER).approval.uitests
+        GENERATE_INFOPLIST_FILE: "YES"
+        SWIFT_VERSION: 5.9
+        TARGETED_DEVICE_FAMILY: "1"
+        TEST_TARGET_NAME: ConvenientSecurityApproval
+        SUPPORTED_PLATFORMS: iphonesimulator
+        SUPPORTS_MACCATALYST: "NO"

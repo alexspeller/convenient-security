@@ -1,0 +1,3 @@
+#!/bin/sh
+printf '%s\n' 'csec: op is disabled in AI commands; use csec exec -- <consumer> with secret references in its environment, or the csec SDK instead.' >&2
+exit 126

@@ -1,0 +1,16 @@
+{
+  "name": "convenient-security-monorepo",
+  "private": true,
+  "workspaces": [
+    "clients/node"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=clients/node",
+    "test": "npm run test --workspace=clients/node",
+    "pack:check": "npm run pack:check --workspace=clients/node"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
+}

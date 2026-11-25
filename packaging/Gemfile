@@ -1,0 +1,8 @@
+# frozen_string_literal: true
+
+# Build/signing tooling for the convenient-security agent (kept out of the
+# Swift package and the client gem). Used to create the Developer ID certificate
+# + provisioning profile and to notarize, via the App Store Connect API.
+source 'https://rubygems.org'
+
+gem 'fastlane'

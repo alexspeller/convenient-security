@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  The 1Password SDK reaches the desktop app by dlopening
+	  libop_sdk_ipc_client.dylib out of /Applications/1Password.app, which is
+	  signed by AgileBits rather than by us. Library validation refuses that
+	  load, and the hardened runtime is mandatory for notarization, so this
+	  exemption is the only way to hold a persistent 1Password session at all.
+
+	  It is scoped to this binary. csecd, csec and csec-rootd carry none of the
+	  forbidden entitlements, and csec's own trust check still rejects every
+	  other one on this binary — see OnePasswordBridgeExecutable.verifyTrusted.
+	  The loader check this removes is replaced by an explicit one: both csecd
+	  and the bridge verify the library is validly signed by AgileBits
+	  (2BUA8C4S2C) before it is loaded. Rationale and residual risk are in
+	  docs/threat-model.md.
+	-->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

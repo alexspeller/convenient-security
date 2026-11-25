@@ -1,0 +1,2 @@
+# `go build ./...` writes a binary named after the package directory.
+/bridge

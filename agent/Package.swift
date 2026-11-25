@@ -1,0 +1,158 @@
+// swift-tools-version:5.9
+import PackageDescription
+
+let package = Package(
+    name: "convenient-security",
+    platforms: [.macOS(.v13), .iOS(.v16)],
+    products: [
+        .library(name: "ConvenientSecurity", targets: ["ConvenientSecurity"]),
+        // Shared, value-free wire model used by the Mac agent and companion app.
+        .library(name: "CSECRemoteApproval", targets: ["CSECRemoteApproval"]),
+        // The team and identifier the build is signed under (identity.xcconfig),
+        // which the iPhone app shares.
+        .library(name: "CSECBuildIdentity", targets: ["CSECBuildIdentity"]),
+        .library(
+            name: "CSECRemoteApprovalCloudKit",
+            targets: ["CSECRemoteApprovalCloudKit"]
+        ),
+        .executable(name: "csecd", targets: ["csecd"]),
+        .executable(name: "csec", targets: ["csec"]),
+        .executable(name: "csec-rootd", targets: ["csec-rootd"]),
+    ],
+    targets: [
+        // The Apple team and identifier prefix, generated from identity.xcconfig
+        // (packaging/lib/identity.sh), and the names derived from them.
+        .target(name: "CSECBuildIdentity"),
+        // Low-level C interop: unix sockets, LOCAL_PEERTOKEN peer identity, proc info.
+        // libbsm provides audit_token_to_pid (not auto-linked).
+        .target(
+            name: "CSecuritySupport",
+            linkerSettings: [.linkedLibrary("bsm"), .linkedLibrary("util")]
+        ),
+        // Pure secret-shape classifier shared by Swift and the standalone PAM
+        // build without pulling unrelated process primitives across boundaries.
+        .target(name: "CSECSecretHeuristics"),
+        // The tree-sitter runtime and bash grammar Codex links, vendored
+        // unmodified (Sources/CTreeSitterBash/VENDORED.md), so the Codex hook
+        // parses a command exactly as Codex's own command checks do. lib.c is
+        // the runtime's amalgamation; the defines are its build script's.
+        .target(
+            name: "CTreeSitterBash",
+            exclude: [
+                "VENDORED.md",
+                "tree-sitter/LICENSE",
+                "tree-sitter-bash/LICENSE",
+                "tree-sitter/src/unicode/LICENSE",
+                "tree-sitter/src/unicode/ICU_SHA",
+                "tree-sitter/src/unicode/README.md",
+            ],
+            sources: [
+                "tree-sitter/src/lib.c",
+                "tree-sitter-bash/src/parser.c",
+                "tree-sitter-bash/src/scanner.c",
+            ],
+            cSettings: [
+                .headerSearchPath("tree-sitter/src"),
+                .define("_POSIX_C_SOURCE", to: "200112L"),
+                .define("_DEFAULT_SOURCE"),
+                .define("_DARWIN_C_SOURCE"),
+            ]
+        ),
+        // Value-free launch plans, peer identity, framing, and root wire types.
+        // This target deliberately has no AppKit, LocalAuthentication, Keychain,
+        // provider, or ServiceManagement implementation.
+        .target(name: "CSECRootProtocol", dependencies: ["CSecuritySupport", "CSECBuildIdentity"]),
+        // The privileged filesystem/process/socket implementation is separate
+        // so csec-rootd does not link the full user-agent module.
+        .target(
+            name: "CSECRootServer",
+            dependencies: ["CSecuritySupport", "CSECRootProtocol"]
+        ),
+        // Cross-platform signed remote-approval envelopes. This target contains
+        // no provider, secret value, AppKit/UIKit, Keychain, or CloudKit code.
+        .target(name: "CSECRemoteApproval"),
+        // Private-database transport. Signatures in CSECRemoteApproval remain
+        // authoritative; CloudKit is an untrusted, value-free mailbox.
+        .target(
+            name: "CSECRemoteApprovalCloudKit",
+            dependencies: ["CSECRemoteApproval", "CSECBuildIdentity"]
+        ),
+        // Security core plus the native encrypted-file provider.
+        .target(
+            name: "ConvenientSecurity",
+            dependencies: [
+                "CSecuritySupport", "CSECSecretHeuristics", "CSECRootProtocol",
+                "CSECRemoteApproval", "CTreeSitterBash", "CSECBuildIdentity",
+            ]
+        ),
+        // All 1Password-specific code lives behind the provider seam.
+        .target(
+            name: "OnePasswordAdapter",
+            dependencies: ["ConvenientSecurity", "CSECRemoteApproval", "CSECBuildIdentity"]
+        ),
+        // The resident agent.
+        .executableTarget(
+            name: "csecd",
+            dependencies: [
+                "ConvenientSecurity", "OnePasswordAdapter",
+                "CSECRemoteApprovalCloudKit", "CSECBuildIdentity",
+            ]
+        ),
+        // The signed launcher / CLI.
+        // OnePasswordAdapter powers CLI-direct 1Password writes
+        // (protect --env, edit op://…); reads stay in csecd.
+        .executableTarget(
+            name: "csec",
+            dependencies: ["ConvenientSecurity", "OnePasswordAdapter", "CSECBuildIdentity"]
+        ),
+        // Narrow privileged launcher. It has no Keychain/Touch ID/provider
+        // dependencies and accepts only the authenticated two-party protocol.
+        .executableTarget(
+            name: "csec-rootd",
+            dependencies: ["CSECRootProtocol", "CSECRootServer"]
+        ),
+        // Framework-free self-checks (`swift run cs-selftest`) — runs without
+        // XCTest / full Xcode, so it works under the Command Line Tools too.
+        .executableTarget(
+            name: "cs-selftest",
+            dependencies: [
+                "ConvenientSecurity", "OnePasswordAdapter", "CSecuritySupport",
+                "CSECRootServer", "CSECRemoteApproval",
+                "CSECRemoteApprovalCloudKit", "CSECBuildIdentity",
+            ]
+        ),
+        // End-to-end check: agent + client over a real socket, no entitlements.
+        .executableTarget(name: "cs-e2e", dependencies: ["ConvenientSecurity"]),
+        // Real OpenSSH interoperability: synthetic RSA key + Apple's ssh(1)
+        // against an isolated, unprivileged localhost sshd.
+        .executableTarget(name: "cs-ssh-e2e", dependencies: ["ConvenientSecurity"]),
+        // A long-running fake agent (in-memory demo values, auto-approve) for
+        // cross-language client integration tests. Not a production surface.
+        .executableTarget(name: "cs-fake-agent", dependencies: ["ConvenientSecurity"]),
+        // Unprivileged functional double for the two-party/root wire protocol.
+        // It uses owner-read files and never claims capability-GID isolation.
+        .executableTarget(
+            name: "cs-fake-rootd",
+            dependencies: ["CSECRootProtocol", "CSECRootServer"]
+        ),
+        // Dev-only screenshot harness: renders the trusted review window with
+        // synthetic value-free reviews and writes a PNG for design iteration.
+        // Auto-approves nothing and resolves nothing; not a production surface.
+        .executableTarget(name: "cs-review-preview", dependencies: ["ConvenientSecurity", "CSECRemoteApproval"]),
+        // Root PAM integration. It receives an already-redacted command over a
+        // private stdin pipe and owns the embedded Touch ID review UI.
+        .executableTarget(
+            name: "csec-sudo-review",
+            dependencies: ["ConvenientSecurity", "CSecuritySupport"]
+        ),
+        // Synthetic regression fixture: rewrites its original argv area the way
+        // modern Ruby process-title support does, with no real environment.
+        .executableTarget(name: "cs-process-title-fixture"),
+        // Synthetic regular-file compatibility fixture. It never receives an
+        // expected value in argv/environment and emits only a fixed success line.
+        .executableTarget(name: "cs-file-probe"),
+        // Synthetic GitHub CLI stand-in for GH_CONFIG_DIR behavior. It never
+        // prints the profile or token and is not a production dependency.
+        .executableTarget(name: "cs-gh-fixture"),
+    ]
+)

@@ -1,0 +1,6 @@
+# Developer-portal team + the agent's App ID, from identity.xcconfig, which
+# packaging/bin/provision.sh exports as CSEC_IDENTIFIER and CSEC_TEAM_ID. Auth
+# is via an App Store Connect API key (see Fastfile), not an Apple ID, so no
+# apple_id here.
+app_identifier(ENV["CSEC_IDENTIFIER"]) if ENV["CSEC_IDENTIFIER"]
+team_id(ENV["CSEC_TEAM_ID"]) if ENV["CSEC_TEAM_ID"]

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- build-agent.sh fills in CSEC_IDENTIFIER from identity.xcconfig. -->
+    <key>CFBundleIdentifier</key>
+    <string>@CSEC_IDENTIFIER@</string>
+    <!-- csecd is the bundle's MAIN executable: the embedded provisioning profile
+         authorizes the restricted keychain-access-groups entitlement only for the
+         main executable, so the entitled binary must be it (a secondary binary
+         claiming that entitlement is SIGKILLed by AMFI at launch). csec is an
+         additional binary in Contents/MacOS; running it still gives Bundle.main =
+         this .app, so `csec install` resolves Contents/Library/LaunchAgents/. -->
+    <key>CFBundleExecutable</key>
+    <string>csecd</string>
+    <key>CFBundleName</key>
+    <string>ConvenientSecurity</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <!-- build-agent.sh replaces both with the repository's VERSION and the
+         build number (the commit count), the same release every binary's
+         __csec_stamp section carries. -->
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <!-- csec is the TCC-responsible process for explicitly enrolled automation
+         commands that it supervises. Keep both legacy (macOS 13) and current
+         full-access purpose keys because the supported OS range spans both. -->
+    <key>NSCalendarsUsageDescription</key>
+    <string>ConvenientSecurity runs explicitly enrolled automation that may read and update your calendars.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>ConvenientSecurity runs explicitly enrolled automation that may read and update your calendars.</string>
+    <key>NSRemindersUsageDescription</key>
+    <string>ConvenientSecurity runs explicitly enrolled automation that may read and update your reminders.</string>
+    <key>NSRemindersFullAccessUsageDescription</key>
+    <string>ConvenientSecurity runs explicitly enrolled automation that may read and update your reminders.</string>
+    <!-- Approval windows name the terminal tab a request came from. csecd asks
+         iTerm2 / Terminal.app (read-only window and tab bookkeeping) over Apple
+         events; this is the Automation prompt the user sees once per terminal. -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>ConvenientSecurity asks your terminal which window and tab a secret, SSH or sudo request came from, so every approval dialog can show it.</string>
+    <!-- Background agent: no Dock icon or menu bar if the bundle is ever opened. -->
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>

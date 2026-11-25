@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The product archive's distribution definition. build-pkg.sh fills in
+  @VERSION@ (the package version, the app's CFBundleShortVersionString and
+  CFBundleVersion joined as VERSION.BUILD) and @MINIMUM_MACOS@ (its
+  LSMinimumSystemVersion), so the installer refuses a Mac the app could not run
+  on before anything is written, rather than leaving an app that fails at
+  launch. Every binary is arm64 only, so an Intel Mac is refused too.
+  Installing to the system domain needs an administrator's name and password.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>Convenient Security</title>
+    <options customize="never" require-scripts="true" hostArchitectures="arm64"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <allowed-os-versions>
+        <os-version min="@MINIMUM_MACOS@"/>
+    </allowed-os-versions>
+    <installation-check script="csecInstallationCheck()"/>
+    <script><![CDATA[
+function csecInstallationCheck() {
+    if (system.sysctl('hw.optional.arm64') != 1) {
+        my.result.type = 'Fatal';
+        my.result.title = 'Convenient Security needs a Mac with Apple silicon';
+        my.result.message = 'This Mac has an Intel processor. Convenient Security runs only on Macs with Apple silicon (M1 or later), so nothing has been installed.';
+        return false;
+    }
+    if (system.compareVersions(system.version.ProductVersion, '@MINIMUM_MACOS@') < 0) {
+        my.result.type = 'Fatal';
+        my.result.title = 'Convenient Security needs macOS @MINIMUM_MACOS@ or later';
+        my.result.message = 'Update macOS in System Settings, then open this installer again. Nothing has been installed.';
+        return false;
+    }
+    return true;
+}
+]]></script>
+    <choices-outline>
+        <line choice="@CSEC_IDENTIFIER@.pkg"/>
+    </choices-outline>
+    <choice id="@CSEC_IDENTIFIER@.pkg" visible="false" title="Convenient Security">
+        <pkg-ref id="@CSEC_IDENTIFIER@.pkg"/>
+    </choice>
+    <pkg-ref id="@CSEC_IDENTIFIER@.pkg" version="@VERSION@" onConclusion="none">ConvenientSecurity-component.pkg</pkg-ref>
+</installer-gui-script>

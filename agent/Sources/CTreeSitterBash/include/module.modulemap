@@ -1,0 +1,4 @@
+module CTreeSitterBash {
+    header "CTreeSitterBash.h"
+    export *
+}

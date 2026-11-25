@@ -1,0 +1,94 @@
+#!/bin/bash
+set -u
+
+# After an upgrade, make every running csecd the new build, and ask the person
+# at the Mac to reopen their approvals, as build-and-install.sh does.
+#
+# The installer has just replaced /Applications/ConvenientSecurity.app under
+# each logged-in user's running csecd. Until a csecd restarts it keeps the old
+# code, and every new csec client refuses it ("the socket peer has an
+# unexpected code identity"), so each one is restarted here. Then, for the
+# console user only (the one at the Mac), `csec restore` raises the one panel
+# that reopens the approvals the restart locked, detached so the installer
+# does not wait on it. If that cannot start, the first request that needs a
+# restored approval raises the same panel.
+#
+# Nothing here can fail the install: the payload is already in place and
+# verified, and `csec doctor` repairs a csecd left running old code.
+#
+# usage: restart-user-agents LAUNCHCTL PS SUDO CONSOLE LABEL CSECD CSEC
+#   LAUNCHCTL, PS, SUDO  /bin/launchctl, /bin/ps, /usr/bin/sudo
+#   CONSOLE              /dev/console, whose owner is the user at the Mac
+#   LABEL                csecd's LaunchAgent label
+#   CSECD, CSEC          the installed csecd (only its name finds candidates)
+#                        and csec
+
+if [ "$#" -ne 7 ]; then
+  echo "usage: restart-user-agents LAUNCHCTL PS SUDO CONSOLE LABEL CSECD CSEC" >&2
+  exit 64
+fi
+launchctl_bin="$1"
+ps_bin="$2"
+sudo_bin="$3"
+console="$4"
+label="$5"
+csecd="$6"
+csec="$7"
+
+case "$label" in
+  "" | *[!A-Za-z0-9._-]*)
+    echo "restart-user-agents: invalid service label" >&2
+    exit 0
+    ;;
+esac
+
+# Candidates: each user running a process with csecd's name, once each. The
+# path in `ps -o comm=` cannot identify csecd itself: SMAppService starts it
+# from the bundle-relative BundleProgram, so ps shows `Contents/MacOS/csecd`,
+# which any other app could equally contain.
+csecd_name="${csecd##*/}"
+candidate_uids="$("$ps_bin" -axo uid=,comm= 2>/dev/null |
+  /usr/bin/awk -v name="$csecd_name" '$2 == name || substr($2, length($2) - length(name)) == "/" name { print $1 }' |
+  /usr/bin/sort -un)"
+
+# launchd decides: a candidate counts only when its csecd job is running. As in
+# AgentStartupWait.runningPID, only the job's own top-level fields (one tab
+# deep) count, never those of the endpoints nested inside it.
+csecd_running() {
+  "$launchctl_bin" print "gui/$1/$label" 2>/dev/null | /usr/bin/awk '
+    /^\t[^\t]/ {
+      line = substr($0, 2)
+      split(line, field, " = ")
+      if (field[1] == "state") running = (field[2] == "running")
+      if (field[1] == "pid" && field[2] ~ /^[0-9]+$/ && field[2] > 0) pid = 1
+    }
+    END { exit !(running && pid) }'
+}
+
+console_uid="$(/usr/bin/stat -f %u "$console" 2>/dev/null || true)"
+restarted_console=0
+for uid in $candidate_uids; do
+  case "$uid" in
+    "" | *[!0-9]*) continue ;;
+  esac
+  csecd_running "$uid" || continue
+  if "$launchctl_bin" kickstart -k "gui/$uid/$label" >/dev/null 2>&1; then
+    echo "Convenient Security: restarted csecd for user $uid on the new build"
+    [ "$uid" = "$console_uid" ] && restarted_console=1
+  else
+    echo "Convenient Security: could not restart csecd for user $uid; csec doctor will" >&2
+  fi
+done
+
+# Only a person at the Mac can answer the restore panel. The login window's
+# console owner is root (uid 0), which runs no csecd.
+if [ "$restarted_console" -eq 1 ] && [ "$console_uid" -ge 501 ] 2>/dev/null; then
+  # doctor --runtime first, as build-and-install.sh does: it waits for the
+  # restarted csecd to answer (never restarting one that is still starting),
+  # so the restore does not race csecd's own start.
+  "$launchctl_bin" asuser "$console_uid" "$sudo_bin" -H -u "#$console_uid" -- \
+    /bin/sh -c '"$1" doctor --runtime >/dev/null 2>&1; exec "$1" restore' csec-restore "$csec" \
+    </dev/null >/dev/null 2>&1 &
+  echo "Convenient Security: asked user $console_uid to reopen their approvals"
+fi
+exit 0

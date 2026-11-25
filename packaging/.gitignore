@@ -1,0 +1,21 @@
+# Signing tooling: never commit secrets or machine-specific build state.
+vendor/
+.bundle/
+
+# Local config (personal 1Password account + item references).
+.env
+
+# App Store Connect API key + any certificate/profile material.
+*.p8
+*.p12
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*.provisionprofile
+
+# fastlane generated output.
+fastlane/report.xml
+fastlane/README.md
+
+# Build products (compiled spike, assembled .app, fetched profiles).
+build/

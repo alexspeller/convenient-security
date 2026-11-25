@@ -1,0 +1,103 @@
+# frozen_string_literal: true
+
+require "yaml"
+
+# Provisioning for the convenient-security agent, driven by an App Store Connect
+# API key (Team key, Admin role) that lives in 1Password. A wrapper reads it with
+# `op` just-in-time and gives Fastlane an inherited `/dev/fd` pipe. Private key
+# bytes therefore stay out of argv, environment snapshots, and disk:
+#   ASC_KEY_ID       - the API key's Key ID
+#   ASC_ISSUER_ID    - the team's Issuer ID
+#   ASC_KEY_FILE     - inherited descriptor path (normally /dev/fd/3)
+#
+# Local signing/notarization (codesign, notarytool, stapler, pkgbuild) live in a
+# shell script; fastlane here talks to the developer portal and, for the iPhone
+# app's App Store build (lane :testflight), to TestFlight.
+
+# The App ID and team, from identity.xcconfig; packaging/bin/provision.sh, which
+# runs this, exports them.
+APP_IDENTIFIER = ENV.fetch("CSEC_IDENTIFIER")
+TEAM_ID = ENV.fetch("CSEC_TEAM_ID")
+
+def asc_api_key
+  app_store_connect_api_key(
+    key_id: ENV.fetch("ASC_KEY_ID"),
+    issuer_id: ENV.fetch("ASC_ISSUER_ID"),
+    key_filepath: ENV.fetch("ASC_KEY_FILE")
+  )
+end
+
+# NOTE: the App ID (CSEC_IDENTIFIER) must be pre-registered in
+# the developer portal. `produce` can't do it here — it has no App Store Connect
+# API-key support (Apple-ID auth only). It's a one-time manual step, done in the
+# same portal visit as the Developer ID certificate.
+desc "Fetch/create the Developer ID provisioning profile for the App ID"
+lane :provision do
+  key = asc_api_key
+
+  # Developer ID distribution profile for macOS (sigh's macOS token is "macos").
+  # Auto-includes application-identifier + keychain-access-groups for the App ID,
+  # which is our access group CSEC_TEAM_ID.CSEC_IDENTIFIER.
+  # filename must end in .mobileprovision (fastlane validation) even though the
+  # content is a macOS Developer ID profile; build-spike copies it to
+  # embedded.provisionprofile, so the extension on disk is cosmetic.
+  get_provisioning_profile(
+    app_identifier: APP_IDENTIFIER,
+    platform: "macos",
+    developer_id: true,
+    api_key: key,
+    filename: "convenient-security.mobileprovision",
+    output_path: "./build",
+    skip_install: true # we embed the file directly; no Xcode profile store needed
+  )
+end
+
+# The iPhone approval app's App Store build. Its Release configuration is
+# CloudKit Production with production push
+# (ConvenientSecurityApproval.production.entitlements). Xcode's own team
+# account signs the archive and its export (-allowProvisioningUpdates, the
+# same account build-and-install.sh's Debug build uses), and creates the App
+# Store distribution certificate and profiles the first time. The API key
+# above is used only for the upload. Run it through the credential wrapper:
+#   packaging/bin/provision.sh testflight
+# ios/project.yml names the app $(CSEC_IDENTIFIER).approval.
+IPHONE_APP_IDENTIFIER = "#{APP_IDENTIFIER}.approval"
+REPO_ROOT = File.expand_path("../..", __dir__)
+
+desc "Archive the iPhone approval app's Release build and upload it to TestFlight"
+lane :testflight do
+  # Read the inherited descriptor now: a pipe can be read only once, and the
+  # build that follows takes minutes.
+  key = asc_api_key
+  ios = File.join(REPO_ROOT, "ios")
+  sh("mise", "exec", "-C", REPO_ROOT, "--", "xcodegen", "generate", "--quiet",
+     "--spec", File.join(ios, "project.yml"))
+  # The same stamped build number as build-and-install.sh's phone builds:
+  # project.yml's integer, then the time. It only ever grows, as App Store
+  # Connect requires within one version, without asking it for the last one.
+  base = YAML.safe_load(File.read(File.join(ios, "project.yml")))
+             .dig("settings", "base", "CURRENT_PROJECT_VERSION")
+  UI.user_error!("ios/project.yml must set CURRENT_PROJECT_VERSION to an integer") unless
+    base.is_a?(String) && base.match?(/\A[0-9]+\z/)
+  build_number = "#{base}.#{Time.now.utc.to_i}"
+  ipa = build_app(
+    project: File.join(ios, "ConvenientSecurityApproval.xcodeproj"),
+    scheme: "ConvenientSecurityApproval",
+    configuration: "Release",
+    export_method: "app-store",
+    clean: true,
+    xcargs: "-allowProvisioningUpdates CURRENT_PROJECT_VERSION=#{build_number}",
+    export_xcargs: "-allowProvisioningUpdates",
+    output_directory: File.join(REPO_ROOT, "packaging", "build", "ios"),
+    output_name: "ConvenientSecurityApproval.ipa"
+  )
+  # Internal testers only: external testing needs Beta App Review and the
+  # public-link setup, which are App Store Connect steps of their own.
+  upload_to_testflight(
+    api_key: key,
+    ipa: ipa,
+    app_identifier: IPHONE_APP_IDENTIFIER,
+    skip_waiting_for_build_processing: true
+  )
+  UI.success("Uploaded the iPhone app build #{build_number} to TestFlight")
+end

@@ -1,0 +1,71 @@
+#!/bin/bash
+set -eu
+
+# Refuses to install this package over a higher csec release, before the
+# installer writes anything. Installer scripts run as root with the package
+# path, the install location and the target volume as $1..$3.
+#
+# package-release (written by build-pkg.sh beside this script) names the
+# package's own version and build, which preinstall cannot read from the
+# payload: it is not extracted yet. allow_downgrade=1 there marks a package
+# built for a deliberate rollback (build-and-install.sh --allow-downgrade).
+
+script_directory="$(cd "$(dirname "$0")" && pwd)"
+target_volume="${3:-/}"
+installed_info="${target_volume%/}/Applications/ConvenientSecurity.app/Contents/Info.plist"
+
+package_version=""
+package_build=""
+allow_downgrade=""
+while IFS='=' read -r key value; do
+  case "$key" in
+    version) package_version="$value" ;;
+    build) package_build="$value" ;;
+    allow_downgrade) allow_downgrade="$value" ;;
+  esac
+done < "$script_directory/package-release"
+
+release_pattern='^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
+build_pattern='^[1-9][0-9]{0,9}$'
+if [[ ! "$package_version" =~ $release_pattern ]] || [[ ! "$package_build" =~ $build_pattern ]]; then
+  echo "Convenient Security package carries no valid release ($package_version, build $package_build)" >&2
+  exit 1
+fi
+
+# Nothing installed yet, or an app from before csec numbered its releases:
+# nothing to compare with.
+[ -f "$installed_info" ] || exit 0
+installed_version="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - -- "$installed_info" 2>/dev/null || true)"
+installed_build="$(/usr/bin/plutil -extract CFBundleVersion raw -o - -- "$installed_info" 2>/dev/null || true)"
+if [[ ! "$installed_version" =~ $release_pattern ]] || [[ ! "$installed_build" =~ ^(0|[1-9][0-9]{0,9})$ ]]; then
+  echo "Convenient Security: the installed app has no release number to compare; installing $package_version (build $package_build)"
+  exit 0
+fi
+
+# Prints -1, 0 or 1 as release A (version, build) is below, equal to or
+# above release B.
+compare_releases() {
+  local a_version="$1" a_build="$2" b_version="$3" b_build="$4"
+  local -a a b
+  IFS=. read -r -a a <<< "$a_version"
+  IFS=. read -r -a b <<< "$b_version"
+  local index
+  for index in 0 1 2; do
+    if [ "$((10#${a[$index]}))" -lt "$((10#${b[$index]}))" ]; then echo -1; return; fi
+    if [ "$((10#${a[$index]}))" -gt "$((10#${b[$index]}))" ]; then echo 1; return; fi
+  done
+  if [ "$((10#$a_build))" -lt "$((10#$b_build))" ]; then echo -1; return; fi
+  if [ "$((10#$a_build))" -gt "$((10#$b_build))" ]; then echo 1; return; fi
+  echo 0
+}
+
+order="$(compare_releases "$installed_version" "$installed_build" "$package_version" "$package_build")"
+if [ "$order" = "1" ]; then
+  if [ "$allow_downgrade" = "1" ]; then
+    echo "Convenient Security: replacing $installed_version (build $installed_build) with the older $package_version (build $package_build), as this package allows"
+    exit 0
+  fi
+  echo "Convenient Security $installed_version (build $installed_build) is installed, which is newer than this package's $package_version (build $package_build). Installing it would downgrade csec, so nothing was changed. Download the current package instead." >&2
+  exit 1
+fi
+exit 0
