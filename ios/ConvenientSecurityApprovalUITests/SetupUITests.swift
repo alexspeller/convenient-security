@@ -38,8 +38,7 @@ final class SetupUITests: ApprovalUITestCase {
     /// reachable before setup and once set up.
     func testThePrivacyPolicyIsLinkedBeforeAndAfterSetup() {
         launch(.notSetUp)
-        // A Link in a List row reaches accessibility as a button.
-        let policy = button("Privacy policy")
+        let policy = link("Privacy policy")
         XCTAssertTrue(reveal(policy, fromTop: true), "before setup")
         setUpPhone()
         XCTAssertTrue(text("No pending approvals").waitForExistence(timeout: Self.appWork))

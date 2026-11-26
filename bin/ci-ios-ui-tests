@@ -84,6 +84,9 @@ if ! ios_bounded 3600 "${ios_test_xcodebuild[@]}" test-without-building \
   grep -E -A120 '^UITEST: ' "$ios_uitest_log" >&2 || true
   grep -E 'error:|^Test Case .* failed|\*\* TEST' "$ios_uitest_log" >&2 || true
   /usr/bin/tail -n 30 "$ios_uitest_log" >&2
+  # A wait that ran out is often the Mac's load: say what was busiest then.
+  echo "Busiest processes (%CPU, command):" >&2
+  /bin/ps -Ao pcpu=,comm= -r | /usr/bin/head -n 12 >&2 || true
   # The scratch log goes with the lease, so a run stopped by its bound says
   # here how far the suite got.
   echo "$(grep -c -E '^Test Case .* passed' "$ios_uitest_log" || true) test cases passed before the run ended" >&2

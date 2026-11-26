@@ -63,6 +63,14 @@ class ApprovalUITestCase: XCTestCase {
     /// for seconds at a time. What must not happen is still watched for over
     /// a short window: load can make such a check pass, never fail it.
     static let appWork: TimeInterval = 30
+    /// How long a test waits on the Simulator's own services, which answer
+    /// the app's notification-settings read and pass a simulated face. On a
+    /// GitHub-hosted VM (3 CPUs, load averages near 80) a newly booted iOS
+    /// 27.2 Simulator left both unanswered for minutes: the first six tests of
+    /// the run each outwaited `appWork` there, and later setups passed. Like
+    /// `appWork`, it costs a passing run nothing, and it leaves room inside a
+    /// test's five-minute allowance for a launch and both waits.
+    static let systemWork: TimeInterval = 120
 
     let app = XCUIApplication()
     let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
@@ -232,7 +240,7 @@ class ApprovalUITestCase: XCTestCase {
     /// gone and the app is active again, unless `untilActive` is false: setup
     /// raises the notification prompt straight after its sheet.
     func matchFace(
-        timeout: TimeInterval = 20,
+        timeout: TimeInterval = ApprovalUITestCase.systemWork,
         untilActive: Bool = true,
         file: StaticString = #filePath,
         line: UInt = #line
@@ -310,7 +318,7 @@ class ApprovalUITestCase: XCTestCase {
     /// says "unread" until the app has read it, so this waits for that.
     func notificationsUndecided(file: StaticString = #filePath, line: UInt = #line) -> Bool {
         var value = ""
-        let read = waitUntil(timeout: Self.appWork) {
+        let read = waitUntil(timeout: Self.systemWork) {
             guard let strip = self.stripValue() else { return false }
             value = strip.notifications
             return value != "notifications unread"
@@ -380,6 +388,12 @@ class ApprovalUITestCase: XCTestCase {
         for _ in 0..<3 where !choice.exists {
             tapSimulatorControl(menuTitle, file: file, line: line)
             _ = choice.waitForExistence(timeout: 3)
+            // On a loaded Simulator a menu can take longer to open, and a
+            // second tap while it opens closes it, so while its control is
+            // still uncovered the next tap waits for it.
+            _ = waitUntil(timeout: Self.appWork) {
+                choice.exists || !self.isHittableNow(self.button(menuTitle))
+            }
             // The open menu covers its control, so a covered control means
             // it opened. At a large text size it scrolls, and an item further
             // down exists only once it is on screen.
@@ -643,6 +657,14 @@ class ApprovalUITestCase: XCTestCase {
 
     func button(_ label: String) -> XCUIElement {
         app.buttons.matching(NSPredicate(format: "label == %@", label)).firstMatch
+    }
+
+    /// A SwiftUI `Link`, which iOS 26 reports in a List row as a button and
+    /// iOS 27 as a link.
+    func link(_ label: String) -> XCUIElement {
+        let types = [XCUIElement.ElementType.button, .link].map(\.rawValue)
+        return app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@ AND elementType IN %@", label, types)).firstMatch
     }
 
     func button(beginningWith prefix: String) -> XCUIElement {
