@@ -108,12 +108,22 @@ elif cmd == 'bootstatus':
     time.sleep(float(os.environ.get('FAKE_BOOT_SECONDS', '0')))
     state = load()
     device = find(state, args[1])
+    # Each listed prefix fails one boot's data migration. Like the real
+    # bootstatus -b, that ends in a terminal status and exit 0, booted.
+    failing = next((p for p in state.get('migration_fails', []) if device['name'].startswith(p)), None)
+    if failing is not None: state['migration_fails'].remove(failing)
     device['state'] = 'Booted'
+    device['migration_failed'] = failing is not None
     device['migrated_on_this_boot'] = not device['booted_once']
     device['booted_once'] = True
     state.setdefault('boots', []).append(dict(device))
     save(state)
-    print('Finished', flush=True)
+    print('Status=3, isTerminal=YES\n\tData Migration Failed' if failing is not None else 'Finished', flush=True)
+elif cmd == 'erase':
+    device = find(state, args[1])
+    assert device['state'] == 'Shutdown', 'erasing a live device'
+    device.update(booted_once=False, erased=True)
+    save(state)
 else:
     save(state)
     raise AssertionError(args)
@@ -158,7 +168,9 @@ with open(str(path) + '.lock', 'a') as lock:
     udid = os.environ['SIMULATOR_RUN_UDID']
     device = next(d for d in state['devices'] if d['udid'] == udid)
     assert device['state'] == 'Booted'
-    assert not device['migrated_on_this_boot'], 'clone repeated first-boot migration'
+    assert not device['migration_failed'], 'ran on a device whose data migration failed'
+    # An erased clone migrates again, as a new device does.
+    assert not device['migrated_on_this_boot'] or device.get('erased'), 'clone repeated first-boot migration'
     state.setdefault('commands', []).append(dict(udid=udid, args=sys.argv[1:],
         device_set=os.environ['SIMULATOR_RUN_SET']))
     path.write_text(json.dumps(state))
@@ -323,6 +335,30 @@ class CISimulatorTests(unittest.TestCase):
         self.assertEqual(len(self.state()["devices"]), 1)
         self.assertEqual(self.state()["devices"][0]["state"], "Shutdown")
         self.assertNotIn("commands", self.state())
+
+    def test_a_failed_data_migration_is_erased_and_booted_again(self):
+        # Hosted run 45867216121: a clone's boot ended "Data Migration Failed",
+        # bootstatus -b exited 0, and the UI tests ran on it at load 180.
+        self.add_device(BASE)
+        self.update(lambda s: s.update(migration_fails=["csec-ci-uitests-"]))
+        result = self.run_check()
+        self.assertEqual(result[0], 0, result)
+        state = self.state()
+        clone = state["commands"][0]["udid"]
+        self.assertEqual([b["migration_failed"] for b in state["boots"]], [True, False])
+        self.assertEqual({b["udid"] for b in state["boots"]}, {clone})
+        self.assertIn(["erase", clone], state["calls"])
+        self.assertEqual(len(state["commands"]), 1)
+        self.assertEqual([d["name"] for d in state["devices"]], [BASE])
+
+    def test_a_second_failed_data_migration_fails_without_running_the_command(self):
+        self.add_device(BASE)
+        self.update(lambda s: s.update(migration_fails=["csec-ci-uitests-", "csec-ci-uitests-"]))
+        result = self.run_check()
+        self.assertEqual(result[0], 75, result)
+        self.assertIn("Data Migration Failed", result[2])
+        self.assertNotIn("commands", self.state())
+        self.assertTrue(all(d["state"] == "Shutdown" for d in self.state()["devices"]))
 
     def test_clone_boot_timeout_preserves_shutdown_recovery_device_and_warm_base(self):
         self.add_device(BASE)

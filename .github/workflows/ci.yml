@@ -35,9 +35,11 @@ jobs:
     runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'xcode-27' }}
     # bin/ci takes about 55 minutes with no wait for the simulator (23 of them
     # the iPhone UI tests), and the Build and test step lets the UI tests wait
-    # 30 more for a shared simulator admission. The rest is headroom for a
-    # loaded Mac or a cold Simulator base's first boot.
-    timeout-minutes: 120
+    # 30 more for a shared simulator admission. A GitHub-hosted VM needs no
+    # admission, but its UI tests alone took 58 minutes after 20 of other
+    # checks, and bin/ci-ios-ui-tests allows them 90. The rest is headroom for
+    # a loaded Mac or a cold Simulator base's first boot.
+    timeout-minutes: 150
     steps:
       # bin/release-manifest.py numbers a build by its commit count, so it and
       # its tests refuse a shallow clone.

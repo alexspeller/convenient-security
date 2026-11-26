@@ -34,6 +34,10 @@ LOCK = Path(os.environ.get("CSEC_CI_SIMULATOR_LOCK", Path.home()
 BASE_PREFIX = "csec-ci-uitests-base "
 OWNED_NAME = re.compile(r"csec-ci-(?:uitests|base-pending)-([0-9]+)-[0-9a-f]{32}")
 SIMCTL_LIMIT = 300
+# bootstatus -b prints this terminal status and still exits 0, leaving a booted
+# device whose system services never settle. On hosted run 45867216121 the UI
+# tests ran on one at load averages near 200 on 3 CPUs and 11 of them failed.
+MIGRATION_FAILED = "Data Migration Failed"
 TEMPFAIL = 75
 NOT_ADMITTED = 76
 NEEDS_BASE = 78
@@ -392,11 +396,24 @@ def direct(argv):
         raise Failure("the selector did not return a Shutdown device")
     set_args = [] if config["device_set"] == "default" else ["--set", config["device_set"]]
     code = TEMPFAIL
+    boot_log = Path(args.boot_log)
+    boot_log.write_text("")
     try:
-        with open(args.boot_log, "w") as log:
-            direct_process([*SIMCTL, *set_args, "bootstatus", udid, "-b"],
-                           float(os.environ["SIMULATOR_RUN_BOOT_S"]), caller,
-                           stdout=log, stderr=subprocess.STDOUT)
+        limit = float(os.environ["SIMULATOR_RUN_BOOT_S"])
+        for attempt in (1, 2):
+            start = boot_log.stat().st_size
+            with open(boot_log, "a") as log:
+                direct_process([*SIMCTL, *set_args, "bootstatus", udid, "-b"], limit, caller,
+                               stdout=log, stderr=subprocess.STDOUT)
+            if MIGRATION_FAILED.encode() not in boot_log.read_bytes()[start:]:
+                break
+            if attempt == 2:
+                raise Failure(f"the Simulator's data migration failed on both boots of {udid}")
+            # An erased device boots as a new one, through a full first-boot
+            # migration, so it gets the cold base's allowance.
+            shutdown(udid)
+            simctl("erase", udid)
+            limit = float(config["base_boot_limit"])
         direct_process(command, float(os.environ.get("SIMULATOR_RUN_RUN_S", "7200")), caller,
                        env=dict(os.environ, SIMULATOR_RUN_SET=config["device_set"], SIMULATOR_RUN_UDID=udid))
         code = 0

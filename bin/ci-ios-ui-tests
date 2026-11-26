@@ -62,15 +62,16 @@ ios_bounded 900 "${ios_xcodebuild[@]}" -quiet -jobs 2 \
   build-for-testing CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= \
   SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
 ios_uitest_log="$ios_scratch/ui-tests.log"
-# Each test is stopped after five minutes, and the whole run after an hour:
+# Each test is stopped after five minutes, and the whole run after ninety:
 # the run's bound catches a wedged Simulator or xcodebuild between tests. It
 # sits well above a loaded Mac's run: the 40-test suite took 32 minutes at a
-# load average near 250 on 10 CPUs and went past forty at one near 455.
+# load average near 250 on 10 CPUs and went past forty at one near 455, and
+# a GitHub-hosted VM (3 CPUs, load averages near 80) took 58.
 # A test's bound only catches one that wedges, so it is well above the
 # slowest test's time on a loaded Mac: the mailbox tests that set up, pair
 # and relaunch take a minute or more unloaded, and went past two minutes at
 # load averages of 160 to 250 on 10 CPUs.
-if ! ios_bounded 3600 "${ios_test_xcodebuild[@]}" test-without-building \
+if ! ios_bounded 5400 "${ios_test_xcodebuild[@]}" test-without-building \
     -project "$repo_root/ios/ConvenientSecurityApproval.xcodeproj" \
     -scheme ConvenientSecurityApproval \
     -destination "id=$ios_simulator" \
