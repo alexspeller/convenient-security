@@ -1356,7 +1356,10 @@ not a compiler failure.
 
 ## GitHub CI
 
-`.github/workflows/ci.yml` runs on every push to `main` and every pull request.
+`.github/workflows/ci.yml` runs on every push to `main`, every pull request, and
+on demand (`workflow_dispatch`, or `gh workflow run CI --ref main`). Re-running
+an old run replays its original event, including whether the repository was
+private then, so after a change of visibility start a new run instead.
 In a public repository both jobs run on GitHub-hosted macOS (the `xcode-27`
 image), which is free there. In a private one they run on the repository's
 own self-hosted Mac (labels `self-hosted`, `macOS`, `ARM64`), because GitHub

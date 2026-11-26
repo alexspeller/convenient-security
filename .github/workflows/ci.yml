@@ -4,6 +4,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Re-running an old run replays its original event, including whether the
+  # repository was private then, so only a new event (a push, a pull request
+  # or this manual trigger) picks its runners afresh.
+  workflow_dispatch:
 
 permissions:
   contents: read
