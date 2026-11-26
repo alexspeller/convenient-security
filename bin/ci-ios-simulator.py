@@ -426,8 +426,39 @@ def direct(argv):
     return code
 
 
+def choose(listing):
+    """bin/ci's runtime and iPhone, tab-separated, from `simctl list runtimes --json`.
+
+    The newest iOS version, and across every runtime of that version the
+    smallest Face ID screen: the xcode-27 hosted image lists a second iOS 27.2
+    runtime offering only iPhone Duo, whose first boot ends "Data Migration
+    Failed" (hosted runs 45867216121 and 45904084139), and the newest-version
+    pick alone took whichever of the two came first.
+    """
+    runtimes = [r for r in listing["runtimes"] if r.get("isAvailable") and r.get("platform") == "iOS"]
+    if not runtimes:
+        raise Failure("no iOS Simulator runtime is installed: xcodebuild -downloadPlatform iOS", 1)
+    version = max([int(part) for part in r["version"].split(".")] for r in runtimes)
+    newest = [r for r in runtimes if [int(part) for part in r["version"].split(".")] == version]
+    # The smallest screens with Face ID first; any Face ID iPhone after them.
+    preferred = ["iPhone 13 mini", "iPhone 12 mini", "iPhone 16e", "iPhone 17e"]
+    candidates = sorted(
+        ((preferred.index(t["name"]) if t["name"] in preferred else len(preferred), t["name"], r["identifier"], r, t)
+         for r in newest for t in r.get("supportedDeviceTypes", [])
+         if t["name"].startswith("iPhone") and "SE" not in t["name"]),
+        key=lambda candidate: candidate[:3])
+    if not candidates:
+        raise Failure(f"{newest[0]['name']} offers no iPhone with Face ID", 1)
+    *_, runtime, device = candidates[0]
+    return "\t".join([runtime["identifier"], runtime["buildversion"], device["identifier"],
+                      f"{device['name']}, {runtime['name']}"])
+
+
 def main():
     argv = sys.argv[1:]
+    if argv == ["choose"]:
+        print(choose(json.load(sys.stdin)))
+        return 0
     if not argv:
         select()
         return 0

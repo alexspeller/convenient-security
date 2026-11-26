@@ -657,5 +657,45 @@ if 'test-without-building' in sys.argv: print('    Executed 42 tests, with 0 fai
         self.assertEqual([d["name"] for d in self.state()["devices"]], [BASE])
 
 
+def runtime(version, build, *devices):
+    return dict(identifier=f"com.apple.CoreSimulator.SimRuntime.iOS-{version.replace('.', '-')}-{build}",
+                name=f"iOS {version}", version=version, buildversion=build, platform="iOS", isAvailable=True,
+                supportedDeviceTypes=[dict(name=name, identifier=f"com.apple.CoreSimulator.SimDeviceType.{name.replace(' ', '-')}")
+                                      for name in devices])
+
+
+class SimulatorChoiceTests(unittest.TestCase):
+    """bin/ci's pick of runtime and iPhone from `simctl list runtimes --json`."""
+
+    def choose(self, *runtimes):
+        return subprocess.run([sys.executable, str(HELPER), "choose"], input=json.dumps(dict(runtimes=list(runtimes))),
+                              capture_output=True, text=True, timeout=WORKFLOW_TIMEOUT)
+
+    def test_a_second_runtime_of_the_same_version_offering_only_iphone_duo_is_not_chosen(self):
+        # The xcode-27 hosted image lists an iOS 27.2 runtime for iPhone Duo
+        # alone beside the full one. Hosted runs 45867216121 and 45904084139
+        # took it, and the Duo's first boot ended "Data Migration Failed".
+        for order in ((0, 1), (1, 0)):
+            with self.subTest(order=order):
+                pair = [runtime("27.2", "24C5089a", "iPhone Duo"),
+                        runtime("27.2", "24C101", "iPhone 17", "iPhone 13 mini", "iPhone Duo")]
+                result = self.choose(*(pair[i] for i in order))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.rstrip("\n").split("\t"),
+                                 ["com.apple.CoreSimulator.SimRuntime.iOS-27-2-24C101", "24C101",
+                                  "com.apple.CoreSimulator.SimDeviceType.iPhone-13-mini", "iPhone 13 mini, iOS 27.2"])
+
+    def test_the_newest_runtime_wins_over_a_better_iphone_on_an_older_one(self):
+        result = self.choose(runtime("26.5", "23F77", "iPhone 13 mini"), runtime("27.2", "24C101", "iPhone 17", "iPhone SE (3rd generation)"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split("\t")[3].strip(), "iPhone 17, iOS 27.2")
+
+    def test_no_ios_runtime_or_face_id_iphone_fails_saying_why(self):
+        self.assertIn("no iOS Simulator runtime is installed", self.choose().stderr)
+        result = self.choose(runtime("27.2", "24C101", "iPhone SE (3rd generation)", "iPad Air 11-inch (M4)"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("iOS 27.2 offers no iPhone with Face ID", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

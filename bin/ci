@@ -1481,23 +1481,7 @@ fi
   # which the tests then require. Its lease confirms Shutdown before deletion;
   # legacy/live devices are preserved, and shutdown warm bases are kept.
   ios_uitest_started="$(date +%s)"
-  ios_choice="$(xcrun simctl list runtimes --json | python3 -c '
-import json, sys
-runtimes = [r for r in json.load(sys.stdin)["runtimes"]
-            if r.get("isAvailable") and r.get("platform") == "iOS"]
-if not runtimes:
-    sys.exit("no iOS Simulator runtime is installed: xcodebuild -downloadPlatform iOS")
-runtime = max(runtimes, key=lambda r: [int(part) for part in r["version"].split(".")])
-runtime_name = runtime["name"]
-supported = {t["name"]: t["identifier"] for t in runtime.get("supportedDeviceTypes", [])}
-# The smallest screens with Face ID first; any Face ID iPhone after them.
-preferred = ["iPhone 13 mini", "iPhone 12 mini", "iPhone 16e", "iPhone 17e"]
-face_id = [name for name in supported if name.startswith("iPhone") and "SE" not in name]
-names = [name for name in preferred if name in supported] + sorted(face_id)
-if not names:
-    sys.exit(f"{runtime_name} offers no iPhone with Face ID")
-print(runtime["identifier"], runtime["buildversion"], supported[names[0]], f"{names[0]}, {runtime_name}", sep="\t")
-')"
+  ios_choice="$(xcrun simctl list runtimes --json | python3 "$repo_root/bin/ci-ios-simulator.py" choose)"
   IFS=$'\t' read -r ios_runtime ios_runtime_build ios_device_type ios_device_description <<<"$ios_choice"
   # Admission precedes the nonbooting selector. A cold base gets a separate
   # lease; this command stays alive through build/test, reap and shutdown.
