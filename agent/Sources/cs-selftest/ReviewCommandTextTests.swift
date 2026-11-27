@@ -46,17 +46,28 @@ import Foundation
               check(scrolls == mustScroll, "\(name): \(mustScroll ? "scrolls" : "shows whole") on this screen")
           }
           if scrolls {
-              check(shown >= ReviewDisclosureFit.minimumHeight - 1,
-                    "\(name): a scrolling command keeps at least the minimum height (\(shown))")
+              // The minimum is the scroll view's frame, which the fit rule
+              // sizes; a bordered command's clip is two points shorter.
+              let frame = scroll.frame.height
+              check(frame >= ReviewDisclosureFit.minimumHeight - 1,
+                    "\(name): a scrolling command keeps at least the minimum height (\(frame), showing \(shown))")
               check(scroll.scrollerStyle == .legacy && !scroll.autohidesScrollers && scroll.hasVerticalScroller,
                     "\(name): a scrolling command's scroller is always drawn")
               check(cue.stringValue == ReviewCommandText.overflowCueText,
                     "\(name): the cue says the command continues")
               if let visibleHeight {
-                  check(panel.window.frame.height <= visibleHeight + 1,
-                        "\(name): the panel grows only to the screen (\(panel.window.frame.height) vs \(visibleHeight))")
-                  check(panel.window.frame.height >= visibleHeight - 1,
-                        "\(name): a scrolling command uses all the height the screen leaves")
+                  // A screen too short for the rest of the panel and the
+                  // minimum (a 1024 by 768 display leaves 674 points) still
+                  // gives the command the minimum, so the panel runs past it.
+                  if frame <= ReviewDisclosureFit.minimumHeight + 1, panel.window.frame.height > visibleHeight + 1 {
+                      print("  note: this screen (\(visibleHeight) pt) is too short for \(name) "
+                            + "with the minimum (\(panel.window.frame.height) pt)")
+                  } else {
+                      check(panel.window.frame.height <= visibleHeight + 1,
+                            "\(name): the panel grows only to the screen (\(panel.window.frame.height) vs \(visibleHeight))")
+                      check(panel.window.frame.height >= visibleHeight - 1,
+                            "\(name): a scrolling command uses all the height the screen leaves")
+                  }
               }
           } else {
               check(text.frame.height <= shown + 1, "\(name): nothing of the command is clipped")
@@ -79,9 +90,14 @@ import Foundation
       }
       let longArgv = sudo((["sudo", "/usr/sbin/chown", "root:wheel"] + files).joined(separator: " "))
       checkFitted("sudo panel, 64 arguments", longArgv)
+      // Only a screen that leaves the command more than 180 points can show
+      // more than the old card did.
       if let scroll = commandScroll(longArgv) {
-          check(scroll.contentView.bounds.height > 180,
-                "sudo panel, 64 arguments: more of the command shows than the old 180-point card")
+          let shown = scroll.contentView.bounds.height
+          let room = (visibleHeight ?? .greatestFiniteMagnitude) - (longArgv.window.frame.height - scroll.frame.height)
+          if room > 182 {
+              check(shown > 180, "sudo panel, 64 arguments: more of the command shows than the old 180-point card")
+          }
       }
       // The longest command the frame carries cannot fit any screen.
       let longest = "sudo /bin/echo " + String(
@@ -152,7 +168,10 @@ import Foundation
               .first { $0.title == "Show command and security details" }?.performClick(nil)
           checkFitted("automation panel, \(name) command", panel, mustScroll: name == "short" ? false : nil)
           if name == "long", let scroll = commandScroll(panel) {
-              check(scroll.frame.height > 88, "automation panel, long command: taller than the old 88-point box")
+              let room = (visibleHeight ?? .greatestFiniteMagnitude) - (panel.window.frame.height - scroll.frame.height)
+              if room > 89 {
+                  check(scroll.frame.height > 88, "automation panel, long command: taller than the old 88-point box")
+              }
           }
           withExtendedLifetime(panel) {}
       }

@@ -55,6 +55,7 @@ func screenFitRuleTests() {
           let shownLists = lists(panel)
           check(shownLists.count == count, "\(name): shows \(count) fitted list(s) (\(shownLists.count))")
           var anyScrolls = false
+          var scrollingAtMinimum = true
           for (index, scroll) in shownLists.enumerated() {
               let label = "\(name), list \(index + 1)"
               guard let document = scroll.documentView,
@@ -69,6 +70,7 @@ func screenFitRuleTests() {
               let shown = clip.bounds.height
               let scrolls = content > shown + 1
               anyScrolls = anyScrolls || scrolls
+              if scrolls, scroll.frame.height > ReviewDisclosureFit.minimumHeight + 1 { scrollingAtMinimum = false }
               check(scrolls == !cue.isHidden,
                     "\(label): the cue shows exactly when the list scrolls (content \(content), shown \(shown))")
               if scrolls {
@@ -104,7 +106,13 @@ func screenFitRuleTests() {
               check(anyScrolls == mustScroll, "\(name): \(mustScroll ? "scrolls" : "shows whole") on this screen")
           }
           if let visibleHeight {
-              if anyScrolls {
+              // A screen too short for the rest of the panel and the minimum
+              // (a 1024 by 768 display leaves 674 points) still gives each
+              // list the minimum, so the panel runs past it.
+              if anyScrolls, scrollingAtMinimum, panel.window.frame.height > visibleHeight + 1 {
+                  print("  note: this screen (\(visibleHeight) pt) is too short for \(name) "
+                        + "with the minimum (\(panel.window.frame.height) pt)")
+              } else if anyScrolls {
                   check(panel.window.frame.height <= visibleHeight + 1,
                         "\(name): the panel grows only to the screen (\(panel.window.frame.height) vs \(visibleHeight))")
                   check(panel.window.frame.height >= visibleHeight - 1,
@@ -175,7 +183,8 @@ func screenFitRuleTests() {
       if let show = button("Show full command", in: both) {
           show.performClick(nil)
           checkFitted("release panel, 200 secrets and the full command", both, count: 1, mustScroll: true)
-          if let visibleHeight {
+          // At the minimum on a short screen, checkFitted has said why it runs past.
+          if let visibleHeight, lists(both).contains(where: { $0.frame.height > ReviewDisclosureFit.minimumHeight + 1 }) {
               check(both.window.frame.height <= visibleHeight + 1,
                     "release panel, 200 secrets and the full command: the panel stays within the screen")
           }

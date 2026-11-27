@@ -2675,9 +2675,19 @@ private final class BlockingSessionFacts: ClaudeSessionFactProvider, @unchecked 
     private let lock = NSLock()
     private var armed = false
     private var delay: TimeInterval = 0
+    private var slowedReads = 0
+    private var longestSlowedRead: TimeInterval = 0
     private let gate = DispatchSemaphore(value: 0)
 
     init(_ base: SyntheticClaudeSessionFacts) { self.base = base }
+
+    /// How many reads `slow` delayed, and the longest one took, so a burst
+    /// check can say how far a slow Mac stretched them.
+    func slowed() -> (reads: Int, longest: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (slowedReads, longestSlowedRead)
+    }
 
     func slow(_ seconds: TimeInterval) {
         lock.lock()
@@ -2712,7 +2722,15 @@ private final class BlockingSessionFacts: ClaudeSessionFactProvider, @unchecked 
         let delay = delay
         lock.unlock()
         if blocking { gate.wait() }
-        if delay > 0 { Thread.sleep(forTimeInterval: delay) }
+        if delay > 0 {
+            let started = Date()
+            Thread.sleep(forTimeInterval: delay)
+            let took = Date().timeIntervalSince(started)
+            lock.lock()
+            slowedReads += 1
+            longestSlowedRead = max(longestSlowedRead, took)
+            lock.unlock()
+        }
         return base.cwd(of: process)
     }
     func openFile(of process: ProcessIncarnation, fd: Int32) -> ProcessOpenFile? {
@@ -2809,20 +2827,37 @@ private func delegationFactBoundTests() async {
     check(isApproved(await evaluate(burst, command: Standard.command, program: Standard.program)),
           "fact bound: the burst's command is approved on its own")
     slow.slow(0.04)
+    // Sized by what one slowed request takes on this Mac: enough of them that
+    // the last waits well past one read's bound, which is what declined them
+    // before, but only about half the queue's one-second wait limit, which
+    // answers a caller behind a hung read and is checked below. A fixed ten
+    // queued past that limit on a slow hosted Mac (run 45988638525).
+    let oneStarted = clock.now
+    let alone = await evaluate(burst, command: Standard.command, program: Standard.program)
+    let one = clock.now - oneStarted
+    let oneSeconds = Double(one.components.seconds) + Double(one.components.attoseconds) / 1e18
+    let burstSize = min(10, max(3, Int(0.5 / max(oneSeconds, 0.001))))
+    check(isApproved(alone), "fact bound: one slowed read alone is approved (\(one))")
+    let burstStarted = clock.now
     let burstResults = await withTaskGroup(of: DelegationEvaluation.self) { group in
-        for _ in 0..<10 {
+        for _ in 0..<burstSize {
             group.addTask { await evaluate(burst, command: Standard.command, program: Standard.program) }
         }
         var results: [DelegationEvaluation] = []
         for await result in group { results.append(result) }
         return results
     }
+    let burstTook = clock.now - burstStarted
     let registeredAfterBurst = await register(burst, "ls", peer: Standard.hookPeer)
     slow.slow(0)
+    let slowed = slow.slowed()
     let burstDeclines = await burstLog.read(DecisionLogQuery(streams: [.decisions], kinds: [.decline])).records
-    check(burstResults.count == 10 && burstResults.allSatisfy(isApproved) && burstDeclines.isEmpty,
+    check(burstTook > .milliseconds(200),
+          "fact bound: the burst of \(burstSize) queues past one read's bound (\(burstTook), one alone \(one))")
+    check(burstResults.count == burstSize && burstResults.allSatisfy(isApproved) && burstDeclines.isEmpty,
           "fact bound: healthy reads queued behind one another are never declined for their wait "
-            + "(\(burstResults.filter { !isApproved($0) }.count) of 10 not approved)")
+            + "(\(burstResults.filter { !isApproved($0) }.count) of \(burstSize) not approved; \(slowed.reads) reads, "
+            + "the longest \(Int(slowed.longest * 1000)) ms, in \(burstTook))")
     check(registeredAfterBurst, "fact bound: after a burst the hook's registration is still taken")
 
     // Behind a read that hangs, a request already queued is answered by the
