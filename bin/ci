@@ -1478,7 +1478,8 @@ fi
   # inside the Simulator. A new Simulator per run (the smallest Face ID iPhone
   # the newest iOS runtime offers), cloned from a base no app was ever
   # installed on, makes the first setup ask for notification permission,
-  # which the tests then require. Its lease confirms Shutdown before deletion;
+  # which the tests then require; bin/ci-ios-ui-tests removes the app its
+  # warm-up setup installed, so the suite's first setup still asks. Its lease confirms Shutdown before deletion;
   # legacy/live devices are preserved, and shutdown warm bases are kept.
   ios_uitest_started="$(date +%s)"
   ios_choice="$(xcrun simctl list runtimes --json | python3 "$repo_root/bin/ci-ios-simulator.py" choose)"

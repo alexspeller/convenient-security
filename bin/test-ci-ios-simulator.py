@@ -124,6 +124,11 @@ elif cmd == 'erase':
     assert device['state'] == 'Shutdown', 'erasing a live device'
     device.update(booted_once=False, erased=True)
     save(state)
+elif cmd == 'uninstall':
+    save(state)
+    if 'XCODE_CALLS' in os.environ:
+        with open(os.environ['XCODE_CALLS'], 'a') as out:
+            out.write(json.dumps(dict(simctl=sys.argv[1:])) + '\n')
 else:
     save(state)
     raise AssertionError(args)
@@ -556,7 +561,14 @@ class CISimulatorTests(unittest.TestCase):
 import json, os, pathlib, sys
 with open(os.environ['XCODE_CALLS'], 'a') as out:
     out.write(json.dumps(dict(args=sys.argv[1:], developer=os.environ.get('DEVELOPER_DIR'))) + '\\n')
+if 'build-for-testing' in sys.argv:
+    import plistlib
+    product = pathlib.Path(sys.argv[sys.argv.index('-derivedDataPath') + 1],
+                           'Build/Products/Debug-iphonesimulator/ConvenientSecurityApproval.app')
+    product.mkdir(parents=True, exist_ok=True)
+    (product / 'Info.plist').write_bytes(plistlib.dumps(dict(CFBundleIdentifier='example.approval')))
 if 'test-without-building' in sys.argv: print('    Executed 42 tests, with 0 failures')
+sys.exit(int(os.environ.get('FAKE_WARM_UP_EXIT', '0')) if any(a.startswith('-only-testing:') for a in sys.argv) else 0)
 """)):
             (self.root / name).write_text(body)
             (self.root / name).chmod(0o755)
@@ -569,7 +581,13 @@ if 'test-without-building' in sys.argv: print('    Executed 42 tests, with 0 fai
                      CSEC_CI_XCODE_SEARCH=str(applications), FAKE_MACOS=macos,
                      FAKE_SELECTED=str(applications / f"Xcode-{selected}.0.app/Contents/Developer"), **extra),
             capture_output=True, text=True, timeout=10)
-        return result, [json.loads(line) for line in calls.read_text().splitlines()]
+        recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+        # The warm-up and the app's removal come between the build and the suite.
+        if len(recorded) == 4:
+            self.assertEqual(recorded[2], dict(simctl=['simctl', '--set', str(self.root / 'private set'),
+                                                       'uninstall', 'owned-udid', 'example.approval']))
+            del recorded[2]
+        return result, recorded
 
     def developer(self, version):
         return str(self.root / f"Applications/Xcode-{version}.0.app/Contents/Developer")
@@ -577,37 +595,49 @@ if 'test-without-building' in sys.argv: print('    Executed 42 tests, with 0 fai
     def test_ui_driver_keeps_build_signing_and_test_bounds(self):
         result, calls = self.run_ui_driver()
         self.assertEqual(result.returncode, 0, result.stderr)
-        build, tests = calls
+        build, warm_up, tests = calls
         self.assertIn('build-for-testing', build['args'])
+        self.assertIn('-only-testing:ConvenientSecurityApprovalUITests/SetupUITests/'
+                      'testSetupTakesOneFaceIDThenAsksForNotifications', warm_up['args'])
+        self.assertFalse([a for a in tests['args'] if a.startswith('-only-testing')], 'the suite runs every test')
+        self.assertIn("Warm-up setup passed", result.stdout)
         self.assertIn('CODE_SIGN_IDENTITY=-', build['args'])
         self.assertIn('SWIFT_TREAT_WARNINGS_AS_ERRORS=YES', build['args'])
-        for call in (build, tests):
+        for call in (build, warm_up, tests):
             self.assertIn('id=owned-udid', call['args'])
             self.assertIn('-DVTSimulatorSetLocation=' + str(self.root / 'private set'), call['args'])
         for key, value in (('-parallel-testing-enabled', 'NO'),
                            ('-test-timeouts-enabled', 'YES'),
                            ('-default-test-execution-time-allowance', '600'),
                            ('-maximum-test-execution-time-allowance', '600')):
-            self.assertEqual(tests['args'][tests['args'].index(key) + 1], value)
+            for call in (warm_up, tests):
+                self.assertEqual(call['args'][call['args'].index(key) + 1], value)
+
+    def test_a_failed_warm_up_does_not_fail_the_run(self):
+        result, calls = self.run_ui_driver(FAKE_WARM_UP_EXIT="65")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 3)
+        self.assertIn("Warm-up setup failed; it does not count", result.stdout)
 
     def test_ui_tests_run_on_newest_xcode_27_while_the_build_keeps_the_selected_xcode(self):
         # macOS 27.2 refuses Xcode 26's DTServiceHub, so its runner never connects.
-        result, (build, tests) = self.run_ui_driver(installed=("26.6", "27.1", "27.10", "27.2"))
+        result, (build, warm_up, tests) = self.run_ui_driver(installed=("26.6", "27.1", "27.10", "27.2"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(build['developer'])
-        self.assertIn('test-without-building', tests['args'])
-        self.assertEqual(tests['developer'], self.developer("27.10"))
+        for call in (warm_up, tests):
+            self.assertIn('test-without-building', call['args'])
+            self.assertEqual(call['developer'], self.developer("27.10"))
         self.assertIn("Xcode 27.10", result.stdout)
 
     def test_selected_xcode_27_runs_both_steps(self):
         result, calls = self.run_ui_driver(selected="27.1", installed=("26.6", "27.1", "27.2"))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([call['developer'] for call in calls], [None, None])
+        self.assertEqual([call['developer'] for call in calls], [None] * 3)
 
     def test_callers_developer_dir_runs_both_steps(self):
         result, calls = self.run_ui_driver(installed=("26.6", "27.1"), DEVELOPER_DIR=str(self.root / "chosen"))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual([call['developer'] for call in calls], [str(self.root / "chosen")] * 2)
+        self.assertEqual([call['developer'] for call in calls], [str(self.root / "chosen")] * 3)
 
     def test_refused_xcode_without_a_newer_one_fails_before_building(self):
         result, calls = self.run_ui_driver(installed=("26.6",), macos="27.2.1")
@@ -620,7 +650,7 @@ if 'test-without-building' in sys.argv: print('    Executed 42 tests, with 0 fai
             with self.subTest(macos=macos):
                 result, calls = self.run_ui_driver(installed=("26.6",), macos=macos)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual([call['developer'] for call in calls], [None, None])
+                self.assertEqual([call['developer'] for call in calls], [None] * 3)
                 (self.root / "xcode.jsonl").unlink()
                 shutil.rmtree(self.root / "Applications")
 

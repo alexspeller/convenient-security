@@ -61,6 +61,40 @@ ios_bounded 900 "${ios_xcodebuild[@]}" -quiet -jobs 2 \
   -derivedDataPath "$ios_scratch/DerivedData" \
   build-for-testing CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= \
   SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
+# The first Face ID a newly booted Simulator raises can be lost. On hosted
+# runs 45907632273 and 45971633892 the run's first test raised its setup
+# sheet and no face ever passed, in 120 s and then in 240 s, and the second
+# time SpringBoard was showing the App Switcher; the next test, on a fresh
+# launch, set up at once, as did every setup after it. So one setup runs
+# first, and its result does not count: the suite runs that test again. The
+# app is then removed, so the suite still starts with notification permission
+# undecided and its setups still meet the system's prompt.
+ios_warmup_test=ConvenientSecurityApprovalUITests/SetupUITests/testSetupTakesOneFaceIDThenAsksForNotifications
+ios_warmup_log="$ios_scratch/ui-warm-up.log"
+if ios_bounded 900 "${ios_test_xcodebuild[@]}" test-without-building \
+    -project "$repo_root/ios/ConvenientSecurityApproval.xcodeproj" \
+    -scheme ConvenientSecurityApproval \
+    -destination "id=$ios_simulator" \
+    -derivedDataPath "$ios_scratch/DerivedData" \
+    -only-testing:"$ios_warmup_test" \
+    -parallel-testing-enabled NO \
+    -test-timeouts-enabled YES \
+    -default-test-execution-time-allowance 600 \
+    -maximum-test-execution-time-allowance 600 \
+    >"$ios_warmup_log" 2>&1; then
+  echo "Warm-up setup passed"
+else
+  echo "Warm-up setup failed; it does not count, and the suite runs it again:"
+  grep -E -m 1 '^UITEST: ' "$ios_warmup_log" || true
+  grep -E -m 3 'error:' "$ios_warmup_log" || true
+fi
+ios_app_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+  "$ios_scratch/DerivedData/Build/Products/Debug-iphonesimulator/ConvenientSecurityApproval.app/Info.plist")"
+ios_simctl=(xcrun simctl)
+if [ "$SIMULATOR_RUN_SET" != default ]; then
+  ios_simctl+=(--set "$SIMULATOR_RUN_SET")
+fi
+"${ios_simctl[@]}" uninstall "$ios_simulator" "$ios_app_bundle_id"
 ios_uitest_log="$ios_scratch/ui-tests.log"
 # Each test is stopped after ten minutes, and the whole run after ninety:
 # the run's bound catches a wedged Simulator or xcodebuild between tests. It

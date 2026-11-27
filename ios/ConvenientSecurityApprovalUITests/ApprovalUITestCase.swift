@@ -259,7 +259,7 @@ class ApprovalUITestCase: XCTestCase {
         }
         // Whether a sheet was raised at all tells a lost tap from a sensor
         // that never answered; bin/ci prints UITEST lines with the trees.
-        print("UITEST: no face passed in \(Int(timeout)) s, counters \(counters())\n\(springboard.debugDescription)")
+        print("UITEST: no face passed in \(Int(timeout)) s, counters \(counters()), app state \(app.state.rawValue) (4 is foreground)\n\(springboard.debugDescription)")
         XCTFail("Face ID did not pass a matching face within \(Int(timeout)) s", file: file, line: line)
     }
 
