@@ -97,8 +97,8 @@ own queue by `SIMULATOR_RUN_LOCK`, `SIMULATOR_RUN_STATE_DIR` and the gate's othe
 lets an owned real check isolate its device set without changing the normal
 warm default-set base.
 The tests simulate Face ID from inside the Simulator, so nothing on the host
-has to answer them; each test is stopped after five minutes, the run after
-forty, the clone's boot after five, the base's first boot after twenty. A
+has to answer them; each test is stopped after ten minutes, the run after
+ninety, the clone's boot after five, the base's first boot after twenty. A
 boot that runs out of time prints where it was waiting (`Waiting on Data
 Migration` and the plugin, say) and the load average. The run's time follows
 the Mac's load: on 17 Oct, at load averages near 800 to 900, 31 tests took

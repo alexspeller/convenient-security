@@ -67,10 +67,13 @@ class ApprovalUITestCase: XCTestCase {
     /// the app's notification-settings read and pass a simulated face. On a
     /// GitHub-hosted VM (3 CPUs, load averages near 80) a newly booted iOS
     /// 27.2 Simulator left both unanswered for minutes: the first six tests of
-    /// the run each outwaited `appWork` there, and later setups passed. Like
-    /// `appWork`, it costs a passing run nothing, and it leaves room inside a
-    /// test's five-minute allowance for a launch and both waits.
-    static let systemWork: TimeInterval = 120
+    /// the run each outwaited `appWork` there, and later setups passed. On
+    /// run 45907632273 (load averages near 46) the run's first test, which
+    /// sets up a Simulator booted three minutes earlier, outwaited 120 s for
+    /// its first face, and the 40 tests after it passed. Like `appWork`, it
+    /// costs a passing run nothing, and it leaves room inside a test's
+    /// ten-minute allowance (bin/ci-ios-ui-tests) for a launch and both waits.
+    static let systemWork: TimeInterval = 240
 
     let app = XCUIApplication()
     let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
@@ -254,6 +257,9 @@ class ApprovalUITestCase: XCTestCase {
                 return
             }
         }
+        // Whether a sheet was raised at all tells a lost tap from a sensor
+        // that never answered; bin/ci prints UITEST lines with the trees.
+        print("UITEST: no face passed in \(Int(timeout)) s, counters \(counters())\n\(springboard.debugDescription)")
         XCTFail("Face ID did not pass a matching face within \(Int(timeout)) s", file: file, line: line)
     }
 

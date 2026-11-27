@@ -62,7 +62,7 @@ ios_bounded 900 "${ios_xcodebuild[@]}" -quiet -jobs 2 \
   build-for-testing CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= \
   SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
 ios_uitest_log="$ios_scratch/ui-tests.log"
-# Each test is stopped after five minutes, and the whole run after ninety:
+# Each test is stopped after ten minutes, and the whole run after ninety:
 # the run's bound catches a wedged Simulator or xcodebuild between tests. It
 # sits well above a loaded Mac's run: the 40-test suite took 32 minutes at a
 # load average near 250 on 10 CPUs and went past forty at one near 455, and
@@ -70,7 +70,9 @@ ios_uitest_log="$ios_scratch/ui-tests.log"
 # A test's bound only catches one that wedges, so it is well above the
 # slowest test's time on a loaded Mac: the mailbox tests that set up, pair
 # and relaunch take a minute or more unloaded, and went past two minutes at
-# load averages of 160 to 250 on 10 CPUs.
+# load averages of 160 to 250 on 10 CPUs. The run's first test sets up on a
+# newly booted Simulator, whose services can take minutes to answer on a
+# hosted VM, so it can wait on them twice (the UI tests' `systemWork`).
 if ! ios_bounded 5400 "${ios_test_xcodebuild[@]}" test-without-building \
     -project "$repo_root/ios/ConvenientSecurityApproval.xcodeproj" \
     -scheme ConvenientSecurityApproval \
@@ -78,8 +80,8 @@ if ! ios_bounded 5400 "${ios_test_xcodebuild[@]}" test-without-building \
     -derivedDataPath "$ios_scratch/DerivedData" \
     -parallel-testing-enabled NO \
     -test-timeouts-enabled YES \
-    -default-test-execution-time-allowance 300 \
-    -maximum-test-execution-time-allowance 300 \
+    -default-test-execution-time-allowance 600 \
+    -maximum-test-execution-time-allowance 600 \
     >"$ios_uitest_log" 2>&1; then
   # What a test could not find comes with the screen's accessibility tree.
   grep -E -A120 '^UITEST: ' "$ios_uitest_log" >&2 || true

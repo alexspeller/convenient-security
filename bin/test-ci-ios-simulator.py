@@ -586,8 +586,8 @@ if 'test-without-building' in sys.argv: print('    Executed 42 tests, with 0 fai
             self.assertIn('-DVTSimulatorSetLocation=' + str(self.root / 'private set'), call['args'])
         for key, value in (('-parallel-testing-enabled', 'NO'),
                            ('-test-timeouts-enabled', 'YES'),
-                           ('-default-test-execution-time-allowance', '300'),
-                           ('-maximum-test-execution-time-allowance', '300')):
+                           ('-default-test-execution-time-allowance', '600'),
+                           ('-maximum-test-execution-time-allowance', '600')):
             self.assertEqual(tests['args'][tests['args'].index(key) + 1], value)
 
     def test_ui_tests_run_on_newest_xcode_27_while_the_build_keeps_the_selected_xcode(self):
