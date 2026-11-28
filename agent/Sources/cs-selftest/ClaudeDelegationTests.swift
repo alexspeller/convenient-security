@@ -2819,24 +2819,28 @@ private func delegationFactBoundTests() async {
     // rules-changed acknowledgement releases together, each read well inside
     // the bound, queue behind one another. The bound is on each read's own
     // run, so none declines, nothing is marked stuck, and the hook's next
-    // registration is still taken.
+    // registration is still taken. The burst runs under csecd's own bound,
+    // not the stuck checks' 150 ms: a hosted Mac stalled one 40 ms read past
+    // 150 ms (run 46141762136), so it was declined before any burst queued.
     let burstLog = await makeDelegationLog(stores)
     let slow = BlockingSessionFacts(facts)
-    let burst = makeService(slow, stores: stores, log: burstLog, factBound: .milliseconds(150))
+    let burstBound = ClaudeDelegationService.factBound
+    let burst = makeService(slow, stores: stores, log: burstLog, factBound: burstBound)
     _ = await register(burst, Standard.program, peer: Standard.hookPeer)
     check(isApproved(await evaluate(burst, command: Standard.command, program: Standard.program)),
           "fact bound: the burst's command is approved on its own")
     slow.slow(0.04)
     // Sized by what one slowed request takes on this Mac: enough of them that
     // the last waits well past one read's bound, which is what declined them
-    // before, but only about half the queue's one-second wait limit, which
+    // before, but well inside the queue's one-second wait limit, which
     // answers a caller behind a hung read and is checked below. A fixed ten
-    // queued past that limit on a slow hosted Mac (run 45988638525).
+    // queued past that limit on a slow hosted Mac (run 45988638525). Ten
+    // reads of at least 40 ms each already queue past the bound.
     let oneStarted = clock.now
     let alone = await evaluate(burst, command: Standard.command, program: Standard.program)
     let one = clock.now - oneStarted
     let oneSeconds = Double(one.components.seconds) + Double(one.components.attoseconds) / 1e18
-    let burstSize = min(10, max(3, Int(0.5 / max(oneSeconds, 0.001))))
+    let burstSize = min(10, max(3, Int(0.65 / max(oneSeconds, 0.001))))
     check(isApproved(alone), "fact bound: one slowed read alone is approved (\(one))")
     let burstStarted = clock.now
     let burstResults = await withTaskGroup(of: DelegationEvaluation.self) { group in
@@ -2852,7 +2856,7 @@ private func delegationFactBoundTests() async {
     slow.slow(0)
     let slowed = slow.slowed()
     let burstDeclines = await burstLog.read(DecisionLogQuery(streams: [.decisions], kinds: [.decline])).records
-    check(burstTook > .milliseconds(200),
+    check(burstTook > burstBound,
           "fact bound: the burst of \(burstSize) queues past one read's bound (\(burstTook), one alone \(one))")
     check(burstResults.count == burstSize && burstResults.allSatisfy(isApproved) && burstDeclines.isEmpty,
           "fact bound: healthy reads queued behind one another are never declined for their wait "
