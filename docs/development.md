@@ -100,9 +100,10 @@ The tests simulate Face ID from inside the Simulator, so nothing on the host
 has to answer them; each test is stopped after ten minutes, the run after
 ninety, the clone's boot after five, the base's first boot after twenty.
 A newly booted Simulator can lose the first Face ID sheet it raises, so one
-setup test runs first as a warm-up whose result does not count; the app is
-then removed, and the suite, which runs that test again, still starts with
-notification permission undecided. A
+setup test runs first as a warm-up whose result does not count, again until
+one passes, at most three times, since a warm-up can fail before it raises a
+sheet; the app is then removed, and the suite, which runs that test again,
+still starts with notification permission undecided. A
 boot that runs out of time prints where it was waiting (`Waiting on Data
 Migration` and the plugin, say) and the load average. The run's time follows
 the Mac's load: on 17 Oct, at load averages near 800 to 900, 31 tests took

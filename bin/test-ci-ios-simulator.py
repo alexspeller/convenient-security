@@ -568,7 +568,13 @@ if 'build-for-testing' in sys.argv:
     product.mkdir(parents=True, exist_ok=True)
     (product / 'Info.plist').write_bytes(plistlib.dumps(dict(CFBundleIdentifier='example.approval')))
 if 'test-without-building' in sys.argv: print('    Executed 42 tests, with 0 failures')
-sys.exit(int(os.environ.get('FAKE_WARM_UP_EXIT', '0')) if any(a.startswith('-only-testing:') for a in sys.argv) else 0)
+if any(a.startswith('-only-testing:') for a in sys.argv):
+    # One exit status per warm-up attempt, the last repeating.
+    exits = os.environ.get('FAKE_WARM_UP_EXITS', '0').split()
+    with open(os.environ['XCODE_CALLS']) as calls:
+        attempt = sum(1 for line in calls if '-only-testing:' in line) - 1
+    sys.exit(int(exits[min(attempt, len(exits) - 1)]))
+sys.exit(0)
 """)):
             (self.root / name).write_text(body)
             (self.root / name).chmod(0o755)
@@ -582,11 +588,11 @@ sys.exit(int(os.environ.get('FAKE_WARM_UP_EXIT', '0')) if any(a.startswith('-onl
                      FAKE_SELECTED=str(applications / f"Xcode-{selected}.0.app/Contents/Developer"), **extra),
             capture_output=True, text=True, timeout=10)
         recorded = [json.loads(line) for line in calls.read_text().splitlines()]
-        # The warm-up and the app's removal come between the build and the suite.
-        if len(recorded) == 4:
-            self.assertEqual(recorded[2], dict(simctl=['simctl', '--set', str(self.root / 'private set'),
-                                                       'uninstall', 'owned-udid', 'example.approval']))
-            del recorded[2]
+        # The warm-ups and the app's removal come between the build and the suite.
+        if len(recorded) >= 4:
+            self.assertEqual(recorded[-2], dict(simctl=['simctl', '--set', str(self.root / 'private set'),
+                                                        'uninstall', 'owned-udid', 'example.approval']))
+            del recorded[-2]
         return result, recorded
 
     def developer(self, version):
@@ -600,7 +606,7 @@ sys.exit(int(os.environ.get('FAKE_WARM_UP_EXIT', '0')) if any(a.startswith('-onl
         self.assertIn('-only-testing:ConvenientSecurityApprovalUITests/SetupUITests/'
                       'testSetupTakesOneFaceIDThenAsksForNotifications', warm_up['args'])
         self.assertFalse([a for a in tests['args'] if a.startswith('-only-testing')], 'the suite runs every test')
-        self.assertIn("Warm-up setup passed", result.stdout)
+        self.assertIn("Warm-up setup passed (attempt 1)", result.stdout)
         self.assertIn('CODE_SIGN_IDENTITY=-', build['args'])
         self.assertIn('SWIFT_TREAT_WARNINGS_AS_ERRORS=YES', build['args'])
         for call in (build, warm_up, tests):
@@ -613,11 +619,21 @@ sys.exit(int(os.environ.get('FAKE_WARM_UP_EXIT', '0')) if any(a.startswith('-onl
             for call in (warm_up, tests):
                 self.assertEqual(call['args'][call['args'].index(key) + 1], value)
 
-    def test_a_failed_warm_up_does_not_fail_the_run(self):
-        result, calls = self.run_ui_driver(FAKE_WARM_UP_EXIT="65")
+    def test_a_failed_warm_up_runs_again_until_one_passes(self):
+        result, calls = self.run_ui_driver(FAKE_WARM_UP_EXITS="65 0")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(calls), 3)
-        self.assertIn("Warm-up setup failed; it does not count", result.stdout)
+        build, first, second, tests = calls
+        self.assertEqual(first['args'], second['args'])
+        self.assertIn("Warm-up setup failed (attempt 1 of 3); it does not count", result.stdout)
+        self.assertIn("Warm-up setup passed (attempt 2)", result.stdout)
+        self.assertFalse([a for a in tests['args'] if a.startswith('-only-testing')], 'the suite runs every test')
+
+    def test_warm_ups_that_all_fail_do_not_fail_the_run(self):
+        result, calls = self.run_ui_driver(FAKE_WARM_UP_EXITS="65")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 5, 'the build, three warm-ups and the suite')
+        self.assertIn("Warm-up setup failed (attempt 3 of 3); it does not count", result.stdout)
+        self.assertNotIn("Warm-up setup passed", result.stdout)
 
     def test_ui_tests_run_on_newest_xcode_27_while_the_build_keeps_the_selected_xcode(self):
         # macOS 27.2 refuses Xcode 26's DTServiceHub, so its runner never connects.

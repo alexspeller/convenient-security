@@ -65,29 +65,35 @@ ios_bounded 900 "${ios_xcodebuild[@]}" -quiet -jobs 2 \
 # runs 45907632273 and 45971633892 the run's first test raised its setup
 # sheet and no face ever passed, in 120 s and then in 240 s, and the second
 # time SpringBoard was showing the App Switcher; the next test, on a fresh
-# launch, set up at once, as did every setup after it. So one setup runs
-# first, and its result does not count: the suite runs that test again. The
-# app is then removed, so the suite still starts with notification permission
+# launch, set up at once, as did every setup after it. So setup runs first as
+# a warm-up whose result does not count: the suite runs that test again. A
+# warm-up can fail before it raises a sheet at all: on hosted run 46133508943
+# the app's notification-settings read went unanswered for 240 s, and the
+# suite's first setup then lost its face with the App Switcher showing. So
+# the warm-up runs again until one passes, at most three times. The app is
+# then removed, so the suite still starts with notification permission
 # undecided and its setups still meet the system's prompt.
 ios_warmup_test=ConvenientSecurityApprovalUITests/SetupUITests/testSetupTakesOneFaceIDThenAsksForNotifications
 ios_warmup_log="$ios_scratch/ui-warm-up.log"
-if ios_bounded 900 "${ios_test_xcodebuild[@]}" test-without-building \
-    -project "$repo_root/ios/ConvenientSecurityApproval.xcodeproj" \
-    -scheme ConvenientSecurityApproval \
-    -destination "id=$ios_simulator" \
-    -derivedDataPath "$ios_scratch/DerivedData" \
-    -only-testing:"$ios_warmup_test" \
-    -parallel-testing-enabled NO \
-    -test-timeouts-enabled YES \
-    -default-test-execution-time-allowance 600 \
-    -maximum-test-execution-time-allowance 600 \
-    >"$ios_warmup_log" 2>&1; then
-  echo "Warm-up setup passed"
-else
-  echo "Warm-up setup failed; it does not count, and the suite runs it again:"
+for ios_warmup_attempt in 1 2 3; do
+  if ios_bounded 900 "${ios_test_xcodebuild[@]}" test-without-building \
+      -project "$repo_root/ios/ConvenientSecurityApproval.xcodeproj" \
+      -scheme ConvenientSecurityApproval \
+      -destination "id=$ios_simulator" \
+      -derivedDataPath "$ios_scratch/DerivedData" \
+      -only-testing:"$ios_warmup_test" \
+      -parallel-testing-enabled NO \
+      -test-timeouts-enabled YES \
+      -default-test-execution-time-allowance 600 \
+      -maximum-test-execution-time-allowance 600 \
+      >"$ios_warmup_log" 2>&1; then
+    echo "Warm-up setup passed (attempt $ios_warmup_attempt)"
+    break
+  fi
+  echo "Warm-up setup failed (attempt $ios_warmup_attempt of 3); it does not count, and the suite runs it again:"
   grep -E -m 1 '^UITEST: ' "$ios_warmup_log" || true
   grep -E -m 3 'error:' "$ios_warmup_log" || true
-fi
+done
 ios_app_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
   "$ios_scratch/DerivedData/Build/Products/Debug-iphonesimulator/ConvenientSecurityApproval.app/Info.plist")"
 ios_simctl=(xcrun simctl)
