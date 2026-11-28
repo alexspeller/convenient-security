@@ -371,14 +371,34 @@ class ApprovalUITestCase: XCTestCase {
         XCTAssertTrue(waitForOutcome("Injected a signed"), "injected", file: file, line: line)
     }
 
-    /// Tap a control in the Simulator section, the list's last.
-    func tapSimulatorControl(_ label: String, file: StaticString = #filePath, line: UInt = #line) {
+    /// Tap a control in the Simulator section, the list's last, in the
+    /// middle of the part of it the list shows unobscured, and return that
+    /// part.
+    ///
+    /// Hittable is not enough: rows scroll behind the counters strip, and a
+    /// control whose top edge alone shows above it reads as hittable. On
+    /// hosted run 46008441537 the Inject menu's top 4 pt showed above the
+    /// strip, with the list half scrolled, and no tap brought up its item. So
+    /// the list scrolls on until a tap's worth of the control shows.
+    @discardableResult
+    func tapSimulatorControl(_ label: String, file: StaticString = #filePath, line: UInt = #line) -> CGRect {
         let control = button(label)
-        for _ in 0..<6 where !isHittableNow(control) {
+        let shown = { control.exists ? control.frame.intersection(self.visibleArea) : .null }
+        let tappable = { self.isHittableNow(control) && shown().height >= min(control.frame.height, 44) }
+        for _ in 0..<6 where !tappable() {
             window.swipeUp(velocity: .fast)
         }
         XCTAssertTrue(control.exists, "the Simulator control \(label)", file: file, line: line)
-        control.tap()
+        let part = shown()
+        guard !part.isNull, part.height > 0 else {
+            control.tap()
+            return part
+        }
+        let frame = window.frame
+        window.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: part.midX - frame.minX, dy: part.midY - frame.minY))
+            .tap()
+        return part
     }
 
     /// Choose `item` from a menu in the Simulator section.
@@ -389,10 +409,12 @@ class ApprovalUITestCase: XCTestCase {
         line: UInt = #line
     ) {
         let choice = button(item)
+        // What each tap did, for the log if the item is never found.
+        var attempts: [String] = []
         // A tap on a menu that lands while its list is still settling can
         // open nothing; tap it again.
-        for _ in 0..<3 where !choice.exists {
-            tapSimulatorControl(menuTitle, file: file, line: line)
+        for attempt in 1...3 where !choice.exists {
+            let tapped = tapSimulatorControl(menuTitle, file: file, line: line)
             _ = choice.waitForExistence(timeout: 3)
             // On a loaded Simulator a menu can take longer to open, and a
             // second tap while it opens closes it, so while its control is
@@ -403,12 +425,18 @@ class ApprovalUITestCase: XCTestCase {
             // The open menu covers its control, so a covered control means
             // it opened. At a large text size it scrolls, and an item further
             // down exists only once it is on screen.
+            let opened = !isHittableNow(button(menuTitle))
+            var swipes = 0
             for _ in 0..<8 where !isHittableNow(choice) && !isHittableNow(button(menuTitle)) {
                 window.swipeUp()
+                swipes += 1
             }
+            attempts.append(
+                "tap \(attempt) at \(tapped.integral) of the control: menu \(opened ? "opened" : "not opened"), \(swipes) swipes"
+            )
         }
         if !choice.exists {
-            print("UITEST: menu item \(item) not found\n\(app.debugDescription)")
+            print("UITEST: menu item \(item) not found (\(attempts.joined(separator: "; ")))\n\(app.debugDescription)")
         }
         XCTAssertTrue(choice.exists, "menu item \(item)", file: file, line: line)
         choice.tap()
