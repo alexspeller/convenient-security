@@ -251,11 +251,13 @@ final class DelegationFactQueue: @unchecked Sendable {
     static let waitBound: Duration = .seconds(1)
 
     private let queue: DispatchQueue
+    private let waitLimit: Duration
     private let lock = NSLock()
     private var overdue = 0
 
-    init(label: String) {
+    init(label: String, waitBound: Duration = DelegationFactQueue.waitBound) {
         queue = DispatchQueue(label: label)
+        waitLimit = waitBound
     }
 
     var isStuck: Bool {
@@ -270,7 +272,7 @@ final class DelegationFactQueue: @unchecked Sendable {
         _ work: @escaping @Sendable () -> T
     ) async -> T? {
         if isStuck { return nil }
-        let wait = wait ?? max(Self.waitBound, bound)
+        let wait = wait ?? max(waitLimit, bound)
         return await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
             let job = DelegationFactJob()
             queue.async {
@@ -431,6 +433,8 @@ public actor ClaudeDelegationService {
     /// behind `csec setup` and `csec status` scan plugins and project
     /// directories, so each gets its own queue and a larger bound.
     public static let factBound: Duration = .milliseconds(300)
+    /// How long a request's fact job may wait behind others (`DelegationFactQueue.waitBound`).
+    public static let factWaitBound: Duration = DelegationFactQueue.waitBound
     public static let discoveryBound: Duration = .seconds(1)
     public static let configurationBound: Duration = .seconds(2)
     /// The stored-sign-in check (`ClaudeCredentialStore`) lists the Keychain
@@ -494,7 +498,7 @@ public actor ClaudeDelegationService {
     private let clock: @Sendable () -> Date
     private let screenLocked: @Sendable () -> Bool
     private let bootSessionUUID: String?
-    private let requestFacts = DelegationFactQueue(label: CSECBuildIdentity.named("delegation.facts"))
+    private let requestFacts: DelegationFactQueue
     private let discoveryFacts = DelegationFactQueue(label: CSECBuildIdentity.named("delegation.discovery"))
     private let configurationFacts = DelegationFactQueue(label: CSECBuildIdentity.named("delegation.configuration"))
     private let credentialFacts = DelegationFactQueue(label: CSECBuildIdentity.named("delegation.credentials"))
@@ -598,6 +602,7 @@ public actor ClaudeDelegationService {
         isOnLocalMounts: @escaping @Sendable (String) -> Bool = { ProcessAncestry.pathIsOnLocalMounts($0) == true },
         repositories: ProjectRepository.FileSystem = .live,
         factBound: Duration = ClaudeDelegationService.factBound,
+        factWaitBound: Duration = ClaudeDelegationService.factWaitBound,
         discoveryBound: Duration = ClaudeDelegationService.discoveryBound,
         configurationBound: Duration = ClaudeDelegationService.configurationBound,
         credentialStore: any ClaudeCredentialStore,
@@ -625,6 +630,9 @@ public actor ClaudeDelegationService {
         self.isOnLocalMounts = isOnLocalMounts
         self.repositories = repositories
         self.factBound = factBound
+        self.requestFacts = DelegationFactQueue(
+            label: CSECBuildIdentity.named("delegation.facts"), waitBound: factWaitBound
+        )
         self.discoveryBound = discoveryBound
         self.configurationBound = configurationBound
         self.credentialStore = credentialStore
